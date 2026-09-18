@@ -26,7 +26,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.0"
+$ScriptVersion = "2.1"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -291,6 +291,23 @@ function Get-LogStart {
     return $null
 }
 
+function Test-TrustedPublisher {
+    param([string]$Signer)
+    if (-not $Signer) { return $false }
+    $trusted = @('Microsoft', 'Google', 'Mozilla', 'Adobe', 'Apple', 'Intel', 'NVIDIA', 'Dell', 'HP Inc', 'Lenovo', 'Citrix', 'VMware', 'Oracle', 'Python Software Foundation', 'GitHub', 'Slack', 'Discord', 'Zoom Video Communications', 'Dropbox', 'Notepad++')
+    try {
+        $tDir = Get-ToolsDir
+        if ($tDir) {
+            $tf = Join-Path $tDir 'trusted.txt'
+            if (Test-Path -LiteralPath $tf) {
+                $trusted += @(Get-Content -LiteralPath $tf | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_ })
+            }
+        }
+    } catch { }
+    foreach ($t in $trusted) { if ($Signer -match [regex]::Escape($t)) { return $true } }
+    return $false
+}
+
 function Get-IocList {
     $tDir = Get-ToolsDir
     if (-not $tDir) { return $null }
@@ -548,9 +565,10 @@ function Invoke-AnalyzeMode {
             }
         }
         $hayOut = Join-Path $OutFolder 'fleet_hayabusa_timeline.csv'
+        $hayHtml = Join-Path $OutFolder 'fleet_hayabusa_report.html'
         $hDir = Split-Path $HayabusaExe -Parent
         Push-Location $hDir
-        try { & $HayabusaExe csv-timeline -d "$merged" -o "$hayOut" -q 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray } }
+        try { & $HayabusaExe dfir-timeline -d "$merged" -o "$hayOut" -H "$hayHtml" -q -w -U -C -K -m low 2>&1 | ForEach-Object { Write-Host "    $(($_ -replace ([char]27 + '\[[0-9;]*m'), ''))" -ForegroundColor DarkGray } }
         finally { Pop-Location }
         if (Test-Path $hayOut) {
             $n = @(Get-Content $hayOut | Select-Object -Skip 1).Count
@@ -560,6 +578,49 @@ function Invoke-AnalyzeMode {
     }
     $reportCsv = Join-Path $OutFolder 'fleet_report.csv'
     $findings | Sort-Object Host, Type | Export-Csv -LiteralPath $reportCsv -NoTypeInformation -Encoding UTF8
+
+    $fleetHtml = Join-Path $OutFolder 'fleet_report.html'
+    $css = @'
+<style>
+body{background:#0f1115;color:#d7dce3;font-family:Segoe UI,Arial,sans-serif;margin:0;padding:24px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:32px 0 10px;color:#8ab4f8;border-bottom:1px solid #2a2f3a;padding-bottom:6px}
+.meta{color:#7d8590;font-size:12px}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #2a2f3a;padding:6px 10px;text-align:left}
+th{background:#1d222c;color:#8ab4f8}tr:nth-child(even){background:#151920}
+.HIGH{color:#ff8789;font-weight:700}.IOC{color:#ff8789}.path{font-family:Consolas,monospace;font-size:12px;color:#8ab4f8;word-break:break-all}
+a{color:#8ab4f8}.foot{margin-top:40px;color:#565e6b;font-size:11px}
+</style>
+'@
+    $fsb = New-Object System.Text.StringBuilder
+    $null = $fsb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira Fleet</title>$css</head><body>")
+    $null = $fsb.AppendLine("<h1>OPHIRA FLEET REPORT</h1><div class='meta'>$(Get-Date -Format u) - $($hosts.Count) hosts - $($findings.Count) findings - IR-Triage v$ScriptVersion</div>")
+    $null = $fsb.AppendLine("<h2>Host summary</h2><table><tr><th>Host</th><th>High-priority</th><th>Proc anomalies</th><th>Brute force</th><th>Collected</th></tr>")
+    foreach ($h in ($hosts | Sort-Object Host)) {
+        $hf = @($findings | Where-Object Host -eq $h.Host)
+        $hp = @($hf | Where-Object { $_.Type -in @('IOC-HIT', 'AVDetection') }).Count
+        $pa = @($hf | Where-Object { $_.Type -eq 'ProcAnomaly' -and $_.Detail -match '^\[HIGH' }).Count
+        $bf = @($hf | Where-Object Type -eq 'BruteForce').Count
+        $rowClass = if ($hp -gt 0 -or $pa -gt 0) { 'HIGH' } else { '' }
+        $null = $fsb.AppendLine("<tr><td class='$rowClass'>$(ConvertTo-HtmlEsc $h.Host)</td><td>$hp</td><td>$pa</td><td>$bf</td><td>$(ConvertTo-HtmlEsc $h.Collected)</td></tr>")
+    }
+    $null = $fsb.AppendLine("</table>")
+    if ($highRisk.Count -gt 0) {
+        $null = $fsb.AppendLine("<h2>High-priority findings (IOC / AV)</h2><table><tr><th>Host</th><th>Type</th><th>Detail</th></tr>")
+        foreach ($f in ($highRisk | Sort-Object Host | Select-Object -First 100)) {
+            $null = $fsb.AppendLine("<tr><td class='IOC'>$(ConvertTo-HtmlEsc $f.Host)</td><td>$(ConvertTo-HtmlEsc $f.Type)</td><td class='path'>$(ConvertTo-HtmlEsc $f.Detail)</td></tr>")
+        }
+        $null = $fsb.AppendLine("</table>")
+    }
+    if ($crossHost.Count -gt 0) {
+        $null = $fsb.AppendLine("<h2>Cross-host indicators (outbreak signal)</h2><table><tr><th>Indicator</th><th>Hosts</th><th>Count</th></tr>")
+        foreach ($c in ($crossHost | Sort-Object HostCount -Descending | Select-Object -First 30)) {
+            $null = $fsb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $c.Indicator)</td><td>$(ConvertTo-HtmlEsc $c.Hosts)</td><td><b>$($c.HostCount)</b></td></tr>")
+        }
+        $null = $fsb.AppendLine("</table>")
+    }
+    $null = $fsb.AppendLine("<div class='foot'>Generated by IR-Triage -Mode Analyze. Per-host details: fleet_report.csv; Sigma timeline: fleet_hayabusa_timeline.csv / fleet_hayabusa_report.html</div></body></html>")
+    $fsb.ToString() | Set-Content -LiteralPath $fleetHtml -Encoding UTF8
+
     $summaryTxt = Join-Path $OutFolder 'fleet_summary.txt'
     $lines = @()
     $lines += "IR-Triage fleet analysis - $(Get-Date -Format u)"
@@ -577,6 +638,7 @@ function Invoke-AnalyzeMode {
     Write-Host ""
     Write-Host "================================================================" -ForegroundColor Green
     Write-Host "  fleet_report.csv  : $reportCsv" -ForegroundColor Green
+    Write-Host "  fleet_report.html : $fleetHtml" -ForegroundColor Green
     Write-Host "  fleet_summary.txt : $summaryTxt" -ForegroundColor Green
     if ($hayOut) { Write-Host "  hayabusa timeline : $hayOut" -ForegroundColor Green }
     Write-Host "================================================================" -ForegroundColor Green
@@ -669,6 +731,14 @@ function Invoke-FlashTriage {
             if ($svcRef.Count -gt 0) { $score += 2; $evidence.Add("persistence:service($($svcRef.Count))") }
             $taskRef = @($taskActions | Where-Object { $_ -and $_ -match [regex]::Escape($name) })
             if ($taskRef.Count -gt 0) { $score += 2; $evidence.Add("persistence:task($($taskRef.Count))") }
+        }
+        $iocHit = [bool]($iocHits | Where-Object { $_.Where -eq $b.Path })
+        $trustedSigned = ($b.SigStatus -eq 'Valid' -and (Test-TrustedPublisher $b.Signer))
+        if ($trustedSigned -and -not $iocHit) {
+            $score = [Math]::Min($score, 2)
+            $evidence.Add("signed-trusted-publisher:$($b.Signer)")
+        } elseif ($trustedSigned -and $iocHit) {
+            $evidence.Add("TRUSTED-PUBLISHER-BUT-IOC-HIT")
         }
         $verdict = if ($score -ge 7) { 'HIGH' } elseif ($score -ge 4) { 'MEDIUM' } else { 'LOW' }
         [pscustomobject]@{ PID = $b.PID; Name = $b.Name; Path = $b.Path; Score = $score; Verdict = $verdict; Evidence = ($evidence -join '; '); Flags = $b.Flags; Signer = $b.Signer }
@@ -1118,7 +1188,7 @@ $script:Modules = @(
             })
             Save-Rows -Name 'system_new_services' -Rows $svc
         } }
-    [pscustomobject]@{ Id = '4.6'; Cat = 'LOGS'; Name = 'Hayabusa Sigma hunt over exported evtx (needs tools\hayabusa)'; Default = $true; Quick = $false;
+    [pscustomobject]@{ Id = '4.6'; Cat = 'LOGS'; Name = 'Detection pack: hayabusa Sigma timeline + logon summary (needs tools\hayabusa)'; Default = $true; Quick = $false;
         Run = {
             $tDir = Get-ToolsDir
             $h = $null
@@ -1127,14 +1197,19 @@ $script:Modules = @(
             $evtxDir = Join-Path $RawDir 'evtx'
             if (-not (Test-Path $evtxDir)) { Write-CaseLog "    no evtx exported - skipping" 'DarkGray'; return }
             $out = Join-Path $CsvDir 'hayabusa_timeline.csv'
-            Write-CaseLog "    running hayabusa Sigma timeline (this may take a while)..." 'Cyan'
+            $html = Join-Path $CsvDir 'hayabusa_report.html'
+            Write-CaseLog "    hayabusa dfir-timeline Sigma hunt (may take a while)..." 'Cyan'
             Push-Location $h.DirectoryName
-            try { & $h.FullName csv-timeline -d "$evtxDir" -o "$out" -q 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' } }
-            finally { Pop-Location }
-            if (Test-Path $out) {
-                $n = @(Get-Content -LiteralPath $out | Select-Object -Skip 1).Count
-                Write-CaseLog "    hayabusa: $n detections in csv\hayabusa_timeline.csv" $(if ($n -gt 0) { 'Yellow' } else { 'Gray' })
-            } else { Write-CaseLog "    hayabusa produced no output" 'DarkYellow' }
+            try {
+                & $h.FullName dfir-timeline -d "$evtxDir" -o "$out" -H "$html" -q -w -U -C -K -m low 2>&1 | ForEach-Object { Write-CaseLog "      $(($_ -replace ([char]27 + '\[[0-9;]*m'), ''))" 'DarkGray' }
+                if (Test-Path $out) {
+                    $n = @(Get-Content -LiteralPath $out | Select-Object -Skip 1).Count
+                    Write-CaseLog "    hayabusa: $n timeline rows (level>=low) in csv\hayabusa_timeline.csv" $(if ($n -gt 0) { 'Yellow' } else { 'Gray' })
+                } else { Write-CaseLog "    hayabusa timeline produced no output" 'DarkYellow' }
+                Write-CaseLog "    hayabusa logon-summary..." 'Cyan'
+                $lsPrefix = Join-Path $CsvDir 'logon_summary'
+                & $h.FullName logon-summary -d "$evtxDir" -o "$lsPrefix" -q -C -K 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+            } finally { Pop-Location }
         } }
     [pscustomobject]@{ Id = '5.1'; Cat = 'ARTIFACTS'; Name = 'Prefetch files'; Default = $true; Quick = $false;
         Run = {
@@ -1157,7 +1232,12 @@ $script:Modules = @(
             foreach ($hive in @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY')) {
                 $out = Join-Path $dest "$hive.hiv"
                 & reg.exe save "HKLM\$hive" "$out" /y 2>&1 | Out-Null
-                if ($LASTEXITCODE -ne 0 -or -not (Test-Path $out)) { Write-CaseLog "    reg save $hive failed" 'DarkYellow' }
+                $saved = Test-Path $out
+                if ($saved) { $saved = ((Get-Item $out -ErrorAction SilentlyContinue).Length -gt 0) }
+                if ($LASTEXITCODE -ne 0 -or -not $saved) {
+                    if (Test-Path $out) { Remove-Item $out -Force -ErrorAction SilentlyContinue }
+                    Write-CaseLog "    reg save $hive failed (admin needed)" 'DarkYellow'
+                }
             }
             $amc = Join-Path $env:SystemRoot 'AppCompat\Programs\Amcache.hve'
             if (Test-Path $amc) {
@@ -1176,6 +1256,39 @@ $script:Modules = @(
             $out = Join-Path $dest 'SRUDB.dat'
             & esentutl.exe /y "$sru" /vss /d "$out" 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) { Write-CaseLog "    SRUM copy failed" 'DarkYellow' }
+        } }
+    [pscustomobject]@{ Id = '5.4'; Cat = 'ARTIFACTS'; Name = 'Execution history (chainsaw: shimcache+amcache timeline, SRUM, evtx gaps)'; Default = $true; Quick = $false;
+        Run = {
+            $tDir = Get-ToolsDir
+            $cs = $null
+            if ($tDir) { $cs = Get-ChildItem -Path $tDir -Recurse -Filter 'chainsaw*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1 }
+            if (-not $cs) { Write-CaseLog "    chainsaw not in tools\ - skipping (or run: -Mode Setup / -Mode Links)" 'DarkGray'; return }
+            $regDir = Join-Path $RawDir 'registry'
+            $sys = Join-Path $regDir 'SYSTEM.hiv'
+            $amc = Join-Path $regDir 'Amcache.hve'
+            $sft = Join-Path $regDir 'SOFTWARE.hiv'
+            if (-not (Test-Path $sys)) { Write-CaseLog "    registry hives not saved (enable module 5.2) - skipping" 'DarkGray'; return }
+            $out = Join-Path $CsvDir 'execution_timeline.csv'
+            $amArgs = @()
+            if (Test-Path $amc) { $amArgs = @('-a', $amc) }
+            Write-CaseLog "    chainsaw: shimcache/amcache execution timeline..." 'Cyan'
+            & $cs.FullName analyse shimcache "$sys" @amArgs -o "$out" 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+            if (Test-Path $out) {
+                $n = @(Get-Content -LiteralPath $out | Select-Object -Skip 1).Count
+                Write-CaseLog "    execution timeline: $n entries in csv\execution_timeline.csv" 'Gray'
+            } else { Write-CaseLog "    chainsaw shimcache analysis failed" 'DarkYellow' }
+            $sruCopy = Join-Path $RawDir 'sru\SRUDB.dat'
+            if ((Test-Path $sruCopy) -and (Test-Path $sft)) {
+                Write-CaseLog "    chainsaw: SRUM usage analysis..." 'Cyan'
+                & $cs.FullName analyse srum -s "$sft" "$sruCopy" -o (Join-Path $CsvDir 'srum_usage.csv') -q 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+            }
+            $evtxDir = Join-Path $RawDir 'evtx'
+            if (Test-Path $evtxDir) {
+                $anDir = Join-Path $RawDir 'analysis'
+                if (-not (Test-Path $anDir)) { New-Item -ItemType Directory -Path $anDir -Force | Out-Null }
+                Write-CaseLog "    chainsaw: evtx gap detection (tamper check)..." 'Cyan'
+                & $cs.FullName analyse gaps "$evtxDir" -q -o (Join-Path $anDir 'evtx_gaps.txt') 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+            }
         } }
     [pscustomobject]@{ Id = '6.1'; Cat = 'DEFENDER'; Name = 'Defender detections, exclusions, status'; Default = $true; Quick = $true;
         Run = {
@@ -1247,7 +1360,7 @@ $script:Modules = @(
             if (Test-Path $dump) {
                 $gb = [math]::Round((Get-Item $dump).Length / 1GB, 1)
                 Write-CaseLog "    Memory captured: $gb GB in $([int]$sw.Elapsed.TotalSeconds)s" 'Green'
-                $vol = Get-ChildItem -Path $tDir -Filter 'vol*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+                $vol = Get-ChildItem -Path $tDir -Recurse -Filter 'vol.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($vol) {
                     $anDir = Join-Path $RawDir 'memory-analysis'
                     New-Item -ItemType Directory -Path $anDir -Force | Out-Null
@@ -1386,6 +1499,141 @@ function Invoke-SelectedModules {
     }
 }
 
+function ConvertTo-HtmlEsc {
+    param([string]$s)
+    if ($null -eq $s) { return '' }
+    return ($s -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;')
+}
+
+function New-VtLink {
+    param([string]$Indicator, [string]$Label = '')
+    $i = ConvertTo-HtmlEsc $Indicator
+    $lbl = if ($Label) { ConvertTo-HtmlEsc $Label } else { $i }
+    if ($Indicator -match '^[a-fA-F0-9]{32,64}$' -or $Indicator -match '^(\d{1,3}\.){3}\d{1,3}$' -or $Indicator -match '\.[a-z]{2,}$') {
+        return "<a target='_blank' href='https://www.virustotal.com/gui/search/$i'>VT&nearr;</a>"
+    }
+    return $lbl
+}
+
+function Import-CaseCsv {
+    param([string]$Name)
+    $f = Join-Path $CsvDir $Name
+    if ((Test-Path $f) -and -not ((Get-Content $f -First 1) -match '^#')) {
+        try { return @(Import-Csv $f) } catch { return @() }
+    }
+    return @()
+}
+
+function New-HtmlReport {
+    $scored = Import-CaseCsv 'flash_process_scored.csv'
+    $iocHits = Import-CaseCsv 'flash_ioc_hits.csv'
+    $hayRows = Import-CaseCsv 'hayabusa_timeline.csv'
+    $execRows = Import-CaseCsv 'execution_timeline.csv'
+    $brute = Import-CaseCsv 'security_bruteforce_candidates.csv'
+    $pubConns = Import-CaseCsv 'flash_public_connections.csv'
+
+    $css = @'
+<style>
+body{background:#0f1115;color:#d7dce3;font-family:Segoe UI,Arial,sans-serif;margin:0;padding:24px}
+h1{font-size:22px;margin:0 0 4px} h2{font-size:16px;margin:32px 0 10px;color:#8ab4f8;border-bottom:1px solid #2a2f3a;padding-bottom:6px}
+.meta{color:#7d8590;font-size:12px}
+.chips{margin:16px 0}.chip{display:inline-block;padding:6px 14px;border-radius:16px;margin-right:8px;font-size:14px;font-weight:600}
+.card{background:#181b21;border:1px solid #2a2f3a;border-radius:8px;padding:14px;margin:10px 0}
+.badge{display:inline-block;padding:3px 10px;border-radius:10px;font-size:12px;font-weight:700;margin-right:8px}
+.HIGH{background:#5c1a1e;color:#ff8789}.MEDIUM{background:#5c470f;color:#ffce6b}.LOW{background:#1d3a26;color:#7ee2a8}.INFO{background:#243447;color:#9ec1f0}
+.ev{display:inline-block;background:#232833;border:1px solid #333b49;border-radius:4px;padding:2px 8px;margin:3px 4px 0 0;font-size:11px;color:#aab4c3}
+.path{font-family:Consolas,monospace;font-size:12px;color:#8ab4f8;word-break:break-all}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #2a2f3a;padding:6px 10px;text-align:left}
+th{background:#1d222c;color:#8ab4f8}tr:nth-child(even){background:#151920}
+.crit{color:#ff8789;font-weight:700}.high{color:#ffb35c}.med{color:#ffce6b}.low{color:#9ec1f0}.info{color:#7d8590}
+a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
+</style>
+'@
+
+    $sb = New-Object System.Text.StringBuilder
+    $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
+    $null = $sb.AppendLine("<h1>OPHIRA TRIAGE REPORT</h1>")
+    $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; IR-Triage v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' })</div>")
+
+    $high = @($scored | Where-Object Verdict -eq 'HIGH').Count
+    $med = @($scored | Where-Object Verdict -eq 'MEDIUM').Count
+    $low = @($scored | Where-Object Verdict -eq 'LOW').Count
+    $hayCrit = @($hayRows | Where-Object { $_.Level -match 'crit' }).Count
+    $hayHigh = @($hayRows | Where-Object { $_.Level -match '^high$' }).Count
+    $null = $sb.AppendLine("<div class='chips'>" +
+        "<span class='chip HIGH'>HIGH: $high</span><span class='chip MEDIUM'>MEDIUM: $med</span><span class='chip LOW'>LOW: $low</span>" +
+        "<span class='chip INFO'>IOC hits: $($iocHits.Count)</span><span class='chip INFO'>Sigma timeline: $($hayRows.Count) rows (crit:$hayCrit high:$hayHigh)</span></div>")
+
+    if ($iocHits.Count -gt 0) {
+        $null = $sb.AppendLine("<h2>IOC HITS - investigate first</h2><table><tr><th>Type</th><th>Indicator</th><th>Where</th><th>Context</th><th></th></tr>")
+        foreach ($h in $iocHits) {
+            $null = $sb.AppendLine("<tr><td><b>$($(ConvertTo-HtmlEsc $h.Type))</b></td><td class='path'>$(ConvertTo-HtmlEsc $h.Indicator)</td><td class='path'>$(ConvertTo-HtmlEsc $h.Where)</td><td>$(ConvertTo-HtmlEsc $h.Context)</td><td>$(New-VtLink $h.Indicator)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table>")
+    }
+
+    $null = $sb.AppendLine("<h2>Process verdicts (correlation scored)</h2>")
+    foreach ($p in ($scored | Sort-Object { [int]$_.Score } -Descending | Select-Object -First 30)) {
+        $evs = ($p.Evidence -split ';' | Where-Object { $_ }) | ForEach-Object { "<span class='ev'>$(ConvertTo-HtmlEsc $_)</span>" }
+        $null = $sb.AppendLine("<div class='card'><span class='badge $($p.Verdict)'>$($p.Verdict) &nbsp;$($p.Score)</span><b>$(ConvertTo-HtmlEsc $p.Name)</b> <span class='meta'>PID $(ConvertTo-HtmlEsc $p.PID)</span> $(New-VtLink $p.Name)<br><span class='path'>$(ConvertTo-HtmlEsc $p.Path)</span><br>$($evs -join ' ')</div>")
+    }
+
+    if ($hayRows.Count -gt 0) {
+        $alertCol = if ($hayRows[0].PSObject.Properties['Alert']) { 'Alert' } else { $null }
+        $null = $sb.AppendLine("<h2>Top Sigma detections (hayabusa)</h2>")
+        if ($alertCol) {
+            $groups = $hayRows | Group-Object $alertCol | Sort-Object Count -Descending | Select-Object -First 20
+            $null = $sb.AppendLine("<table><tr><th>Alert</th><th>Hits</th><th>Max level</th><th>Last seen</th></tr>")
+            foreach ($g in $groups) {
+                $lvl = (@($g.Group | ForEach-Object { $_.Level }) | Sort-Object -Descending | Select-Object -First 1)
+                $lvlClass = switch -Regex ("$lvl") { 'crit' { 'crit'; break } 'high' { 'high'; break } 'med' { 'med'; break } default { 'info' } }
+                $last = (@($g.Group | ForEach-Object { $_.Timestamp } | Sort-Object -Descending | Select-Object -First 1) -join '')
+                $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $g.Name)</td><td>$($g.Count)</td><td class='$lvlClass'>$lvl</td><td>$(ConvertTo-HtmlEsc $last)</td></tr>")
+            }
+            $null = $sb.AppendLine("</table>")
+        }
+        $null = $sb.AppendLine("<div class='meta'>Full timeline: csv\hayabusa_timeline.csv &nbsp;|&nbsp; hayabusa's own summary: csv\hayabusa_report.html</div>")
+    }
+
+    if ($execRows.Count -gt 0) {
+        $null = $sb.AppendLine("<h2>Execution history highlights (user-writable paths)</h2><table>")
+        $shown = 0
+        foreach ($r in $execRows) {
+            $line = ($r.PSObject.Properties | ForEach-Object { "$($_.Value)" }) -join ' '
+            if ($line -match '(?i)\\Users\\|\\AppData\\|\\Temp\\|\\ProgramData\\|\\Downloads\\') {
+                $ts = ($r.PSObject.Properties | Select-Object -First 1).Value
+                $pathCol = @($r.PSObject.Properties | Where-Object { "$($_.Value)" -match '(?i)\\.*\.(exe|dll|ps1|bat|scr|js|vbs)' } | Select-Object -First 1)
+                $pv = if ($pathCol) { "$($pathCol.Value)" } else { $line }
+                $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $ts)</td><td class='path'>$(ConvertTo-HtmlEsc $pv)</td></tr>")
+                $shown++
+                if ($shown -ge 40) { break }
+            }
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>First $shown of $($execRows.Count) entries - full: csv\execution_timeline.csv</div>")
+    }
+
+    if ($brute.Count -gt 0) {
+        $null = $sb.AppendLine("<h2>Brute-force candidates</h2><table><tr><th>Source IP</th><th>Failed logons</th><th></th></tr>")
+        foreach ($b in $brute) { $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $b.SourceIp)</td><td><b>$($b.FailedLogons)</b></td><td>$(New-VtLink $b.SourceIp)</td></tr>") }
+        $null = $sb.AppendLine("</table>")
+    }
+
+    if ($pubConns.Count -gt 0) {
+        $null = $sb.AppendLine("<h2>Public connections (live)</h2><table><tr><th>Remote</th><th>State</th><th>PID</th><th>Process</th><th></th></tr>")
+        foreach ($c in ($pubConns | Select-Object -First 25)) {
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $c.RemoteAddress):$(ConvertTo-HtmlEsc $c.RemotePort)</td><td>$(ConvertTo-HtmlEsc $c.State)</td><td>$(ConvertTo-HtmlEsc $c.PID)</td><td class='path'>$(ConvertTo-HtmlEsc $c.ProcessPath)</td><td>$(New-VtLink $c.RemoteAddress)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table>")
+    }
+
+    $null = $sb.AppendLine("<div class='foot'>Generated $(Get-Date -Format u) by IR-Triage v$ScriptVersion - all verdicts are correlation heuristics; verify against raw CSV/evtx evidence before acting.</div>")
+    $null = $sb.AppendLine("</body></html>")
+    $reportPath = Join-Path $CaseDir 'report.html'
+    $sb.ToString() | Set-Content -LiteralPath $reportPath -Encoding UTF8
+    Write-CaseLog "    report: $reportPath" 'Cyan'
+    return $reportPath
+}
+
 function New-Package {
     Write-Host ""
     Write-CaseLog "Packaging case folder..." 'Cyan'
@@ -1405,6 +1653,8 @@ function New-Package {
         OutputFolder = $CaseDir
     }
     $case | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $CaseDir 'case.json') -Encoding UTF8
+
+    try { New-HtmlReport | Out-Null } catch { Write-CaseLog "    report generation failed: $($_.Exception.Message)" 'DarkYellow' }
 
     $manifest = @()
     $manifest += "IR-Triage v$ScriptVersion evidence manifest"
@@ -1463,6 +1713,7 @@ function New-Package {
     Write-Host "  COLLECTION COMPLETE" -ForegroundColor Green
     Write-Host "================================================================" -ForegroundColor Green
     Write-Host "  Case folder : $CaseDir  ($sizeAll MB)"
+    if (Test-Path (Join-Path $CaseDir 'report.html')) { Write-Host "  Report      : $CaseDir\report.html  <-- open this first" -ForegroundColor Cyan }
     if ($zipped) { Write-Host "  Package     : $zipPath  ($zipSize MB)" -ForegroundColor White }
     if ($zipHash) { Write-Host "  Zip SHA256  : $zipHash" -ForegroundColor White }
     if ($shareResult) { Write-Host "  Share copy  : $shareResult" -ForegroundColor $(if ($shareResult -match 'FAILED') { 'Red' } else { 'Green' }) }

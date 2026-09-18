@@ -35,17 +35,18 @@ Owner handoff: send the whole folder, they double-click `RUN-TRIAGE.bat`, accept
    - VOLATILE — processes, full hashing, connections, DNS+ARP, sessions, drivers
    - PERSISTENCE — Run keys, startup folders, services, scheduled tasks, WMI subscriptions
    - NETWORK MAP — interfaces, reachable subnets, SMB, saved creds, Kerberos, proxy/WPAD, opt-in active probes
-   - LOGS — Security (4625 brute-force candidates), PowerShell 4104, Sysmon (auto-detected), RDP, System 7045, **raw evtx export**, optional **Hayabusa Sigma hunt**
-   - ARTIFACTS — Prefetch, registry hives (SYSTEM/SOFTWARE/SAM/SECURITY, Amcache.hve), UserAssist, SRUM
+   - LOGS — Security (4625 brute-force candidates), PowerShell 4104, Sysmon (auto-detected), RDP, System 7045, **raw evtx export**, **detection pack** (hayabusa Sigma timeline + HTML report + logon summary)
+   - ARTIFACTS — Prefetch, registry hives (SYSTEM/SOFTWARE/SAM/SECURITY, Amcache.hve), UserAssist, SRUM, **execution history** (chainsaw shimcache+amcache timeline, SRUM analysis, evtx gap/tamper detection)
    - DEFENDER — detections, exclusions, status, operational log
    - MEMORY — optional RAM capture (winpmem), optional Volatility 3 quick pass
-3. **Packaging** — SHA256 manifest per file + package hash, `case.json` metadata, ZIP (memory dump excluded, hashed separately)
+3. **Packaging** — SHA256 manifest per file + package hash, `case.json` metadata, **report.html** (verdict cards, IOC hits, top Sigma detections, execution timeline, VT links), ZIP (memory dump excluded, hashed separately)
 
 ## FP/TP decision support
 
 - **Correlation score** — evidence stacks per binary: user-path (+1), unsigned (+2), binary deleted (+3), public connection (+2), persistence refs (+2 each), IOC hash hit (+4) → verdict. A lone Electron app in AppData = LOW; process+task+service+connection+IOC = HIGH
+- **Trusted publishers** — validly-signed binaries from known publishers (or your own list in `tools\trusted.txt`, see sample) get capped at LOW — kills updater/Electron false positives; an IOC hit always overrides
+- **report.html** — one page per case: verdict cards with evidence chips, IOC hits, severity-colored Sigma detections, execution-timeline highlights, brute-force candidates — every hash/IP/domain gets a VirusTotal deep link
 - **IOC matching** — hashes/IPs/domains in `tools\iocs.txt` (see `tools/iocs.txt.sample`); hits print red and land in `flash_ioc_hits.csv`
-- **Sigma severity** — with hayabusa in `tools\`, every collection gets a scored detection timeline
 - **Raw evidence** — every flag is backed by raw CSV/evtx/hive so any verdict can be verified
 
 ## Companion tools
@@ -58,7 +59,7 @@ Owner handoff: send the whole folder, they double-click `RUN-TRIAGE.bat`, accept
 | chainsaw | offline Sigma hunt + shimcache/amcache execution timeline | https://github.com/WithSecureOpenSource/chainsaw/releases |
 | Velociraptor | if you later need always-on agent-based DFIR | https://github.com/Velocidex/velociraptor/releases |
 
-`-Mode Setup` downloads and installs the first four into `tools\` automatically (zips extract to `tools\<name>\`, found recursively). Manual placement anywhere in `tools\` works too.
+`-Mode Setup` downloads and installs the first four into `tools\` automatically (zips extract to `tools\<name>\`, found recursively). Manual placement anywhere in `tools\` works too. **This repo ships with the tools pre-installed in `tools\`** — the kit is self-contained; keep them updated via `-Mode Setup` or each tool's `update-rules`/release page.
 
 Analyst-side quick wins on a collected case:
 ```
@@ -69,7 +70,7 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 
 ## Analyze mode
 
-Merges N case zips → `fleet_report.csv` + `fleet_summary.txt`; flags **the same indicator on multiple hosts** (outbreak signal); optionally runs one hayabusa Sigma timeline across all hosts' evtx (auto-discovered in `tools\` or pass `-HayabusaPath`).
+Merges N case zips → `fleet_report.csv` + **`fleet_report.html`** (host summary, high-priority findings, cross-host indicator matrix) + `fleet_summary.txt`; optionally runs one hayabusa Sigma timeline across all hosts' evtx (auto-discovered in `tools\` or pass `-HayabusaPath`).
 
 ## Design rules
 
