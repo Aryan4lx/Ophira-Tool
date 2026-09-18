@@ -1,10 +1,11 @@
-# IR-Triage IOC list - one indicator per line, # comments allowed
+# Ophira IOC list - one indicator per line, # comments allowed
 # Auto-detected types:
-#   SHA256/MD5 hashes (32-64 hex chars)
-#   IPv4 addresses
-#   domains (matched with subdomains)
+#   SHA1 (40 hex)  - checked against amcache execution history
+#   SHA256/MD5 (64/32 hex) - checked against running processes
+#   IPv4 addresses - checked against live connections
+#   domains (matched with subdomains) - checked against DNS cache
 #
 # Examples:
-# 6f3be2a0e5f8f9c60d2b1c0a19e8d7c6b5a43210fedcba9876543210fedcba98
+# 6f3be2a0e5f8f9c60d2b1c0a19e8d7c6b5a43210
 # 185.220.101.4
 # evil-c2.example.com

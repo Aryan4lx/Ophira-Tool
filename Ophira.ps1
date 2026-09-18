@@ -1,5 +1,5 @@
 ﻿<#
-IR-Triage v1.0  -  Windows Incident Response Triage Collector
+Ophira v2.2  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -7,7 +7,7 @@ by a responder during early triage / threat hunting.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links')]
+    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links', 'UpdateRules')]
     [string]$Mode = 'Collect',
     [string]$CaseID = "",
     [string]$Analyst = "",
@@ -15,18 +15,21 @@ param(
     [ValidateSet('Flash', 'Quick', 'Standard', 'Full', 'Custom')]
     [string]$Preset = 'Standard',
     [switch]$NoMenu,
+    [switch]$SimpleUI,
     [switch]$IncludeMemory,
     [switch]$NoElevate,
     [int]$LogHours = 168,
     [string]$SharePath = "",
     [string[]]$ComputerName,
+    [string]$TargetsFile = '',
+    [int]$MaxThreads = 8,
     [string]$AnalyzePath = '.',
     [string]$HayabusaPath = '',
     [string[]]$SetupTools,
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.1"
+$ScriptVersion = "2.2"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -53,16 +56,34 @@ function Get-KitRoot {
     return (Get-Location).Path
 }
 
+$cfgFile = Join-Path (Get-KitRoot) 'ophira.config.txt'
+if (Test-Path -LiteralPath $cfgFile) {
+    try {
+        foreach ($line in (Get-Content -LiteralPath $cfgFile)) {
+            $l = ($line -replace '#.*$', '').Trim()
+            if ($l -match '^(SHARE|CASE|ANALYST)\s*=\s*(.+)$') {
+                $val = $Matches[2].Trim()
+                switch ($Matches[1]) {
+                    'SHARE' { if (-not $PSBoundParameters.ContainsKey('SharePath') -and $val) { $SharePath = $val } }
+                    'CASE' { if (-not $PSBoundParameters.ContainsKey('CaseID') -and $val) { $CaseID = $val } }
+                    'ANALYST' { if (-not $PSBoundParameters.ContainsKey('Analyst') -and $val) { $Analyst = $val } }
+                }
+            }
+        }
+    } catch { }
+}
+$script:SimpleUI = [bool]$SimpleUI
+
 function Write-CaseLog {
     param([string]$Message, [string]$Color = 'Gray', [switch]$NoConsole)
     $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Message
-    if (-not $NoConsole) { Write-Host $line -ForegroundColor $Color }
+    if (-not $NoConsole -and -not $script:SimpleUI) { Write-Host $line -ForegroundColor $Color }
     Add-Content -LiteralPath $CaseLog -Value $line -Encoding UTF8
 }
 
 function Out-Flash {
     param([string]$Text, [string]$Color = 'White')
-    Write-Host $Text -ForegroundColor $Color
+    if (-not $script:SimpleUI) { Write-Host $Text -ForegroundColor $Color }
     $script:FlashLines.Add(($Text -replace "\x1b\[[0-9;]*m", ''))
 }
 
@@ -72,14 +93,14 @@ function Save-Rows {
     try {
         if ($Rows -and @($Rows).Count -gt 0) {
             @($Rows) | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
-            return "csv\$Name.csv ({0} rows)" -f @($Rows).Count
+            Write-CaseLog ("    saved {0} rows -> csv\{1}.csv" -f @($Rows).Count, $Name) 'DarkGray'
         } else {
             "# no entries" | Set-Content -LiteralPath $path -Encoding UTF8
-            return "csv\$Name.csv (empty)"
+            Write-CaseLog "    csv\$Name.csv (empty)" 'DarkGray'
         }
     } catch {
         "FAILED: $($_.Exception.Message)" | Set-Content -LiteralPath $path -Encoding UTF8
-        return "FAILED"
+        Write-CaseLog "    csv\$Name.csv FAILED" 'DarkYellow'
     }
 }
 
@@ -313,11 +334,12 @@ function Get-IocList {
     if (-not $tDir) { return $null }
     $f = Join-Path $tDir 'iocs.txt'
     if (-not (Test-Path -LiteralPath $f)) { return $null }
-    $iocs = @{ Hashes = @{}; Ips = @{}; Domains = @{} }
+    $iocs = @{ Hashes = @{}; Sha1 = @{}; Ips = @{}; Domains = @{} }
     foreach ($line in (Get-Content -LiteralPath $f)) {
         $l = ($line -replace '#.*$', '').Trim()
         if (-not $l) { continue }
-        if ($l -match '^[a-fA-F0-9]{32,64}$') { $iocs.Hashes[$l.ToUpper()] = $true }
+        if ($l -match '^[a-fA-F0-9]{40}$') { $iocs.Sha1[$l.ToUpper()] = $true; $iocs.Hashes[$l.ToUpper()] = $true }
+        elseif ($l -match '^[a-fA-F0-9]{32,64}$') { $iocs.Hashes[$l.ToUpper()] = $true }
         elseif ($l -match '^(\d{1,3}\.){3}\d{1,3}$') { $iocs.Ips[$l] = $true }
         else { $iocs.Domains[$l.ToLower()] = $true }
     }
@@ -327,12 +349,14 @@ function Get-IocList {
 
 function Show-ToolLinks {
     Write-Host ""
-    Write-Host "=== IR-Triage companion tools ===" -ForegroundColor Cyan
+    Write-Host "=== Ophira companion tools ===" -ForegroundColor Cyan
     $rows = @(
         [pscustomobject]@{ Tool = 'winpmem (RAM capture)'; Url = 'https://github.com/Velocidex/winpmem/releases'; Use = 'module 7.1 memory capture; drop exe in tools\' }
         [pscustomobject]@{ Tool = 'hayabusa (Sigma hunt)'; Url = 'https://github.com/Yamato-Security/hayabusa/releases'; Use = 'module 4.6 on-host Sigma timeline; get win-x64.zip' }
         [pscustomobject]@{ Tool = 'volatility3 (memory analysis)'; Url = 'https://github.com/volatilityfoundation/volatility3/releases'; Use = 'offline: pslist/netscan/malfind; get win-exes zip, keep vol.exe' }
         [pscustomobject]@{ Tool = 'chainsaw (artifact analysis)'; Url = 'https://github.com/WithSecureOpenSource/chainsaw/releases'; Use = 'offline: sigma hunt + shimcache/amcache timeline' }
+        [pscustomobject]@{ Tool = 'AmcacheParser (EZ)'; Url = 'https://github.com/EricZimmerman/AmcacheParser/releases'; Use = 'module 8.4 execution inventory + SHA1 x IOC' }
+        [pscustomobject]@{ Tool = 'RBCmd (EZ)'; Url = 'https://github.com/EricZimmerman/RBCmd/releases'; Use = 'module 8.4 recycle bin parse' }
         [pscustomobject]@{ Tool = 'velociraptor (enterprise)'; Url = 'https://github.com/Velocidex/velociraptor/releases'; Use = 'if you move to always-on agent-based DFIR' }
     )
     $rows | Format-Table Tool, Url, Use -AutoSize | Out-String -Width 200 | Write-Host
@@ -341,6 +365,7 @@ function Show-ToolLinks {
 
 function Invoke-SetupMode {
     param([string[]]$Wanted)
+    if ($Wanted) { $Wanted = @($Wanted | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
     $toolsDir = Join-Path (Get-KitRoot) 'tools'
     New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
     $catalog = @(
@@ -348,6 +373,8 @@ function Invoke-SetupMode {
         [pscustomobject]@{ Name = 'hayabusa';    Repo = 'Yamato-Security/hayabusa';         Pattern = '^hayabusa-[\d\.]+-win-x64\.zip$'; Zip = $true }
         [pscustomobject]@{ Name = 'volatility3'; Repo = 'volatilityfoundation/volatility3'; Pattern = '^volatility3-win-exes-.*\.zip$'; Zip = $true }
         [pscustomobject]@{ Name = 'chainsaw';    Repo = 'WithSecureOpenSource/chainsaw';     Pattern = '^chainsaw_all_platforms\+rules\.zip$'; Zip = $true }
+        [pscustomobject]@{ Name = 'AmcacheParser'; Direct = 'https://download.ericzimmermanstools.com/AmcacheParser.zip'; Zip = $true }
+        [pscustomobject]@{ Name = 'RBCmd';       Direct = 'https://download.ericzimmermanstools.com/RBCmd.zip'; Zip = $true }
     )
     $installed = @()
     foreach ($t in $catalog) {
@@ -355,96 +382,159 @@ function Invoke-SetupMode {
         Write-Host ""
         Write-Host "=== $($t.Name) ===" -ForegroundColor Cyan
         try {
-            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$($t.Repo)/releases/latest" -Headers @{ 'User-Agent' = 'IR-Triage' } -TimeoutSec 30 -ErrorAction Stop
-            $asset = @($rel.assets | Where-Object { $_.name -match $t.Pattern } | Select-Object -First 1)[0]
-            if (-not $asset) { Write-Host "  no matching asset found in latest release ($($rel.tag_name)) - download manually: https://github.com/$($t.Repo)/releases" -ForegroundColor Yellow; continue }
-            $mb = [math]::Round($asset.size / 1MB, 1)
-            Write-Host "  latest: $($asset.name) ($mb MB)"
+            $assetUrl = $null
+            $assetName = $null
+            if ($t.PSObject.Properties['Direct' ] -and $t.Direct) {
+                $assetUrl = $t.Direct
+                $assetName = ($t.Direct -split '/')[-1]
+                Write-Host "  source: ericzimmermanstools.com ($assetName)"
+            } else {
+                $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$($t.Repo)/releases/latest" -Headers @{ 'User-Agent' = 'Ophira' } -TimeoutSec 30 -ErrorAction Stop
+                $asset = @($rel.assets | Where-Object { $_.name -match $t.Pattern } | Select-Object -First 1)[0]
+                if (-not $asset) { Write-Host "  no matching asset found in latest release ($($rel.tag_name)) - download manually: https://github.com/$($t.Repo)/releases" -ForegroundColor Yellow; continue }
+                $mb = [math]::Round($asset.size / 1MB, 1)
+                Write-Host "  latest: $($asset.name) ($mb MB)"
+                $assetUrl = $asset.browser_download_url
+                $assetName = $asset.name
+            }
             $confirm = Read-Host "  download to tools\? [Y/n]"
             if ($confirm -match '^[Nn]') { continue }
-            $tmp = Join-Path ([IO.Path]::GetTempPath()) $asset.name
-            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmp -UseBasicParsing -ErrorAction Stop
+            $tmp = Join-Path ([IO.Path]::GetTempPath()) $assetName
+            Invoke-WebRequest -Uri $assetUrl -OutFile $tmp -UseBasicParsing -ErrorAction Stop
             if ($t.Zip) {
                 $dest = Join-Path $toolsDir $t.Name
                 if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
                 Expand-Archive -LiteralPath $tmp -DestinationPath $dest -Force -ErrorAction Stop
                 Write-Host "  extracted -> tools\$($t.Name)\" -ForegroundColor Green
             } else {
-                Copy-Item -LiteralPath $tmp -Destination (Join-Path $toolsDir $asset.name) -Force -ErrorAction Stop
-                Write-Host "  saved -> tools\$($asset.name)" -ForegroundColor Green
+                Copy-Item -LiteralPath $tmp -Destination (Join-Path $toolsDir $assetName) -Force -ErrorAction Stop
+                Write-Host "  saved -> tools\$assetName" -ForegroundColor Green
             }
             Remove-Item $tmp -Force -ErrorAction SilentlyContinue
             $installed += $t.Name
         } catch {
             Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "  manual download: https://github.com/$($t.Repo)/releases" -ForegroundColor Yellow
+            if ($t.PSObject.Properties['Direct'] -and $t.Direct) { Write-Host "  manual download: $($t.Direct)" -ForegroundColor Yellow }
+            else { Write-Host "  manual download: https://github.com/$($t.Repo)/releases" -ForegroundColor Yellow }
         }
     }
     Write-Host ""
     Write-Host "Setup done: $(if ($installed) { $installed -join ', ' } else { 'nothing installed' })" -ForegroundColor $(if ($installed) { 'Green' } else { 'Yellow' })
-    Write-Host "hayabusa/volatility3/chainsaw live in tools\<name>\ subfolders - IR-Triage finds them recursively." -ForegroundColor Gray
+    Write-Host "hayabusa/volatility3/chainsaw live in tools\<name>\ subfolders - Ophira finds them recursively." -ForegroundColor Gray
 }
 
 function Invoke-DeployMode {
-    param([string[]]$Targets, [string]$DeployPreset, $Cred, [string]$DeployCaseID, [string]$DeploySharePath)
+    param([string[]]$Targets, [string]$DeployPreset, $Cred, [string]$DeployCaseID, [string]$DeploySharePath, [int]$Threads = 8)
+
     $kit = Get-KitRoot
-    $scriptPath = Join-Path $kit 'IR-Triage.ps1'
+    $scriptPath = Join-Path $kit 'Ophira.ps1'
     $tools = Join-Path $kit 'tools'
     $outFolder = Join-Path $kit 'collections'
-    if (-not (Test-Path $scriptPath)) { Write-Host "IR-Triage.ps1 not found in $kit" -ForegroundColor Red; return }
+    if (-not (Test-Path $scriptPath)) { Write-Host "Ophira.ps1 not found in $kit" -ForegroundColor Red; return }
     if (-not (Test-Path $outFolder)) { New-Item -ItemType Directory -Path $outFolder -Force | Out-Null }
-    $sessionParams = @{ ComputerName = ''; SessionOption = (New-PSSessionOption -NoMachineProfile) }
-    if ($Cred) { $sessionParams.Credential = $Cred }
-    $ok = @(); $fail = @()
-    $total = $Targets.Count; $i = 0
-    foreach ($c in $Targets) {
-        $i++
-        Write-Host "`n[$i/$total] $c" -ForegroundColor Cyan
+    $toolsDir = if (Test-Path $tools) { $tools } else { $null }
+
+    $worker = {
+        param($c, $scriptPath, $toolsDir, $preset, $caseID, $sharePath, $cred, $outFolder)
+        $result = [pscustomobject]@{ Host = $c; Ok = $false; Detail = '' }
+        $s = $null
         try {
-            $sessionParams.ComputerName = $c
-            $s = New-PSSession @sessionParams -ErrorAction Stop
-            $remoteDir = 'C:\Windows\Temp\IRTriage'
+            $sp = @{ ComputerName = $c; SessionOption = (New-PSSessionOption -NoMachineProfile) }
+            if ($cred) { $sp.Credential = $cred }
+            $s = New-PSSession @sp -ErrorAction Stop
+            $remoteDir = 'C:\Windows\Temp\Ophira'
             Invoke-Command -Session $s -ScriptBlock { $null = New-Item -ItemType Directory -Path $args[0] -Force } -ArgumentList $remoteDir -ErrorAction Stop | Out-Null
-            Copy-Item -Path $scriptPath -Destination "$remoteDir\IR-Triage.ps1" -ToSession $s -Force
-            if (Test-Path $tools) {
+            Copy-Item -Path $scriptPath -Destination "$remoteDir\Ophira.ps1" -ToSession $s -Force
+            if ($toolsDir) {
                 $rd = "$remoteDir\tools"
                 Invoke-Command -Session $s -ScriptBlock { $null = New-Item -ItemType Directory -Path $args[0] -Force } -ArgumentList $rd | Out-Null
-                Get-ChildItem $tools -File -Filter '*.txt' | ForEach-Object { Copy-Item -Path $_.FullName -Destination "$rd\$($_.Name)" -ToSession $s -Force }
-                if (Test-Path "$tools\iocs.txt") { Copy-Item -Path "$tools\iocs.txt" -Destination "$rd\iocs.txt" -ToSession $s -Force }
+                Get-ChildItem $toolsDir -File -Filter '*.txt' -ErrorAction SilentlyContinue | ForEach-Object {
+                    Copy-Item -Path $_.FullName -Destination "$rd\$($_.Name)" -ToSession $s -Force
+                }
             }
-            Write-Host "  kit copied, running collection ($DeployPreset preset)..." -ForegroundColor Gray
-            $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$remoteDir\IR-Triage.ps1`" -Mode Collect -NoMenu -NoElevate -Preset $DeployPreset -OutputPath `"$remoteDir\out`" -CaseID `"$DeployCaseID`""
-            if ($DeploySharePath) { $cmd += " -SharePath `"$DeploySharePath`"" }
+            $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$remoteDir\Ophira.ps1`" -Mode Collect -NoMenu -NoElevate -Preset $preset -OutputPath `"$remoteDir\out`" -CaseID `"$caseID`""
+            if ($sharePath) { $cmd += " -SharePath `"$sharePath`"" }
             $res = Invoke-Command -Session $s -ScriptBlock {
-                param($c, $t)
-                $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $c -Wait -PassThru -WindowStyle Hidden
+                param($k, $t)
+                $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $k -Wait -PassThru -WindowStyle Hidden
                 $z = Get-ChildItem "$t\out" -Filter '*.zip' -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
                 if ($z) { $z.FullName } else { "NORESULT:exit=$($p.ExitCode)" }
             } -ArgumentList $cmd, $remoteDir
             if ($res -and $res -notmatch '^NORESULT') {
-                if ($DeploySharePath) {
-                    Write-Host "  result uploaded to share: $res" -ForegroundColor Green
+                if ($sharePath) {
+                    $result.Detail = "uploaded to share ($res)"
                 } else {
-                    Copy-Item -Path $res -Destination $outFolder -FromSession $s -Force
-                    Write-Host "  pulled: $(Split-Path $res -Leaf) -> $outFolder" -ForegroundColor Green
+                    Copy-Item -Path $res -Destination $outFolder -FromSession $s -Force -ErrorAction Stop
+                    $result.Detail = "pulled $(Split-Path $res -Leaf)"
                 }
-                $ok += $c
-            } else {
-                Write-Host "  no result zip produced ($res)" -ForegroundColor Red
-                $fail += "$c (no output)"
-            }
-            Invoke-Command -Session $s -ScriptBlock { Remove-Item 'C:\Windows\Temp\IRTriage' -Recurse -Force -ErrorAction SilentlyContinue } -ErrorAction SilentlyContinue
-            Remove-PSSession $s -Confirm:$false
-        } catch {
-            Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
-            $fail += "$c ($($_.Exception.Message))"
-        }
+                $result.Ok = $true
+            } else { $result.Detail = "no result zip ($res)" }
+            Invoke-Command -Session $s -ScriptBlock { Remove-Item 'C:\Windows\Temp\Ophira' -Recurse -Force -ErrorAction SilentlyContinue } -ErrorAction SilentlyContinue
+        } catch { $result.Detail = $_.Exception.Message }
+        finally { if ($s) { Remove-PSSession $s -Confirm:$false -ErrorAction SilentlyContinue } }
+        return $result
     }
+
+    function Invoke-DeployBatch {
+        param([string[]]$Batch)
+        $pool = [runspacefactory]::CreateRunspacePool(1, [Math]::Max(1, $Threads))
+        $pool.Open()
+        $jobs = [System.Collections.ArrayList]::new()
+        foreach ($c in $Batch) {
+            $ps = [powershell]::Create()
+            $null = $ps.AddScript($worker.ToString()).AddArgument($c).AddArgument($scriptPath).AddArgument($toolsDir).AddArgument($DeployPreset).AddArgument($DeployCaseID).AddArgument($DeploySharePath).AddArgument($Cred).AddArgument($outFolder)
+            $ps.RunspacePool = $pool
+            $null = $jobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Target = $c })
+        }
+        $results = @()
+        while ($jobs.Count -gt 0) {
+            $doneIdx = @()
+            for ($i = 0; $i -lt $jobs.Count; $i++) {
+                if ($jobs[$i].Handle.IsCompleted) { $doneIdx += $i }
+            }
+            foreach ($i in ($doneIdx | Sort-Object -Descending)) {
+                $j = $jobs[$i]
+                try {
+                    $out = @($j.PS.EndInvoke($j.Handle))
+                    foreach ($o in $out) {
+                        $results += $o
+                        $mark = if ($o.Ok) { 'OK  ' } else { 'FAIL' }
+                        $col = if ($o.Ok) { 'Green' } else { 'Red' }
+                        Write-Host ("  [{0}] {1,-25} {2}" -f $mark, $o.Host, $o.Detail) -ForegroundColor $col
+                    }
+                } catch {
+                    $results += [pscustomobject]@{ Host = $j.Target; Ok = $false; Detail = "worker error: $($_.Exception.Message)" }
+                    Write-Host ("  [FAIL] {0,-25} worker error" -f $j.Target) -ForegroundColor Red
+                }
+                $j.PS.Dispose()
+                $jobs.RemoveAt($i)
+            }
+            if ($jobs.Count -gt 0) { Start-Sleep -Milliseconds 500 }
+        }
+        $pool.Close()
+        $pool.Dispose()
+        return $results
+    }
+
+    $total = $Targets.Count
+    Write-Host "Deploying to $total hosts ($Threads parallel, $DeployPreset preset)..." -ForegroundColor Cyan
+    $results = @(Invoke-DeployBatch -Batch $Targets)
+    $retry = @($results | Where-Object { -not $_.Ok } | Select-Object -ExpandProperty Host -Unique)
+    if ($retry.Count -gt 0) {
+        Write-Host "`nRetrying $($retry.Count) failed host(s) sequentially..." -ForegroundColor Yellow
+        $results += @(Invoke-DeployBatch -Batch $retry)
+        $results = @($results | Group-Object Host | ForEach-Object {
+            $good = @($_.Group | Where-Object Ok)
+            if ($good.Count -gt 0) { $good[0] } else { $_.Group | Select-Object -Last 1 }
+        })
+    }
+    $ok = @($results | Where-Object Ok)
+    $fail = @($results | Where-Object { -not $_.Ok })
     Write-Host "`n================================================================" -ForegroundColor Cyan
     Write-Host "  DEPLOYMENT SUMMARY: $($ok.Count)/$total succeeded" -ForegroundColor $(if ($fail.Count) { 'Yellow' } else { 'Green' })
-    if ($fail.Count) { $fail | ForEach-Object { Write-Host "  FAILED: $_" -ForegroundColor Red } }
+    if ($fail.Count) { $fail | ForEach-Object { Write-Host "  FAILED: $($_.Host) - $($_.Detail)" -ForegroundColor Red } }
     Write-Host "  Collections in: $(if ($DeploySharePath) { $DeploySharePath } else { $outFolder })"
-    Write-Host "  Next: .\IR-Triage.ps1 -Mode Analyze -AnalyzePath <that folder>" -ForegroundColor Cyan
+    Write-Host "  Next: .\Ophira.ps1 -Mode Analyze -AnalyzePath <that folder>" -ForegroundColor Cyan
     Write-Host "================================================================" -ForegroundColor Cyan
 }
 
@@ -462,11 +552,12 @@ function Invoke-AnalyzeMode {
         Write-Host "hayabusa not found at $HayabusaExe" -ForegroundColor Red; $HayabusaExe = ''
     }
     $sources = @()
+    $sources += Get-ChildItem $Path -Filter 'OPHIRA_*.zip' -File -ErrorAction SilentlyContinue
     $sources += Get-ChildItem $Path -Filter 'IRCASE_*.zip' -File -ErrorAction SilentlyContinue
-    foreach ($d in (Get-ChildItem $Path -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^IRCASE_' })) {
+    foreach ($d in (Get-ChildItem $Path -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(OPHIRA|IRCASE)_' })) {
         if ((Test-Path (Join-Path $d.FullName 'case.json')) -and -not ($sources | Where-Object { $_.BaseName -eq $d.Name })) { $sources += $d }
     }
-    if (-not $sources) { Write-Host "No IRCASE_* packages found in $Path" -ForegroundColor Red; return }
+    if (-not $sources) { Write-Host "No OPHIRA_*/IRCASE_* packages found in $Path" -ForegroundColor Red; return }
     $findings = @()
     $hosts = @()
     $evtxDirs = @()
@@ -482,7 +573,7 @@ function Invoke-AnalyzeMode {
                 $dir = $tmp
             } catch { Write-Host "cannot extract $($src.Name): $($_.Exception.Message)" -ForegroundColor Red; continue }
         }
-        $host_ = $src.Name -replace '^IRCASE_', '' -replace '_\d{8}_\d{6}.*$', ''
+        $host_ = $src.Name -replace '^(OPHIRA|IRCASE)_', '' -replace '_\d{8}_\d{6}.*$', ''
         $caseJson = Join-Path $dir 'case.json'
         $meta = $null
         if (Test-Path $caseJson) { try { $meta = Get-Content $caseJson -Raw | ConvertFrom-Json } catch { } }
@@ -502,6 +593,7 @@ function Invoke-AnalyzeMode {
                 'security_bruteforce_candidates.csv' = 'BruteForce'
                 'defender_threats.csv'               = 'AVDetection'
                 'system_new_services.csv'            = 'NewService'
+                'process_hashes.csv'                 = 'FileHash'
             }
             foreach ($k in $map.Keys) {
                 $f = Join-Path $csvDir $k
@@ -510,6 +602,7 @@ function Invoke-AnalyzeMode {
                         $rows = Import-Csv $f
                         foreach ($r in @($rows)) {
                             $detail = ''
+                            if ($k -eq 'process_hashes.csv') { $detail += "$($r.SHA256) $($r.Path) " }
                             if ($r.PSObject.Properties['Name']) { $detail += "$($r.Name) " }
                             if ($r.PSObject.Properties['Path']) { $detail += "$($r.Path) " }
                             if ($r.PSObject.Properties['Indicator']) { $detail += "[$($r.Indicator)] $($r.Where)" }
@@ -541,7 +634,7 @@ function Invoke-AnalyzeMode {
         $highRisk | Group-Object Host | ForEach-Object { Write-Host "    $($_.Name): $($_.Count)" -ForegroundColor Red }
     }
     $crossHost = @()
-    foreach ($g in ($findings | Where-Object { $_.Type -in @('ProcAnomaly', 'IOC-HIT', 'TaskFlagged', 'ServiceFlagged') } | Group-Object { ($_.Detail -split ' ')[0] })) {
+    foreach ($g in ($findings | Where-Object { $_.Type -in @('ProcAnomaly', 'IOC-HIT', 'TaskFlagged', 'ServiceFlagged', 'FileHash') } | Group-Object { ($_.Detail -split ' ')[0] })) {
         $hs = @($g.Group | Select-Object -ExpandProperty Host -Unique)
         if ($hs.Count -gt 1) { $crossHost += [pscustomobject]@{ Indicator = $g.Name; Hosts = ($hs -join ', '); HostCount = $hs.Count } }
     }
@@ -593,7 +686,7 @@ a{color:#8ab4f8}.foot{margin-top:40px;color:#565e6b;font-size:11px}
 '@
     $fsb = New-Object System.Text.StringBuilder
     $null = $fsb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira Fleet</title>$css</head><body>")
-    $null = $fsb.AppendLine("<h1>OPHIRA FLEET REPORT</h1><div class='meta'>$(Get-Date -Format u) - $($hosts.Count) hosts - $($findings.Count) findings - IR-Triage v$ScriptVersion</div>")
+    $null = $fsb.AppendLine("<h1>OPHIRA FLEET REPORT</h1><div class='meta'>$(Get-Date -Format u) - $($hosts.Count) hosts - $($findings.Count) findings - Ophira v$ScriptVersion</div>")
     $null = $fsb.AppendLine("<h2>Host summary</h2><table><tr><th>Host</th><th>High-priority</th><th>Proc anomalies</th><th>Brute force</th><th>Collected</th></tr>")
     foreach ($h in ($hosts | Sort-Object Host)) {
         $hf = @($findings | Where-Object Host -eq $h.Host)
@@ -618,12 +711,31 @@ a{color:#8ab4f8}.foot{margin-top:40px;color:#565e6b;font-size:11px}
         }
         $null = $fsb.AppendLine("</table>")
     }
-    $null = $fsb.AppendLine("<div class='foot'>Generated by IR-Triage -Mode Analyze. Per-host details: fleet_report.csv; Sigma timeline: fleet_hayabusa_timeline.csv / fleet_hayabusa_report.html</div></body></html>")
+    if ($hayOut -and (Test-Path $hayOut)) {
+        try {
+            $hayRows = @(Import-Csv -LiteralPath $hayOut)
+            $ruleCol = $null
+            foreach ($cand in @('RuleTitle', 'Alert', 'RuleFile')) {
+                if ($hayRows.Count -gt 0 -and $hayRows[0].PSObject.Properties[$cand]) { $ruleCol = $cand; break }
+            }
+            if ($hayRows.Count -gt 0 -and $ruleCol) {
+                $null = $fsb.AppendLine("<h2>Top Sigma detections across fleet</h2><table><tr><th>Alert</th><th>Hits</th><th>Max level</th><th>Hosts</th></tr>")
+                foreach ($g in ($hayRows | Group-Object $ruleCol | Sort-Object Count -Descending | Select-Object -First 20)) {
+                    $lvl = (@($g.Group | ForEach-Object { $_.Level }) | Sort-Object -Descending | Select-Object -First 1) -join ''
+                    $lvlClass = switch -Regex ("$lvl") { 'crit' { 'crit'; break } 'high' { 'high'; break } 'med' { 'med'; break } default { 'info' } }
+                    $hostsN = @($g.Group | ForEach-Object { $_.Computer } | Select-Object -Unique).Count
+                    $null = $fsb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $g.Name)</td><td>$($g.Count)</td><td class='$lvlClass'>$lvl</td><td>$hostsN</td></tr>")
+                }
+                $null = $fsb.AppendLine("</table><div class='meta'>Full timeline: fleet_hayabusa_timeline.csv / fleet_hayabusa_report.html</div>")
+            }
+        } catch { }
+    }
+    $null = $fsb.AppendLine("<div class='foot'>Generated by Ophira -Mode Analyze. Per-host details: fleet_report.csv; Sigma timeline: fleet_hayabusa_timeline.csv / fleet_hayabusa_report.html</div></body></html>")
     $fsb.ToString() | Set-Content -LiteralPath $fleetHtml -Encoding UTF8
 
     $summaryTxt = Join-Path $OutFolder 'fleet_summary.txt'
     $lines = @()
-    $lines += "IR-Triage fleet analysis - $(Get-Date -Format u)"
+    $lines += "Ophira fleet analysis - $(Get-Date -Format u)"
     $lines += "Hosts: $($hosts.Count)  Findings: $($findings.Count)"
     $lines += ""
     $lines += "HOSTS:"
@@ -818,8 +930,21 @@ function Invoke-FlashTriage {
     Save-Rows -Name 'flash_public_connections' -Rows $ext
 }
 
-function ConvertTo-Rot13 {
-    param([string]$s)
+function Get-UserProfileList {
+    $rows = @()
+    try {
+        $pl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+        foreach ($k in (Get-ChildItem $pl -ErrorAction SilentlyContinue)) {
+            $p = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+            if ($p.ProfileImagePath -and $k.PSChildName -match '^S-1-5-21-') {
+                $rows += [pscustomobject]@{ Sid = $k.PSChildName; Path = "$($p.ProfileImagePath)"; User = (Split-Path "$($p.ProfileImagePath)" -Leaf) }
+            }
+        }
+    } catch { }
+    return $rows
+}
+
+function ConvertTo-Rot13 {    param([string]$s)
     ($s.ToCharArray() | ForEach-Object {
         $c = [int]$_; $l = $c -band 0x20
         if ((($c -bor $l) -ge 97) -and (($c -bor $l) -le 122)) {
@@ -1374,6 +1499,172 @@ $script:Modules = @(
                 Write-CaseLog "    Memory capture FAILED" 'Red'
             }
         } }
+    [pscustomobject]@{ Id = '8.1'; Cat = 'CONTEXT'; Name = 'Attacker activity (console history, RDP targets, recycle bin)'; Default = $true; Quick = $true;
+        Run = {
+            $profiles = Get-UserProfileList
+            $dest = Join-Path $RawDir 'useractivity'
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            $hist = @()
+            foreach ($p in $profiles) {
+                foreach ($rel in @('AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt')) {
+                    $f = Join-Path $p.Path $rel
+                    if (Test-Path -LiteralPath $f) {
+                        $udir = Join-Path $dest $p.User
+                        if (-not (Test-Path $udir)) { New-Item -ItemType Directory -Path $udir -Force | Out-Null }
+                        try { Copy-Item -LiteralPath $f -Destination (Join-Path $udir 'ConsoleHost_history.txt') -Force -ErrorAction Stop } catch { }
+                        $hist += [pscustomobject]@{ User = $p.User; File = $f; KB = [math]::Round((Get-Item -LiteralPath $f).Length / 1KB, 1); LastWrite = (Get-Item -LiteralPath $f).LastWriteTime }
+                    }
+                }
+            }
+            Save-Rows -Name 'powershell_console_history' -Rows $hist
+            foreach ($h in $hist) { Write-CaseLog "    history: $($h.User) ($($h.KB) KB, $($h.LastWrite))" 'Gray' }
+            $rdp = @()
+            try {
+                foreach ($sid in (Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-' })) {
+                    $base = "Registry::HKEY_USERS\$($sid.PSChildName)\Software\Microsoft\Terminal Server Client\Servers"
+                    if (Test-Path $base) {
+                        foreach ($srv in (Get-ChildItem $base -ErrorAction SilentlyContinue)) {
+                            $hint = (Get-ItemProperty -Path $srv.PSPath -ErrorAction SilentlyContinue).UsernameHint
+                            $rdp += [pscustomobject]@{ User = $sid.PSChildName; TargetServer = $srv.PSChildName; UsernameHint = "$hint"; LastWrite = $srv.Name -replace '.*\\', '' }
+                        }
+                    }
+                }
+            } catch { }
+            Save-Rows -Name 'rdp_client_targets' -Rows $rdp
+            $rbRows = @()
+            $rbDest = Join-Path $RawDir 'recyclebin'
+            New-Item -ItemType Directory -Path $rbDest -Force | Out-Null
+            foreach ($drv in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | Where-Object { $_.Free -ne $null })) {
+                $rb = Join-Path $drv.Root '$Recycle.Bin'
+                if (Test-Path -LiteralPath $rb) {
+                    $files = Get-ChildItem -LiteralPath $rb -Recurse -Filter '$I*' -File -ErrorAction SilentlyContinue
+                    foreach ($f in $files) {
+                        $sidDir = Split-Path $f.DirectoryName -Leaf
+                        $rbRows += [pscustomobject]@{ Drive = $drv.Name; OwnerSid = $sidDir; File = $f.Name; Bytes = $f.Length; Deleted = $f.LastWriteTime }
+                        $sub = Join-Path $rbDest "$($drv.Name)_$sidDir"
+                        if (-not (Test-Path $sub)) { New-Item -ItemType Directory -Path $sub -Force | Out-Null }
+                        try { Copy-Item -LiteralPath $f.FullName -Destination $sub -Force -ErrorAction Stop } catch { }
+                    }
+                }
+            }
+            Save-Rows -Name 'recyclebin_index' -Rows $rbRows
+        } }
+    [pscustomobject]@{ Id = '8.2'; Cat = 'CONTEXT'; Name = 'User registry saves (NTUSER.DAT + UsrClass.dat, all profiles)'; Default = $true; Quick = $false;
+        Run = {
+            $dest = Join-Path $RawDir 'registry\users'
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            $saved = 0
+            foreach ($p in (Get-UserProfileList)) {
+                $nt = Join-Path $p.Path 'NTUSER.DAT'
+                $uc = Join-Path $p.Path 'AppData\Local\Microsoft\Windows\UsrClass.dat'
+                $loaded = Test-Path "Registry::HKEY_USERS\$($p.Sid)"
+                $loadedCls = Test-Path "Registry::HKEY_USERS\$($p.Sid)_Classes"
+                if (Test-Path -LiteralPath $nt) {
+                    $out = Join-Path $dest "$($p.User)_NTUSER.DAT"
+                    $ok = $false
+                    if ($loaded) { & reg.exe save "HKU\$($p.Sid)" "$out" /y 2>&1 | Out-Null; $ok = ($LASTEXITCODE -eq 0) }
+                    if (-not $ok) { try { Copy-Item -LiteralPath $nt -Destination $out -Force -ErrorAction Stop; $ok = $true } catch { } }
+                    if ($ok -and (Test-Path $out) -and ((Get-Item $out).Length -gt 0)) { $saved++ } elseif (Test-Path $out) { Remove-Item $out -Force -ErrorAction SilentlyContinue }
+                }
+                if (Test-Path -LiteralPath $uc) {
+                    $out = Join-Path $dest "$($p.User)_UsrClass.dat"
+                    $ok = $false
+                    if ($loadedCls) { & reg.exe save "HKU\$($p.Sid)_Classes" "$out" /y 2>&1 | Out-Null; $ok = ($LASTEXITCODE -eq 0) }
+                    if (-not $ok) { try { Copy-Item -LiteralPath $uc -Destination $out -Force -ErrorAction Stop; $ok = $true } catch { } }
+                    if ($ok -and (Test-Path $out) -and ((Get-Item $out).Length -gt 0)) { $saved++ } elseif (Test-Path $out) { Remove-Item $out -Force -ErrorAction SilentlyContinue }
+                }
+            }
+            Write-CaseLog "    saved $saved user hive files to raw\registry\users\" 'Gray'
+        } }
+    [pscustomobject]@{ Id = '8.3'; Cat = 'CONTEXT'; Name = 'Coverage & context (Sysmon config, task XML, BITS, domain info)'; Default = $true; Quick = $true;
+        Run = {
+            $cDir = Join-Path $RawDir 'context'
+            New-Item -ItemType Directory -Path $cDir -Force | Out-Null
+            foreach ($svc in @('Sysmon64', 'Sysmon')) {
+                $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$svc\Parameters"
+                if (Test-Path $k) {
+                    & reg.exe export "HKLM\SYSTEM\CurrentControlSet\Services\$svc\Parameters" (Join-Path $cDir "${svc}_Parameters.reg") /y 2>&1 | Out-Null
+                    break
+                }
+            }
+            try {
+                $tDir = Join-Path $RawDir 'tasks'
+                New-Item -ItemType Directory -Path $tDir -Force | Out-Null
+                if (Get-Command Export-ScheduledTask -ErrorAction SilentlyContinue) {
+                    $n = 0
+                    foreach ($t in (Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+                        try {
+                            $safe = ($t.TaskPath + $t.TaskName) -replace '[\\/:*?"<>|]', '_'
+                            if ($safe.Length -gt 150) { $safe = $safe.Substring(0, 150) }
+                            Export-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction Stop | Set-Content -LiteralPath (Join-Path $tDir "$safe.xml") -Encoding UTF8
+                            $n++
+                        } catch { }
+                    }
+                    Write-CaseLog "    exported $n task XMLs to raw\tasks\" 'Gray'
+                }
+            } catch { }
+            $bits = @()
+            try {
+                if (Get-Command Get-BitsTransfer -ErrorAction SilentlyContinue) {
+                    $bits = @(Get-BitsTransfer -AllUsers -ErrorAction SilentlyContinue | Select-Object DisplayName, OwnerAccount, JobState, TransferType, @{n = 'Files'; e = { @($_.Files) -join ';' } })
+                }
+            } catch { }
+            Save-Rows -Name 'bits_jobs' -Rows $bits
+            $cs = Get-WmiOrCim -Class Win32_ComputerSystem
+            $roleMap = @('Standalone Workstation', 'Member Workstation', 'Standalone Server', 'Member Server', 'Backup Domain Controller', 'Primary Domain Controller')
+            $dom = @()
+            if ($cs) {
+                $dom += [pscustomobject]@{
+                    Name = $cs.Name; Domain = $cs.Domain; PartOfDomain = $cs.PartOfDomain
+                    DomainRole = if ($cs.DomainRole -ne $null) { $roleMap[[int]$cs.DomainRole] } else { '' }
+                    LoggedUser = $cs.UserName
+                }
+            }
+            Save-Rows -Name 'domain_info' -Rows $dom
+            if ($cs -and $cs.PartOfDomain) {
+                Invoke-ExeCapture -SubDir 'context' -Name 'nltest_dsgetdc.txt' -Exe nltest.exe -Arguments "/dsgetdc:$env:USERDOMAIN"
+                Invoke-ExeCapture -SubDir 'context' -Name 'nltest_trusts.txt' -Exe nltest.exe -Arguments '/domain_trusts'
+            }
+        } }
+    [pscustomobject]@{ Id = '8.4'; Cat = 'CONTEXT'; Name = 'EZ forensic parsers (AmcacheParser + RBCmd, needs tools\)'; Default = $true; Quick = $false;
+        Run = {
+            $tDir = Get-ToolsDir
+            if (-not $tDir) { Write-CaseLog "    no tools\ - skipping" 'DarkGray'; return }
+            $amcExe = Get-ChildItem -Path $tDir -Recurse -Filter 'AmcacheParser*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            $rbExe = Get-ChildItem -Path $tDir -Recurse -Filter 'RBCmd*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            $amcHive = Join-Path $RawDir 'registry\Amcache.hve'
+            if ($amcExe -and (Test-Path $amcHive)) {
+                Write-CaseLog "    AmcacheParser: historical execution inventory..." 'Cyan'
+                & $amcExe.FullName -f "$amcHive" --csv "$CsvDir" --csvf amcache.csv 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+                $amcCsv = Join-Path $CsvDir 'amcache.csv'
+                if (Test-Path $amcCsv) {
+                    $n = @(Get-Content -LiteralPath $amcCsv | Select-Object -Skip 1).Count
+                    Write-CaseLog "    amcache: $n entries in csv\amcache.csv" 'Gray'
+                    $iocs = Get-IocList
+                    if ($iocs -and $iocs.Sha1.Count -gt 0) {
+                        try {
+                            $rows = Import-Csv -LiteralPath $amcCsv
+                            $sha1Col = ($rows[0].PSObject.Properties.Name | Where-Object { $_ -match '^sha1$' } | Select-Object -First 1)
+                            $nameCol = ($rows[0].PSObject.Properties.Name | Where-Object { $_ -match 'ApplicationName|SourceSimpleName|^Name$' } | Select-Object -First 1)
+                            $hits = @()
+                            foreach ($r in $rows) {
+                                $sv = "$($r.$sha1Col)".ToUpper() -replace '[^A-F0-9]', ''
+                                if ($sv -and $iocs.Sha1.ContainsKey($sv)) {
+                                    $hits += [pscustomobject]@{ Indicator = $sv; Application = "$($r.$nameCol)"; SourceFile = "$($r.SourceFile)"; Match = 'amcache-SHA1' }
+                                }
+                            }
+                            Save-Rows -Name 'ioc_hits_amcache' -Rows $hits
+                            if ($hits.Count) { Write-CaseLog "    AMCACHE IOC HITS: $($hits.Count) (csv\ioc_hits_amcache.csv)" 'Red' }
+                        } catch { Write-CaseLog "    amcache IOC xref failed: $($_.Exception.Message)" 'DarkYellow' }
+                    }
+                } else { Write-CaseLog "    AmcacheParser produced no output" 'DarkYellow' }
+            }
+            $rbSrc = Join-Path $RawDir 'recyclebin'
+            if ($rbExe -and (Test-Path $rbSrc) -and @(Get-ChildItem -LiteralPath $rbSrc -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
+                Write-CaseLog "    RBCmd: recycle bin parse..." 'Cyan'
+                & $rbExe.FullName -d "$rbSrc" -q --csv "$CsvDir" --csvf recyclebin.csv 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+            }
+        } }
 )
 
 function Get-FilteredEvents {
@@ -1435,7 +1726,7 @@ function Show-Menu {
     while ($true) {
         Clear-Host
         Write-Host "================================================================" -ForegroundColor Cyan
-        Write-Host "  IR-TRIAGE v$ScriptVersion   |   $Computer   |   Log range: $range" -ForegroundColor Cyan
+        Write-Host "  OPHIRA v$ScriptVersion   |   $Computer   |   Log range: $range" -ForegroundColor Cyan
         Write-Host "================================================================" -ForegroundColor Cyan
         $n = 0
         foreach ($cat in $cats) {
@@ -1480,21 +1771,52 @@ function Show-Menu {
 
 function Invoke-SelectedModules {
     param([hashtable]$Selection)
-    $total = @($Selection.Values | Where-Object { $_ }).Count
+    $selected = @($script:Modules | Where-Object { $Selection[$_.Id] })
+    $total = $selected.Count
     $done = 0
-    foreach ($m in $script:Modules) {
-        if (-not $Selection[$m.Id]) { continue }
-        $done++
+    if ($script:SimpleUI) {
+        $friendly = @{
+            'VOLATILE'    = 'Checking what is running right now'
+            'PERSISTENCE' = 'Checking how malware could survive a reboot'
+            'NETWORK MAP' = 'Mapping network connections'
+            'LOGS'        = 'Reviewing Windows security logs'
+            'ARTIFACTS'   = 'Preserving forensic evidence'
+            'CONTEXT'     = 'Collecting attacker activity traces'
+            'DEFENDER'    = 'Checking antivirus history'
+            'MEMORY'      = 'Capturing memory (the long step)'
+        }
+        $cats = @($selected | Group-Object Cat | ForEach-Object { $_.Name })
+        $step = 0
+        $swAll = [System.Diagnostics.Stopwatch]::StartNew()
+        foreach ($cat in $cats) {
+            $step++
+            Write-Host ""
+            Write-Host ("  Step {0}/{1}: {2}..." -f $step, $cats.Count, $friendly[$cat]) -ForegroundColor Cyan
+            foreach ($m in ($selected | Where-Object { $_.Cat -eq $cat })) {
+                $done++
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                try { & $m.Run } catch { Write-CaseLog ("    ERROR: {0}" -f $_.Exception.Message) 'Red' }
+                $sw.Stop()
+                Write-CaseLog ("Module {0} ({1}) done in {2:N1}s" -f $m.Id, $m.Name, $sw.Elapsed.TotalSeconds) 'DarkGray' -NoConsole
+            }
+        }
+        $swAll.Stop()
         Write-Host ""
-        Write-CaseLog ("[{0}/{1}] Module {2}: {3}" -f $done, $total, $m.Id, $m.Name) 'Cyan'
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        try {
-            & $m.Run
-            $sw.Stop()
-            Write-CaseLog ("    done in {0:N1}s" -f $sw.Elapsed.TotalSeconds) 'DarkGreen'
-        } catch {
-            $sw.Stop()
-            Write-CaseLog ("    ERROR: {0}" -f $_.Exception.Message) 'Red'
+        Write-Host ("  All steps finished in {0:N0} seconds. Packaging results..." -f $swAll.Elapsed.TotalSeconds) -ForegroundColor Cyan
+    } else {
+        foreach ($m in $selected) {
+            $done++
+            Write-Host ""
+            Write-CaseLog ("[{0}/{1}] Module {2}: {3}" -f $done, $total, $m.Id, $m.Name) 'Cyan'
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                & $m.Run
+                $sw.Stop()
+                Write-CaseLog ("    done in {0:N1}s" -f $sw.Elapsed.TotalSeconds) 'DarkGreen'
+            } catch {
+                $sw.Stop()
+                Write-CaseLog ("    ERROR: {0}" -f $_.Exception.Message) 'Red'
+            }
         }
     }
 }
@@ -1517,6 +1839,7 @@ function New-VtLink {
 
 function Import-CaseCsv {
     param([string]$Name)
+    if ($Name -notmatch '\.csv$') { $Name = "$Name.csv" }
     $f = Join-Path $CsvDir $Name
     if ((Test-Path $f) -and -not ((Get-Content $f -First 1) -match '^#')) {
         try { return @(Import-Csv $f) } catch { return @() }
@@ -1553,7 +1876,7 @@ a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
     $sb = New-Object System.Text.StringBuilder
     $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
     $null = $sb.AppendLine("<h1>OPHIRA TRIAGE REPORT</h1>")
-    $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; IR-Triage v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' })</div>")
+    $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' })</div>")
 
     $high = @($scored | Where-Object Verdict -eq 'HIGH').Count
     $med = @($scored | Where-Object Verdict -eq 'MEDIUM').Count
@@ -1572,6 +1895,15 @@ a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
         $null = $sb.AppendLine("</table>")
     }
 
+    $amcHits = Import-CaseCsv 'ioc_hits_amcache.csv'
+    if ($amcHits.Count -gt 0) {
+        $null = $sb.AppendLine("<h2>HISTORICAL EXECUTION IOC HITS (amcache) - near-certain TP evidence</h2><table><tr><th>SHA1</th><th>Application</th><th>Source</th><th></th></tr>")
+        foreach ($h in $amcHits) {
+            $null = $sb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $h.Indicator)</td><td>$(ConvertTo-HtmlEsc $h.Application)</td><td>$(ConvertTo-HtmlEsc $h.SourceFile)</td><td>$(New-VtLink $h.Indicator)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table>")
+    }
+
     $null = $sb.AppendLine("<h2>Process verdicts (correlation scored)</h2>")
     foreach ($p in ($scored | Sort-Object { [int]$_.Score } -Descending | Select-Object -First 30)) {
         $evs = ($p.Evidence -split ';' | Where-Object { $_ }) | ForEach-Object { "<span class='ev'>$(ConvertTo-HtmlEsc $_)</span>" }
@@ -1579,7 +1911,10 @@ a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
     }
 
     if ($hayRows.Count -gt 0) {
-        $alertCol = if ($hayRows[0].PSObject.Properties['Alert']) { 'Alert' } else { $null }
+        $alertCol = $null
+        foreach ($cand in @('RuleTitle', 'Alert', 'RuleFile')) {
+            if ($hayRows[0].PSObject.Properties[$cand]) { $alertCol = $cand; break }
+        }
         $null = $sb.AppendLine("<h2>Top Sigma detections (hayabusa)</h2>")
         if ($alertCol) {
             $groups = $hayRows | Group-Object $alertCol | Sort-Object Count -Descending | Select-Object -First 20
@@ -1626,7 +1961,7 @@ a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
         $null = $sb.AppendLine("</table>")
     }
 
-    $null = $sb.AppendLine("<div class='foot'>Generated $(Get-Date -Format u) by IR-Triage v$ScriptVersion - all verdicts are correlation heuristics; verify against raw CSV/evtx evidence before acting.</div>")
+    $null = $sb.AppendLine("<div class='foot'>Generated $(Get-Date -Format u) by Ophira v$ScriptVersion - all verdicts are correlation heuristics; verify against raw CSV/evtx evidence before acting.</div>")
     $null = $sb.AppendLine("</body></html>")
     $reportPath = Join-Path $CaseDir 'report.html'
     $sb.ToString() | Set-Content -LiteralPath $reportPath -Encoding UTF8
@@ -1634,12 +1969,42 @@ a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
     return $reportPath
 }
 
+function New-SuperTimeline {
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($name in @('security_events', 'powershell_events', 'sysmon_events', 'system_events', 'defender_events', 'rdp_localsession', 'rdp_connections')) {
+        foreach ($r in (Import-CaseCsv $name)) {
+            if ($r.PSObject.Properties['TimeCreated']) {
+                $rows.Add([pscustomobject]@{ Timestamp = "$($r.TimeCreated)"; Source = $name; Type = "EID $($r.Id)"; Detail = (("$($r.Message)") -replace '\s+', ' ').Trim() })
+            }
+        }
+    }
+    foreach ($r in (Import-CaseCsv 'hayabusa_timeline')) {
+        if ($r.PSObject.Properties['Timestamp']) {
+            $rule = if ($r.PSObject.Properties['RuleTitle']) { $r.RuleTitle } elseif ($r.PSObject.Properties['Alert']) { $r.Alert } else { $r.RuleFile }
+            $rows.Add([pscustomobject]@{ Timestamp = "$($r.Timestamp)"; Source = 'hayabusa'; Type = "$($r.Level): $rule"; Detail = "$($r.Details)" })
+        }
+    }
+    $exec = Import-CaseCsv 'execution_timeline'
+    if ($exec.Count -gt 0) {
+        $tCol = ($exec[0].PSObject.Properties.Name | Select-Object -First 1)
+        foreach ($r in $exec) {
+            $line = ($r.PSObject.Properties | ForEach-Object { "$($_.Value)" }) -join ' '
+            $rows.Add([pscustomobject]@{ Timestamp = "$($r.$tCol)"; Source = 'execution'; Type = 'shimcache/amcache'; Detail = $line })
+        }
+    }
+    if ($rows.Count -eq 0) { return }
+    $sorted = $rows | Sort-Object { try { [datetime]::Parse($_.Timestamp, [System.Globalization.CultureInfo]::InvariantCulture) } catch { [datetime]::MinValue } }
+    $out = Join-Path $CsvDir 'supertimeline.csv'
+    $sorted | Export-Csv -LiteralPath $out -NoTypeInformation -Encoding UTF8
+    Write-CaseLog "    supertimeline: $($rows.Count) events -> csv\supertimeline.csv" 'DarkGray'
+}
+
 function New-Package {
     Write-Host ""
     Write-CaseLog "Packaging case folder..." 'Cyan'
     $os = Get-WmiOrCim -Class Win32_OperatingSystem
     $case = [pscustomobject]@{
-        Tool = "IR-Triage v$ScriptVersion"
+        Tool = "Ophira v$ScriptVersion"
         CaseID = $script:CurrentCaseID
         Analyst = $script:CurrentAnalyst
         Computer = $Computer
@@ -1655,11 +2020,29 @@ function New-Package {
     $case | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $CaseDir 'case.json') -Encoding UTF8
 
     try { New-HtmlReport | Out-Null } catch { Write-CaseLog "    report generation failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-SuperTimeline } catch { Write-CaseLog "    supertimeline failed: $($_.Exception.Message)" 'DarkYellow' }
 
     $manifest = @()
-    $manifest += "IR-Triage v$ScriptVersion evidence manifest"
+    $manifest += "Ophira v$ScriptVersion evidence manifest"
     $manifest += "CaseID: $($script:CurrentCaseID)  Analyst: $($script:CurrentAnalyst)"
     $manifest += "Host: $Computer  Collected: $($StartTime.ToString('u'))"
+    $manifest += ""
+    try {
+        $selfHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+        $manifest += "SCRIPT: Ophira v$ScriptVersion  SHA256: $selfHash"
+    } catch { $manifest += "SCRIPT: Ophira v$ScriptVersion  (self-hash unavailable)" }
+    $tDirM = Get-ToolsDir
+    if ($tDirM) {
+        $toolExes = Get-ChildItem -Path $tDirM -Recurse -File -Include 'hayabusa*.exe', 'chainsaw*.exe', 'vol.exe', '*winpmem*.exe', 'AmcacheParser*.exe', 'RBCmd*.exe' -ErrorAction SilentlyContinue
+        if ($toolExes) {
+            $manifest += "TOOLS AVAILABLE:"
+            foreach ($exe in $toolExes) {
+                $th = ''
+                try { $th = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.Substring(0, 16) } catch { }
+                $manifest += "  $($exe.Name)  [$th...]"
+            }
+        }
+    }
     $manifest += ""
     $manifest += "{0,-70} {1,12} SHA256" -f "File", "SizeBytes"
     $files = Get-ChildItem -LiteralPath $CaseDir -Recurse -File | Where-Object { $_.Name -ne 'manifest.txt' -and $_.Name -notmatch '\.zip$' }
@@ -1697,30 +2080,35 @@ function New-Package {
     }
 
     $shareResult = ''
+    $script:ShareOk = $false
     if ($SharePath -and $zipped -and (Test-Path $zipPath)) {
         try {
             if (-not (Test-Path $SharePath)) { throw "share path not reachable: $SharePath" }
             Copy-Item -LiteralPath $zipPath -Destination $SharePath -Force -ErrorAction Stop
             $shareResult = "copied to $SharePath"
+            $script:ShareOk = $true
             Add-Content -LiteralPath (Join-Path $CaseDir 'manifest.txt') -Encoding UTF8 -Value "UPLOADED TO: $SharePath at $(Get-Date -Format u)"
         } catch { $shareResult = "SHARE COPY FAILED: $($_.Exception.Message)" }
     }
+    $script:FinalZipPath = if ($zipped -and (Test-Path $zipPath)) { $zipPath } else { (Join-Path $CaseDir 'report.html') }
 
     $sizeAll = [math]::Round((Get-ChildItem -LiteralPath $CaseDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
     $zipSize = if ($zipped) { [math]::Round((Get-Item $zipPath).Length / 1MB, 1) } else { 0 }
-    Write-Host ""
-    Write-Host "================================================================" -ForegroundColor Green
-    Write-Host "  COLLECTION COMPLETE" -ForegroundColor Green
-    Write-Host "================================================================" -ForegroundColor Green
-    Write-Host "  Case folder : $CaseDir  ($sizeAll MB)"
-    if (Test-Path (Join-Path $CaseDir 'report.html')) { Write-Host "  Report      : $CaseDir\report.html  <-- open this first" -ForegroundColor Cyan }
-    if ($zipped) { Write-Host "  Package     : $zipPath  ($zipSize MB)" -ForegroundColor White }
-    if ($zipHash) { Write-Host "  Zip SHA256  : $zipHash" -ForegroundColor White }
-    if ($shareResult) { Write-Host "  Share copy  : $shareResult" -ForegroundColor $(if ($shareResult -match 'FAILED') { 'Red' } else { 'Green' }) }
-    Write-Host "  Memory dump : $(if (Test-Path $MemDir) { "$MemDir (NOT in zip - send separately)" } else { 'not captured' })"
-    Write-Host ""
-    Write-Host "  Send the ZIP file (and memory dump if captured) to the analyst." -ForegroundColor Yellow
-    Write-Host "================================================================" -ForegroundColor Green
+    if (-not $script:SimpleUI) {
+        Write-Host ""
+        Write-Host "================================================================" -ForegroundColor Green
+        Write-Host "  COLLECTION COMPLETE" -ForegroundColor Green
+        Write-Host "================================================================" -ForegroundColor Green
+        Write-Host "  Case folder : $CaseDir  ($sizeAll MB)"
+        if (Test-Path (Join-Path $CaseDir 'report.html')) { Write-Host "  Report      : $CaseDir\report.html  <-- open this first" -ForegroundColor Cyan }
+        if ($zipped) { Write-Host "  Package     : $zipPath  ($zipSize MB)" -ForegroundColor White }
+        if ($zipHash) { Write-Host "  Zip SHA256  : $zipHash" -ForegroundColor White }
+        if ($shareResult) { Write-Host "  Share copy  : $shareResult" -ForegroundColor $(if ($shareResult -match 'FAILED') { 'Red' } else { 'Green' }) }
+        Write-Host "  Memory dump : $(if (Test-Path $MemDir) { "$MemDir (NOT in zip - send separately)" } else { 'not captured' })"
+        Write-Host ""
+        Write-Host "  Send the ZIP file (and memory dump if captured) to the analyst." -ForegroundColor Yellow
+        Write-Host "================================================================" -ForegroundColor Green
+    }
 }
 
 if ($Mode -ne 'Collect') {
@@ -1729,8 +2117,46 @@ if ($Mode -ne 'Collect') {
         'Setup' { Invoke-SetupMode -Wanted $SetupTools }
         'Analyze' { Invoke-AnalyzeMode -Path $AnalyzePath -HayabusaExe $HayabusaPath }
         'Deploy' {
-            if (-not $ComputerName) { Write-Host "-ComputerName required for Deploy mode" -ForegroundColor Red; exit 1 }
-            Invoke-DeployMode -Targets $ComputerName -DeployPreset $Preset -Cred $Credential -DeployCaseID $CaseID -DeploySharePath $SharePath
+            if ($TargetsFile -and (Test-Path -LiteralPath $TargetsFile)) {
+                $ComputerName += @(Get-Content -LiteralPath $TargetsFile | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_ })
+            }
+            if (-not $ComputerName) { Write-Host "-ComputerName or -TargetsFile required for Deploy mode" -ForegroundColor Red; exit 1 }
+            Invoke-DeployMode -Targets $ComputerName -DeployPreset $Preset -Cred $Credential -DeployCaseID $CaseID -DeploySharePath $SharePath -Threads $MaxThreads
+        }
+        'UpdateRules' {
+            $tDir = Get-ToolsDir
+            $h = $null
+            if ($tDir) { $h = Get-ChildItem -Path $tDir -Recurse -Filter 'hayabusa*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch 'live-response' } | Select-Object -First 1 }
+            if (-not $h) { Write-Host "hayabusa not found in tools\ - run -Mode Setup first" -ForegroundColor Red; exit 1 }
+            $rulesDir = Join-Path $h.DirectoryName 'rules'
+            $confirm = Read-Host "Replace hayabusa detection rules with the latest from hayabusa-rules? [Y/n]"
+            if ($confirm -match '^[Nn]') { exit 0 }
+            $bak = $null
+            if (Test-Path $rulesDir) {
+                $bak = "$rulesDir.bak"
+                if (Test-Path $bak) { Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue }
+                Move-Item -LiteralPath $rulesDir -Destination $bak -Force
+            }
+            try {
+                Write-Host "Downloading latest rules from hayabusa-rules..." -ForegroundColor Cyan
+                $zip = Join-Path ([IO.Path]::GetTempPath()) 'hayabusa-rules.zip'
+                Invoke-WebRequest -Uri 'https://github.com/Yamato-Security/hayabusa-rules/archive/refs/heads/main.zip' -OutFile $zip -UseBasicParsing -ErrorAction Stop
+                $ex = Join-Path ([IO.Path]::GetTempPath()) 'hayabusa-rules-extract'
+                if (Test-Path $ex) { Remove-Item $ex -Recurse -Force }
+                Expand-Archive -LiteralPath $zip -DestinationPath $ex -Force -ErrorAction Stop
+                $inner = Get-ChildItem $ex -Directory | Select-Object -First 1
+                if (-not $inner) { throw 'archive layout unexpected' }
+                Move-Item -LiteralPath $inner.FullName -Destination $rulesDir -Force -ErrorAction Stop
+                Remove-Item $zip, $ex -Recurse -Force -ErrorAction SilentlyContinue
+                $n = @(Get-ChildItem $rulesDir -Recurse -Filter '*.yml' -ErrorAction SilentlyContinue).Count
+                if ($n -eq 0) { throw 'no rule files found after extract' }
+                if ($bak -and (Test-Path $bak)) { Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue }
+                Write-Host "Rules updated ($n rule files). (Chainsaw Sigma rules: git pull in tools\chainsaw\sigma)" -ForegroundColor Green
+            } catch {
+                if ($bak -and (Test-Path $bak)) { Move-Item -LiteralPath $bak -Destination $rulesDir -Force }
+                Write-Host "Rules update FAILED ($($_.Exception.Message)) - previous rules restored." -ForegroundColor Red
+                exit 1
+            }
         }
     }
     exit 0
@@ -1752,7 +2178,7 @@ $Computer = $env:COMPUTERNAME
 $StartTime = Get-Date
 $Stamp = $StartTime.ToString('yyyyMMdd_HHmmss')
 $BaseDir = if ($OutputPath) { $OutputPath } else { Get-KitRoot }
-$CaseName = "IRCASE_${Computer}_${Stamp}"
+$CaseName = "OPHIRA_${Computer}_${Stamp}"
 $CaseDir = Join-Path $BaseDir $CaseName
 $CsvDir = Join-Path $CaseDir 'csv'
 $RawDir = Join-Path $CaseDir 'raw'
@@ -1768,13 +2194,12 @@ $IsAdmin = Test-IsAdmin
 $Sysmon = Get-SysmonState
 Clear-Host
 Write-Host "================================================================" -ForegroundColor Cyan
-Write-Host "     ____ _____ ____    _____ _   _ ____  _     ___   _ " -ForegroundColor Cyan
-Write-Host "    |  _ \_   _/ __|  |_   _| | | |  _ \| |   / _ \ / \" -ForegroundColor Cyan
-Write-Host "    | |_) || || |__     | | | |_| | |_)| |  | | | | ^ |" -ForegroundColor Cyan
-Write-Host "    |  _ < | ||  __|    | | |  _  |  _ <| |__| |_| |/ \| " -ForegroundColor Cyan
-Write-Host "    |_| \_\|_ |_|       |_| |_| |_|_| \____/ \___/_/ \_\" -ForegroundColor Cyan
+Write-Host "   ___  ___  ___ _  _ ___ _____ _   ___ ___   " -ForegroundColor Cyan
+Write-Host "  | _ \/ _ \| __| \| | _ \_   _/_\ | _ \ _ \ " -ForegroundColor Cyan
+Write-Host "  |  _/ (_) | _|| .\` |  _/ | |/ _ \|   /  _/" -ForegroundColor Cyan
+Write-Host "  |_|  \___/|___|_|\_|_|   |_/_/ \_\_|_\_|_\ " -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan
-Write-Host "  IR-Triage v$ScriptVersion  -  single-script Windows IR toolkit" -ForegroundColor White
+Write-Host "  Ophira v$ScriptVersion  -  single-script Windows IR toolkit" -ForegroundColor White
 Write-Host "  READ-ONLY: collects evidence, never changes the system" -ForegroundColor DarkGray
 Write-Host "  Modes: -Mode Collect | Deploy | Analyze | Setup | Links" -ForegroundColor DarkGray
 Write-Host "----------------------------------------------------------------" -ForegroundColor Cyan
@@ -1786,14 +2211,21 @@ Write-Host "  Output    : $CaseDir"
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host ""
 
-Write-CaseLog "IR-Triage v$ScriptVersion started on $Computer by $env:USERNAME (admin=$IsAdmin, sysmon=$Sysmon)" 'Gray' -NoConsole
+Write-CaseLog "Ophira v$ScriptVersion started on $Computer by $env:USERNAME (admin=$IsAdmin, sysmon=$Sysmon)" 'Gray' -NoConsole
 
 Invoke-FlashTriage
 
 $selection = Get-PresetSelection -P $Preset
-if ($NoMenu) {
+if ($NoMenu -or $script:SimpleUI) {
     Write-Host ""
-    Write-CaseLog "NoMenu mode: running preset '$Preset' ($(@($selection.Values | Where-Object { $_ }).Count) modules)" 'Cyan'
+    if ($script:SimpleUI) {
+        Write-Host "  First quick check done - details are saved for the security team." -ForegroundColor Cyan
+        Write-Host "  Now collecting the full evidence. This usually takes 3-5 minutes." -ForegroundColor Cyan
+        Write-Host "  Please DO NOT close this window until it says DONE." -ForegroundColor Yellow
+        Write-Host ""
+    } else {
+        Write-CaseLog "NoMenu mode: running preset '$Preset' ($(@($selection.Values | Where-Object { $_ }).Count) modules)" 'Cyan'
+    }
     if ($Preset -eq 'Flash') {
         Write-CaseLog "Flash-only preset: skipping deep modules" 'Gray'
         $selection = @{}
@@ -1814,7 +2246,32 @@ if (@($selection.Values | Where-Object { $_ }).Count -gt 0) {
 
 New-Package
 
-if (-not $NoMenu) {
+if ($script:SimpleUI) {
+    Write-Host ""
+    Write-Host "  ==============================================================" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "     DONE! Everything was collected successfully." -ForegroundColor Green
+    Write-Host ""
+    if ($script:ShareOk) {
+        Write-Host "     Your results were uploaded automatically." -ForegroundColor Green
+        Write-Host "     Nothing left to do - you can close this window." -ForegroundColor Green
+    } else {
+        Write-Host "     Please send this file to your security team:" -ForegroundColor White
+        Write-Host ""
+        Write-Host "     $script:FinalZipPath" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "     The file location is COPIED to your clipboard (Ctrl+V to paste)." -ForegroundColor White
+        Write-Host "     A folder window has opened with the file already selected." -ForegroundColor White
+        Write-Host "     If some items failed, send the file anyway - it holds everything" -ForegroundColor DarkGray
+        Write-Host "     that could be collected." -ForegroundColor DarkGray
+    }
+    Write-Host ""
+    Write-Host "  ==============================================================" -ForegroundColor Green
+    try { Set-Clipboard -Value $script:FinalZipPath } catch { }
+    if ($script:FinalZipPath -and (Test-Path -LiteralPath $script:FinalZipPath)) {
+        try { Start-Process explorer.exe -ArgumentList "/select,`"$($script:FinalZipPath)`"" } catch { }
+    }
+} elseif (-not $NoMenu) {
     Write-Host ""
     Write-Host "Press any key to close..." -ForegroundColor DarkGray
     try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }

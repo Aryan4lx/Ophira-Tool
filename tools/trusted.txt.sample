@@ -1,4 +1,4 @@
-# IR-Triage trusted publishers - one per line, # comments allowed
+﻿# Ophira trusted publishers - one per line, # comments allowed
 # Binaries with a VALID signature from these publishers get their flash
 # verdict capped at LOW (unless an IOC hash hit overrides it).
 # Add publishers common in YOUR environment (e.g. your company name).

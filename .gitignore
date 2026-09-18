@@ -1,6 +1,6 @@
-tools/*.exe
 *.zip
 IRCASE_*/
 collections/
 .vscode/
 tools/iocs.txt
+OPHIRA_*/
