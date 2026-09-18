@@ -1,0 +1,10 @@
+# IR-Triage IOC list - one indicator per line, # comments allowed
+# Auto-detected types:
+#   SHA256/MD5 hashes (32-64 hex chars)
+#   IPv4 addresses
+#   domains (matched with subdomains)
+#
+# Examples:
+# 6f3be2a0e5f8f9c60d2b1c0a19e8d7c6b5a43210fedcba9876543210fedcba98
+# 185.220.101.4
+# evil-c2.example.com

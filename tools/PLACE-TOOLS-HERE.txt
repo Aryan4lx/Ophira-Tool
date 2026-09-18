@@ -1,0 +1,2 @@
+Place winpmem64.exe (RAM capture) and/or vol.exe (Volatility 3 standalone) here.
+Module 7.1 finds them automatically. Without them, everything else still works.
