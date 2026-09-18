@@ -1,4 +1,4 @@
-<#
+﻿<#
 IR-Triage v1.0  -  Windows Incident Response Triage Collector
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
@@ -7,6 +7,8 @@ by a responder during early triage / threat hunting.
 
 [CmdletBinding()]
 param(
+    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links')]
+    [string]$Mode = 'Collect',
     [string]$CaseID = "",
     [string]$Analyst = "",
     [string]$OutputPath = "",
@@ -16,10 +18,15 @@ param(
     [switch]$IncludeMemory,
     [switch]$NoElevate,
     [int]$LogHours = 168,
-    [string]$SharePath = ""
+    [string]$SharePath = "",
+    [string[]]$ComputerName,
+    [string]$AnalyzePath = '.',
+    [string]$HayabusaPath = '',
+    [string[]]$SetupTools,
+    [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "1.2"
+$ScriptVersion = "2.0"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -41,34 +48,10 @@ function Get-ArgString {
     $parts -join ' '
 }
 
-if (-not (Test-IsAdmin) -and -not $NoElevate) {
-    Write-Host "[!] Not elevated. Requesting administrator rights..." -ForegroundColor Yellow
-    $argStr = Get-ArgString
-    try {
-        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $argStr"
-        exit
-    } catch {
-        Write-Host "[!] Elevation declined. Continuing with LIMITED access (many modules will fail)." -ForegroundColor Red
-        try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
-    }
+function Get-KitRoot {
+    if ($PSScriptRoot) { return $PSScriptRoot }
+    return (Get-Location).Path
 }
-
-$Computer = $env:COMPUTERNAME
-$StartTime = Get-Date
-$Stamp = $StartTime.ToString('yyyyMMdd_HHmmss')
-$BaseDir = if ($OutputPath) { $OutputPath } else { $PSScriptRoot }
-if (-not $BaseDir) { $BaseDir = (Get-Location).Path }
-$CaseName = "IRCASE_${Computer}_${Stamp}"
-$CaseDir = Join-Path $BaseDir $CaseName
-$CsvDir = Join-Path $CaseDir 'csv'
-$RawDir = Join-Path $CaseDir 'raw'
-$MemDir = Join-Path $CaseDir 'memory'
-$CaseLog = Join-Path $CaseDir 'collection.log'
-
-New-Item -ItemType Directory -Path $CsvDir, $RawDir -Force | Out-Null
-$script:FlashLines = New-Object System.Collections.Generic.List[string]
-$script:CurrentCaseID = $CaseID
-$script:CurrentAnalyst = $Analyst
 
 function Write-CaseLog {
     param([string]$Message, [string]$Color = 'Gray', [switch]$NoConsole)
@@ -298,8 +281,13 @@ function Get-SysmonState {
 }
 
 function Get-ToolsDir {
-    if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot 'tools'))) { return (Join-Path $PSScriptRoot 'tools') }
-    if (Test-Path (Join-Path $BaseDir 'tools')) { return (Join-Path $BaseDir 'tools') }
+    $root = Get-KitRoot
+    if (Test-Path (Join-Path $root 'tools')) { return (Join-Path $root 'tools') }
+    return $null
+}
+
+function Get-LogStart {
+    if ($script:LogHours -gt 0) { return (Get-Date).AddHours(-1 * $script:LogHours) }
     return $null
 }
 
@@ -318,6 +306,284 @@ function Get-IocList {
     }
     if ($iocs.Hashes.Count -eq 0 -and $iocs.Ips.Count -eq 0 -and $iocs.Domains.Count -eq 0) { return $null }
     return $iocs
+}
+
+function Show-ToolLinks {
+    Write-Host ""
+    Write-Host "=== IR-Triage companion tools ===" -ForegroundColor Cyan
+    $rows = @(
+        [pscustomobject]@{ Tool = 'winpmem (RAM capture)'; Url = 'https://github.com/Velocidex/winpmem/releases'; Use = 'module 7.1 memory capture; drop exe in tools\' }
+        [pscustomobject]@{ Tool = 'hayabusa (Sigma hunt)'; Url = 'https://github.com/Yamato-Security/hayabusa/releases'; Use = 'module 4.6 on-host Sigma timeline; get win-x64.zip' }
+        [pscustomobject]@{ Tool = 'volatility3 (memory analysis)'; Url = 'https://github.com/volatilityfoundation/volatility3/releases'; Use = 'offline: pslist/netscan/malfind; get win-exes zip, keep vol.exe' }
+        [pscustomobject]@{ Tool = 'chainsaw (artifact analysis)'; Url = 'https://github.com/WithSecureOpenSource/chainsaw/releases'; Use = 'offline: sigma hunt + shimcache/amcache timeline' }
+        [pscustomobject]@{ Tool = 'velociraptor (enterprise)'; Url = 'https://github.com/Velocidex/velociraptor/releases'; Use = 'if you move to always-on agent-based DFIR' }
+    )
+    $rows | Format-Table Tool, Url, Use -AutoSize | Out-String -Width 200 | Write-Host
+    Write-Host "Tip: -Mode Setup downloads winpmem/hayabusa/volatility3/chainsaw into tools\ automatically." -ForegroundColor Yellow
+}
+
+function Invoke-SetupMode {
+    param([string[]]$Wanted)
+    $toolsDir = Join-Path (Get-KitRoot) 'tools'
+    New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+    $catalog = @(
+        [pscustomobject]@{ Name = 'winpmem';     Repo = 'Velocidex/winpmem';                Pattern = '^go-winpmem_amd64.*signed\.exe$|^winpmem.*x64.*\.exe$'; Zip = $false }
+        [pscustomobject]@{ Name = 'hayabusa';    Repo = 'Yamato-Security/hayabusa';         Pattern = '^hayabusa-[\d\.]+-win-x64\.zip$'; Zip = $true }
+        [pscustomobject]@{ Name = 'volatility3'; Repo = 'volatilityfoundation/volatility3'; Pattern = '^volatility3-win-exes-.*\.zip$'; Zip = $true }
+        [pscustomobject]@{ Name = 'chainsaw';    Repo = 'WithSecureOpenSource/chainsaw';     Pattern = '^chainsaw_all_platforms\+rules\.zip$'; Zip = $true }
+    )
+    $installed = @()
+    foreach ($t in $catalog) {
+        if ($Wanted -and $Wanted.Count -gt 0 -and $t.Name -notin $Wanted) { continue }
+        Write-Host ""
+        Write-Host "=== $($t.Name) ===" -ForegroundColor Cyan
+        try {
+            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$($t.Repo)/releases/latest" -Headers @{ 'User-Agent' = 'IR-Triage' } -TimeoutSec 30 -ErrorAction Stop
+            $asset = @($rel.assets | Where-Object { $_.name -match $t.Pattern } | Select-Object -First 1)[0]
+            if (-not $asset) { Write-Host "  no matching asset found in latest release ($($rel.tag_name)) - download manually: https://github.com/$($t.Repo)/releases" -ForegroundColor Yellow; continue }
+            $mb = [math]::Round($asset.size / 1MB, 1)
+            Write-Host "  latest: $($asset.name) ($mb MB)"
+            $confirm = Read-Host "  download to tools\? [Y/n]"
+            if ($confirm -match '^[Nn]') { continue }
+            $tmp = Join-Path ([IO.Path]::GetTempPath()) $asset.name
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmp -UseBasicParsing -ErrorAction Stop
+            if ($t.Zip) {
+                $dest = Join-Path $toolsDir $t.Name
+                if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+                Expand-Archive -LiteralPath $tmp -DestinationPath $dest -Force -ErrorAction Stop
+                Write-Host "  extracted -> tools\$($t.Name)\" -ForegroundColor Green
+            } else {
+                Copy-Item -LiteralPath $tmp -Destination (Join-Path $toolsDir $asset.name) -Force -ErrorAction Stop
+                Write-Host "  saved -> tools\$($asset.name)" -ForegroundColor Green
+            }
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+            $installed += $t.Name
+        } catch {
+            Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  manual download: https://github.com/$($t.Repo)/releases" -ForegroundColor Yellow
+        }
+    }
+    Write-Host ""
+    Write-Host "Setup done: $(if ($installed) { $installed -join ', ' } else { 'nothing installed' })" -ForegroundColor $(if ($installed) { 'Green' } else { 'Yellow' })
+    Write-Host "hayabusa/volatility3/chainsaw live in tools\<name>\ subfolders - IR-Triage finds them recursively." -ForegroundColor Gray
+}
+
+function Invoke-DeployMode {
+    param([string[]]$Targets, [string]$DeployPreset, $Cred, [string]$DeployCaseID, [string]$DeploySharePath)
+    $kit = Get-KitRoot
+    $scriptPath = Join-Path $kit 'IR-Triage.ps1'
+    $tools = Join-Path $kit 'tools'
+    $outFolder = Join-Path $kit 'collections'
+    if (-not (Test-Path $scriptPath)) { Write-Host "IR-Triage.ps1 not found in $kit" -ForegroundColor Red; return }
+    if (-not (Test-Path $outFolder)) { New-Item -ItemType Directory -Path $outFolder -Force | Out-Null }
+    $sessionParams = @{ ComputerName = ''; SessionOption = (New-PSSessionOption -NoMachineProfile) }
+    if ($Cred) { $sessionParams.Credential = $Cred }
+    $ok = @(); $fail = @()
+    $total = $Targets.Count; $i = 0
+    foreach ($c in $Targets) {
+        $i++
+        Write-Host "`n[$i/$total] $c" -ForegroundColor Cyan
+        try {
+            $sessionParams.ComputerName = $c
+            $s = New-PSSession @sessionParams -ErrorAction Stop
+            $remoteDir = 'C:\Windows\Temp\IRTriage'
+            Invoke-Command -Session $s -ScriptBlock { $null = New-Item -ItemType Directory -Path $args[0] -Force } -ArgumentList $remoteDir -ErrorAction Stop | Out-Null
+            Copy-Item -Path $scriptPath -Destination "$remoteDir\IR-Triage.ps1" -ToSession $s -Force
+            if (Test-Path $tools) {
+                $rd = "$remoteDir\tools"
+                Invoke-Command -Session $s -ScriptBlock { $null = New-Item -ItemType Directory -Path $args[0] -Force } -ArgumentList $rd | Out-Null
+                Get-ChildItem $tools -File -Filter '*.txt' | ForEach-Object { Copy-Item -Path $_.FullName -Destination "$rd\$($_.Name)" -ToSession $s -Force }
+                if (Test-Path "$tools\iocs.txt") { Copy-Item -Path "$tools\iocs.txt" -Destination "$rd\iocs.txt" -ToSession $s -Force }
+            }
+            Write-Host "  kit copied, running collection ($DeployPreset preset)..." -ForegroundColor Gray
+            $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$remoteDir\IR-Triage.ps1`" -Mode Collect -NoMenu -NoElevate -Preset $DeployPreset -OutputPath `"$remoteDir\out`" -CaseID `"$DeployCaseID`""
+            if ($DeploySharePath) { $cmd += " -SharePath `"$DeploySharePath`"" }
+            $res = Invoke-Command -Session $s -ScriptBlock {
+                param($c, $t)
+                $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $c -Wait -PassThru -WindowStyle Hidden
+                $z = Get-ChildItem "$t\out" -Filter '*.zip' -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($z) { $z.FullName } else { "NORESULT:exit=$($p.ExitCode)" }
+            } -ArgumentList $cmd, $remoteDir
+            if ($res -and $res -notmatch '^NORESULT') {
+                if ($DeploySharePath) {
+                    Write-Host "  result uploaded to share: $res" -ForegroundColor Green
+                } else {
+                    Copy-Item -Path $res -Destination $outFolder -FromSession $s -Force
+                    Write-Host "  pulled: $(Split-Path $res -Leaf) -> $outFolder" -ForegroundColor Green
+                }
+                $ok += $c
+            } else {
+                Write-Host "  no result zip produced ($res)" -ForegroundColor Red
+                $fail += "$c (no output)"
+            }
+            Invoke-Command -Session $s -ScriptBlock { Remove-Item 'C:\Windows\Temp\IRTriage' -Recurse -Force -ErrorAction SilentlyContinue } -ErrorAction SilentlyContinue
+            Remove-PSSession $s -Confirm:$false
+        } catch {
+            Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
+            $fail += "$c ($($_.Exception.Message))"
+        }
+    }
+    Write-Host "`n================================================================" -ForegroundColor Cyan
+    Write-Host "  DEPLOYMENT SUMMARY: $($ok.Count)/$total succeeded" -ForegroundColor $(if ($fail.Count) { 'Yellow' } else { 'Green' })
+    if ($fail.Count) { $fail | ForEach-Object { Write-Host "  FAILED: $_" -ForegroundColor Red } }
+    Write-Host "  Collections in: $(if ($DeploySharePath) { $DeploySharePath } else { $outFolder })"
+    Write-Host "  Next: .\IR-Triage.ps1 -Mode Analyze -AnalyzePath <that folder>" -ForegroundColor Cyan
+    Write-Host "================================================================" -ForegroundColor Cyan
+}
+
+function Invoke-AnalyzeMode {
+    param([string]$Path, [string]$HayabusaExe)
+    if (-not (Test-Path $Path)) { Write-Host "Path not found: $Path" -ForegroundColor Red; return }
+    $OutFolder = $Path
+    if (-not $HayabusaExe) {
+        $tDir = Get-ToolsDir
+        if ($tDir) {
+            $h = Get-ChildItem -Path $tDir -Recurse -Filter 'hayabusa*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch 'live-response' } | Select-Object -First 1
+            if ($h) { $HayabusaExe = $h.FullName }
+        }
+    } elseif (-not (Test-Path $HayabusaExe)) {
+        Write-Host "hayabusa not found at $HayabusaExe" -ForegroundColor Red; $HayabusaExe = ''
+    }
+    $sources = @()
+    $sources += Get-ChildItem $Path -Filter 'IRCASE_*.zip' -File -ErrorAction SilentlyContinue
+    foreach ($d in (Get-ChildItem $Path -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^IRCASE_' })) {
+        if ((Test-Path (Join-Path $d.FullName 'case.json')) -and -not ($sources | Where-Object { $_.BaseName -eq $d.Name })) { $sources += $d }
+    }
+    if (-not $sources) { Write-Host "No IRCASE_* packages found in $Path" -ForegroundColor Red; return }
+    $findings = @()
+    $hosts = @()
+    $evtxDirs = @()
+    foreach ($src in $sources) {
+        $tmp = $null
+        $dir = $src.FullName
+        if ($src -is [System.IO.FileInfo]) {
+            $tmp = Join-Path ([IO.Path]::GetTempPath()) ("fleet_" + $src.BaseName)
+            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+            try {
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                [IO.Compression.ZipFile]::ExtractToDirectory($src.FullName, $tmp)
+                $dir = $tmp
+            } catch { Write-Host "cannot extract $($src.Name): $($_.Exception.Message)" -ForegroundColor Red; continue }
+        }
+        $host_ = $src.Name -replace '^IRCASE_', '' -replace '_\d{8}_\d{6}.*$', ''
+        $caseJson = Join-Path $dir 'case.json'
+        $meta = $null
+        if (Test-Path $caseJson) { try { $meta = Get-Content $caseJson -Raw | ConvertFrom-Json } catch { } }
+        if ($meta -and $meta.Computer) { $host_ = $meta.Computer }
+        $hosts += [pscustomobject]@{
+            Host = $host_; Source = $src.Name; CaseID = $meta.CaseID
+            Collected = $meta.StartedUTC; Admin = $meta.AdminElevated; Sysmon = $meta.SysmonPresent
+        }
+        $csvDir = Join-Path $dir 'csv'
+        if (Test-Path $csvDir) {
+            $map = @{
+                'flash_process_scored.csv'           = 'ProcAnomaly'
+                'flash_ioc_hits.csv'                 = 'IOC-HIT'
+                'flash_public_connections.csv'       = 'PublicConn'
+                'scheduled_tasks_flagged.csv'        = 'TaskFlagged'
+                'services_flagged.csv'               = 'ServiceFlagged'
+                'security_bruteforce_candidates.csv' = 'BruteForce'
+                'defender_threats.csv'               = 'AVDetection'
+                'system_new_services.csv'            = 'NewService'
+            }
+            foreach ($k in $map.Keys) {
+                $f = Join-Path $csvDir $k
+                if ((Test-Path $f) -and -not ((Get-Content $f -First 1) -match '^#')) {
+                    try {
+                        $rows = Import-Csv $f
+                        foreach ($r in @($rows)) {
+                            $detail = ''
+                            if ($r.PSObject.Properties['Name']) { $detail += "$($r.Name) " }
+                            if ($r.PSObject.Properties['Path']) { $detail += "$($r.Path) " }
+                            if ($r.PSObject.Properties['Indicator']) { $detail += "[$($r.Indicator)] $($r.Where)" }
+                            if ($r.PSObject.Properties['SourceIp']) { $detail += "$($r.SourceIp) ($($r.FailedLogons) failures)" }
+                            if ($r.PSObject.Properties['ThreatName']) { $detail += "$($r.ThreatName) $($r.Resources)" }
+                            if ($r.PSObject.Properties['RemoteAddress']) { $detail += "$($r.RemoteAddress):$($r.RemotePort) <- $($r.ProcessPath)" }
+                            if ($r.PSObject.Properties['Service']) { $detail += "$($r.Service) $($r.Binary)" }
+                            if ($r.PSObject.Properties['Verdict']) { $detail = "[$($r.Verdict) $($r.Score)] " + $detail + " {$($r.Evidence)}" }
+                            if (-not $detail) { $detail = ($r.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ' }
+                            $findings += [pscustomobject]@{ Host = $host_; Type = $map[$k]; Detail = $detail.Trim(); Source = $k }
+                        }
+                    } catch { }
+                }
+            }
+        }
+        $e = Join-Path $dir 'raw\evtx'
+        if (Test-Path $e) { $evtxDirs += $e }
+    }
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Cyan
+    Write-Host "  FLEET ANALYSIS - $($hosts.Count) hosts, $($findings.Count) findings" -ForegroundColor Cyan
+    Write-Host "================================================================" -ForegroundColor Cyan
+    $byType = $findings | Group-Object Type | Sort-Object Count -Descending
+    Write-Host "`n  Findings by type:" -ForegroundColor White
+    foreach ($g in $byType) { Write-Host ("    {0,-14} {1}" -f $g.Name, $g.Count) }
+    $highRisk = @($findings | Where-Object { $_.Type -in @('IOC-HIT', 'AVDetection') })
+    if ($highRisk.Count) {
+        Write-Host "`n  *** HIGH-PRIORITY (IOC hits / AV detections) ***" -ForegroundColor Red
+        $highRisk | Group-Object Host | ForEach-Object { Write-Host "    $($_.Name): $($_.Count)" -ForegroundColor Red }
+    }
+    $crossHost = @()
+    foreach ($g in ($findings | Where-Object { $_.Type -in @('ProcAnomaly', 'IOC-HIT', 'TaskFlagged', 'ServiceFlagged') } | Group-Object { ($_.Detail -split ' ')[0] })) {
+        $hs = @($g.Group | Select-Object -ExpandProperty Host -Unique)
+        if ($hs.Count -gt 1) { $crossHost += [pscustomobject]@{ Indicator = $g.Name; Hosts = ($hs -join ', '); HostCount = $hs.Count } }
+    }
+    if ($crossHost.Count) {
+        Write-Host "`n  SAME INDICATOR ON MULTIPLE HOSTS (outbreak signal):" -ForegroundColor Magenta
+        $crossHost | Sort-Object HostCount -Descending | Select-Object -First 20 | ForEach-Object {
+            Write-Host ("    {0,-45} {1} hosts: {2}" -f $_.Indicator, $_.HostCount, $_.Hosts) -ForegroundColor Magenta
+        }
+    }
+    $hayOut = $null
+    if ($HayabusaExe -and $evtxDirs.Count -gt 0) {
+        Write-Host "`n  Running hayabusa fleet timeline over $($evtxDirs.Count) hosts' evtx..." -ForegroundColor Cyan
+        $merged = Join-Path ([IO.Path]::GetTempPath()) 'fleet_merged_evtx'
+        if (Test-Path $merged) { Remove-Item $merged -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Path $merged -Force | Out-Null
+        $i = 0
+        foreach ($e in $evtxDirs) {
+            $i++
+            Get-ChildItem $e -Filter '*.evtx' -File -ErrorAction SilentlyContinue | ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $merged ("{0}_{1}" -f $i, $_.Name)) -Force
+            }
+        }
+        $hayOut = Join-Path $OutFolder 'fleet_hayabusa_timeline.csv'
+        $hDir = Split-Path $HayabusaExe -Parent
+        Push-Location $hDir
+        try { & $HayabusaExe csv-timeline -d "$merged" -o "$hayOut" -q 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray } }
+        finally { Pop-Location }
+        if (Test-Path $hayOut) {
+            $n = @(Get-Content $hayOut | Select-Object -Skip 1).Count
+            Write-Host "    hayabusa: $n detections -> $hayOut" -ForegroundColor Yellow
+        }
+        Remove-Item $merged -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $reportCsv = Join-Path $OutFolder 'fleet_report.csv'
+    $findings | Sort-Object Host, Type | Export-Csv -LiteralPath $reportCsv -NoTypeInformation -Encoding UTF8
+    $summaryTxt = Join-Path $OutFolder 'fleet_summary.txt'
+    $lines = @()
+    $lines += "IR-Triage fleet analysis - $(Get-Date -Format u)"
+    $lines += "Hosts: $($hosts.Count)  Findings: $($findings.Count)"
+    $lines += ""
+    $lines += "HOSTS:"
+    foreach ($h in $hosts) { $lines += "  $($h.Host)  collected=$($h.Collected) admin=$($h.Admin) sysmon=$($h.Sysmon) src=$($h.Source)" }
+    $lines += ""
+    $lines += "HIGH PRIORITY:"
+    if ($highRisk.Count) { foreach ($f in $highRisk) { $lines += "  $($f.Host) $($f.Type) $($f.Detail)" } } else { $lines += "  none" }
+    $lines += ""
+    $lines += "CROSS-HOST INDICATORS:"
+    if ($crossHost.Count) { foreach ($c in $crossHost) { $lines += "  $($c.Indicator) -> $($c.Hosts)" } } else { $lines += "  none" }
+    $lines | Set-Content -LiteralPath $summaryTxt -Encoding UTF8
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Green
+    Write-Host "  fleet_report.csv  : $reportCsv" -ForegroundColor Green
+    Write-Host "  fleet_summary.txt : $summaryTxt" -ForegroundColor Green
+    if ($hayOut) { Write-Host "  hayabusa timeline : $hayOut" -ForegroundColor Green }
+    Write-Host "================================================================" -ForegroundColor Green
+    foreach ($src in $sources) {
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ("fleet_" + $src.BaseName)
+        if ($tmp -and (Test-Path $tmp)) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Invoke-FlashTriage {
@@ -776,7 +1042,7 @@ $script:Modules = @(
         } }
     [pscustomobject]@{ Id = '4.1'; Cat = 'LOGS'; Name = 'Security log (auth events + evtx export)'; Default = $true; Quick = $false;
         Run = {
-            $start = if ($LogHours -gt 0) { (Get-Date).AddHours(-1 * $LogHours) } else { $null }
+            $start = Get-LogStart
             $ids = @(4624, 4625, 4648, 4672, 4720, 4722, 4724, 4726, 4728, 4732, 4735, 4756, 4688, 1102)
             $ev = Get-FilteredEvents -LogName 'Security' -Ids $ids -Start $start
             Save-Rows -Name 'security_events' -Rows $ev
@@ -799,7 +1065,7 @@ $script:Modules = @(
         } }
     [pscustomobject]@{ Id = '4.2'; Cat = 'LOGS'; Name = 'PowerShell operational log (4104 script blocks)'; Default = $true; Quick = $false;
         Run = {
-            $start = if ($LogHours -gt 0) { (Get-Date).AddHours(-1 * $LogHours) } else { $null }
+            $start = Get-LogStart
             $ev = Get-FilteredEvents -LogName 'Microsoft-Windows-PowerShell/Operational' -Ids @(4104, 400, 600) -Start $start -MaxMsg 2000
             Save-Rows -Name 'powershell_events' -Rows $ev
             Export-Evtx -LogName 'Microsoft-Windows-PowerShell/Operational' -FileName 'PowerShell_Operational.evtx'
@@ -807,7 +1073,7 @@ $script:Modules = @(
     [pscustomobject]@{ Id = '4.3'; Cat = 'LOGS'; Name = 'Sysmon logs (auto-skips if not installed)'; Default = $true; Quick = $false;
         Run = {
             if (-not (Get-SysmonState)) { Write-CaseLog "    Sysmon not present - skipping" 'DarkGray'; return }
-            $start = if ($LogHours -gt 0) { (Get-Date).AddHours(-1 * $LogHours) } else { $null }
+            $start = Get-LogStart
             $ids = @(1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 20, 21, 22, 23, 25)
             $ev = Get-FilteredEvents -LogName 'Microsoft-Windows-Sysmon/Operational' -Ids $ids -Start $start
             Save-Rows -Name 'sysmon_events' -Rows $ev
@@ -831,7 +1097,7 @@ $script:Modules = @(
         } }
     [pscustomobject]@{ Id = '4.4'; Cat = 'LOGS'; Name = 'RDP logs (LocalSessionManager + ConnectionManager)'; Default = $true; Quick = $false;
         Run = {
-            $start = if ($LogHours -gt 0) { (Get-Date).AddHours(-1 * $LogHours) } else { $null }
+            $start = Get-LogStart
             $ev1 = Get-FilteredEvents -LogName 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' -Ids @(21, 22, 24, 25, 39, 40) -Start $start -MaxMsg 300
             Save-Rows -Name 'rdp_localsession' -Rows $ev1
             Export-Evtx -LogName 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' -FileName 'RDP_LocalSessionManager.evtx'
@@ -841,7 +1107,7 @@ $script:Modules = @(
         } }
     [pscustomobject]@{ Id = '4.5'; Cat = 'LOGS'; Name = 'System log (service installs 7045, changes 7040)'; Default = $true; Quick = $false;
         Run = {
-            $start = if ($LogHours -gt 0) { (Get-Date).AddHours(-1 * $LogHours) } else { $null }
+            $start = Get-LogStart
             $ev = Get-FilteredEvents -LogName 'System' -Ids @(7045, 7040, 104, 6005, 6006) -Start $start
             Save-Rows -Name 'system_events' -Rows $ev
             $svc = @($ev | Where-Object { $_.Id -eq 7045 } | ForEach-Object {
@@ -852,17 +1118,19 @@ $script:Modules = @(
             })
             Save-Rows -Name 'system_new_services' -Rows $svc
         } }
-    [pscustomobject]@{ Id = '4.6'; Cat = 'LOGS'; Name = 'Hayabusa Sigma hunt over exported evtx (needs tools\hayabusa*.exe)'; Default = $true; Quick = $false;
+    [pscustomobject]@{ Id = '4.6'; Cat = 'LOGS'; Name = 'Hayabusa Sigma hunt over exported evtx (needs tools\hayabusa)'; Default = $true; Quick = $false;
         Run = {
             $tDir = Get-ToolsDir
             $h = $null
-            if ($tDir) { $h = Get-ChildItem -Path $tDir -Filter 'hayabusa*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1 }
-            if (-not $h) { Write-CaseLog "    hayabusa not in tools\ - skipping (analyst can run it offline on the zip)" 'DarkGray'; return }
+            if ($tDir) { $h = Get-ChildItem -Path $tDir -Recurse -Filter 'hayabusa*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch 'live-response' } | Select-Object -First 1 }
+            if (-not $h) { Write-CaseLog "    hayabusa not in tools\ - skipping (or run: -Mode Setup / -Mode Links)" 'DarkGray'; return }
             $evtxDir = Join-Path $RawDir 'evtx'
             if (-not (Test-Path $evtxDir)) { Write-CaseLog "    no evtx exported - skipping" 'DarkGray'; return }
             $out = Join-Path $CsvDir 'hayabusa_timeline.csv'
             Write-CaseLog "    running hayabusa Sigma timeline (this may take a while)..." 'Cyan'
-            & $h.FullName csv-timeline -d "$evtxDir" -o "$out" -q -w 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+            Push-Location $h.DirectoryName
+            try { & $h.FullName csv-timeline -d "$evtxDir" -o "$out" -q 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' } }
+            finally { Pop-Location }
             if (Test-Path $out) {
                 $n = @(Get-Content -LiteralPath $out | Select-Object -Skip 1).Count
                 Write-CaseLog "    hayabusa: $n detections in csv\hayabusa_timeline.csv" $(if ($n -gt 0) { 'Yellow' } else { 'Gray' })
@@ -943,7 +1211,7 @@ $script:Modules = @(
             Save-Rows -Name 'defender_status' -Rows $status
             Save-Rows -Name 'defender_threats' -Rows $threats
             Save-Rows -Name 'defender_preferences' -Rows $prefs
-            $start = if ($LogHours -gt 0) { (Get-Date).AddHours(-1 * $LogHours) } else { $null }
+            $start = Get-LogStart
             $ev = Get-FilteredEvents -LogName 'Microsoft-Windows-Windows Defender/Operational' -Ids @(1116, 1117, 5001, 5007) -Start $start -MaxMsg 500
             Save-Rows -Name 'defender_events' -Rows $ev
             Export-Evtx -LogName 'Microsoft-Windows-Windows Defender/Operational' -FileName 'Defender_Operational.evtx'
@@ -951,9 +1219,9 @@ $script:Modules = @(
     [pscustomobject]@{ Id = '7.1'; Cat = 'MEMORY'; Name = 'RAM capture via winpmem (needs tools\winpmem, LARGE output)'; Default = $false; Quick = $false;
         Run = {
             $tool = $null
-            $tDir = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'tools' } else { Join-Path $BaseDir 'tools' }
-            if (Test-Path $tDir) {
-                $tool = Get-ChildItem -Path $tDir -Filter 'winpmem*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            $tDir = Get-ToolsDir
+            if ($tDir) {
+                $tool = Get-ChildItem -Path $tDir -Recurse -Filter '*winpmem*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
             }
             if (-not $tool) {
                 Write-CaseLog "    winpmem not found in tools\ folder" 'Yellow'
@@ -1204,6 +1472,47 @@ function New-Package {
     Write-Host "================================================================" -ForegroundColor Green
 }
 
+if ($Mode -ne 'Collect') {
+    switch ($Mode) {
+        'Links' { Show-ToolLinks }
+        'Setup' { Invoke-SetupMode -Wanted $SetupTools }
+        'Analyze' { Invoke-AnalyzeMode -Path $AnalyzePath -HayabusaExe $HayabusaPath }
+        'Deploy' {
+            if (-not $ComputerName) { Write-Host "-ComputerName required for Deploy mode" -ForegroundColor Red; exit 1 }
+            Invoke-DeployMode -Targets $ComputerName -DeployPreset $Preset -Cred $Credential -DeployCaseID $CaseID -DeploySharePath $SharePath
+        }
+    }
+    exit 0
+}
+
+if (-not (Test-IsAdmin) -and -not $NoElevate) {
+    Write-Host "[!] Not elevated. Requesting administrator rights..." -ForegroundColor Yellow
+    $argStr = Get-ArgString
+    try {
+        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $argStr"
+        exit
+    } catch {
+        Write-Host "[!] Elevation declined. Continuing with LIMITED access (many modules will fail)." -ForegroundColor Red
+        try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
+    }
+}
+
+$Computer = $env:COMPUTERNAME
+$StartTime = Get-Date
+$Stamp = $StartTime.ToString('yyyyMMdd_HHmmss')
+$BaseDir = if ($OutputPath) { $OutputPath } else { Get-KitRoot }
+$CaseName = "IRCASE_${Computer}_${Stamp}"
+$CaseDir = Join-Path $BaseDir $CaseName
+$CsvDir = Join-Path $CaseDir 'csv'
+$RawDir = Join-Path $CaseDir 'raw'
+$MemDir = Join-Path $CaseDir 'memory'
+$CaseLog = Join-Path $CaseDir 'collection.log'
+
+New-Item -ItemType Directory -Path $CsvDir, $RawDir -Force | Out-Null
+$script:FlashLines = New-Object System.Collections.Generic.List[string]
+$script:CurrentCaseID = $CaseID
+$script:CurrentAnalyst = $Analyst
+
 $IsAdmin = Test-IsAdmin
 $Sysmon = Get-SysmonState
 Clear-Host
@@ -1214,8 +1523,9 @@ Write-Host "    | |_) || || |__     | | | |_| | |_)| |  | | | | ^ |" -Foreground
 Write-Host "    |  _ < | ||  __|    | | |  _  |  _ <| |__| |_| |/ \| " -ForegroundColor Cyan
 Write-Host "    |_| \_\|_ |_|       |_| |_| |_|_| \____/ \___/_/ \_\" -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan
-Write-Host "  IR-Triage v$ScriptVersion  -  Windows Incident Response Collector" -ForegroundColor White
+Write-Host "  IR-Triage v$ScriptVersion  -  single-script Windows IR toolkit" -ForegroundColor White
 Write-Host "  READ-ONLY: collects evidence, never changes the system" -ForegroundColor DarkGray
+Write-Host "  Modes: -Mode Collect | Deploy | Analyze | Setup | Links" -ForegroundColor DarkGray
 Write-Host "----------------------------------------------------------------" -ForegroundColor Cyan
 Write-Host "  Host      : $Computer"
 Write-Host "  OS User   : $env:USERNAME"
