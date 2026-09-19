@@ -16,6 +16,11 @@
 # DEPLOY - push the kit to remote hosts over WinRM (parallel, 8 by default):
 .\Ophira.ps1 -Mode Deploy -ComputerName SRV01,SRV02 -Preset Quick -Credential (Get-Credential)
 .\Ophira.ps1 -Mode Deploy -TargetsFile hosts.txt -MaxThreads 16
+.\Ophira.ps1 -Mode Deploy -TargetsFile hosts.txt -PushTools   # Kansa-style: push hayabusa, run, remove after
+
+# DELTA - re-run later and see only what CHANGED (pseudo-monitoring without an agent):
+.\Ophira.ps1 -NoMenu -Preset Standard           # auto-diffs against the newest previous OPHIRA_*.zip
+.\Ophira.ps1 -NoMenu -Preset Quick -DeltaPath .\old-case.zip
 
 # ANALYZE - merge any number of OPHIRA_*.zip into one fleet view (+ Sigma timeline):
 .\Ophira.ps1 -Mode Analyze -AnalyzePath .\collections
@@ -40,7 +45,11 @@
    - CONTEXT — **attacker activity** (PowerShell console history, RDP client targets, recycle bin), **user registry saves** (NTUSER.DAT/UsrClass.dat all profiles), **coverage & context** (Sysmon config, task XML, BITS jobs, domain info), **EZ parsers** (AmcacheParser execution inventory with SHA1×IOC cross-check, RBCmd)
    - DEFENDER — detections, exclusions, status, operational log
    - MEMORY — optional RAM capture (winpmem), optional Volatility 3 quick pass
-3. **Packaging** — SHA256 manifest (per file + package + script self-hash + tool inventory), `case.json`, **report.html**, **supertimeline.csv** (all events merged chronologically), ZIP
+3. **Packaging** — SHA256 manifest (per file + package + script self-hash + tool inventory), `case.json`, **report.html**, **supertimeline.csv** (all events merged chronologically), **delta_new.csv** (new findings vs previous collection), **siem_export.ndjson** (Splunk/Elastic-ready records), **logging_gaps.csv** (log cleared/stopped + evtx gap tamper check), ZIP
+
+## Delta collection (pseudo-monitoring)
+
+Run Ophira again on the same box days later: it auto-finds the previous case, compares flagged processes / tasks / services / autoruns / Sigma alerts, and reports **only what's NEW** — in the console, the report ("NEW since previous collection"), the SIEM export, and the SimpleUI owner screen. Point-in-time triage becomes a lightweight watch without installing anything.
 
 ## FP/TP decision support
 
@@ -52,7 +61,9 @@
 
 ## Analyze mode
 
-Merges N case zips → `fleet_report.csv` + **`fleet_report.html`** (host matrix, high-priority findings, cross-host indicator + hash dedup, top fleet Sigma detections) + one merged hayabusa timeline. Accepts legacy `IRCASE_*` packages too.
+Merges N case zips → `fleet_report.csv` + **`fleet_report.html`** (host matrix, high-priority findings, cross-host indicator + hash dedup, top fleet Sigma detections, **baselining proposals**) + one merged hayabusa timeline. Accepts legacy `IRCASE_*` packages too.
+
+**Fleet baselining:** publishers present on ≥60% of hosts with zero HIGH verdicts are written to `proposed_trusted.txt` — review once, merge into `tools\trusted.txt`, and your false-positive rate drops with every host you scan.
 
 ## Companion tools
 
@@ -82,9 +93,6 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 
 ## Roadmap
 
-- [ ] Delta collection (re-run shows only NEW findings — pseudo-monitoring without an agent)
-- [ ] Fleet baselining auto-allowlist (binary on 40/50 hosts = proposed trusted entry)
-- [ ] SIEM export (JSON/CEF) + logging-continuity check
 - [ ] YARA scan of flagged binaries
 - [ ] Role-based presets (WebServer / DC / Workstation)
 
