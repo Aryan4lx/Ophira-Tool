@@ -18,6 +18,7 @@ param(
     [switch]$SimpleUI,
     [switch]$IncludeMemory,
     [switch]$PushTools,
+    [switch]$Sequential,
     [switch]$NoElevate,
     [int]$LogHours = 168,
     [string]$SharePath = "",
@@ -31,7 +32,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.3"
+$ScriptVersion = "2.4"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -590,17 +591,49 @@ function Invoke-AnalyzeMode {
     $hosts = @()
     $evtxDirs = @()
     $signerRows = @()
+    $extractWorker = {
+        param($zipPath, $tmp)
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $tmp)
+        return $tmp
+    }
+    $extractJobs = [System.Collections.ArrayList]::new()
+    $pool = [runspacefactory]::CreateRunspacePool(1, 4)
+    $pool.Open()
+    foreach ($src in $sources) {
+        if ($src -is [System.IO.FileInfo]) {
+            $tmp = Join-Path ([IO.Path]::GetTempPath()) ("fleet_" + $src.BaseName)
+            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+            $ps = [powershell]::Create()
+            $null = $ps.AddScript($extractWorker.ToString()).AddArgument($src.FullName).AddArgument($tmp)
+            $ps.RunspacePool = $pool
+            $null = $extractJobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Src = $src; Tmp = $tmp })
+        }
+    }
+    $extractMap = @{}
+    while ($extractJobs.Count -gt 0) {
+        $doneIdx = @()
+        for ($i = 0; $i -lt $extractJobs.Count; $i++) {
+            if ($extractJobs[$i].Handle.IsCompleted) { $doneIdx += $i }
+        }
+        foreach ($i in ($doneIdx | Sort-Object -Descending)) {
+            $j = $extractJobs[$i]
+            try { $null = $j.PS.EndInvoke($j.Handle); $extractMap[$j.Src.Name] = $j.Tmp }
+            catch { Write-Host "cannot extract $($j.Src.Name): $($_.Exception.Message)" -ForegroundColor Red }
+            $j.PS.Dispose()
+            $extractJobs.RemoveAt($i)
+        }
+        if ($extractJobs.Count -gt 0) { Start-Sleep -Milliseconds 200 }
+    }
+    $pool.Close()
+    $pool.Dispose()
     foreach ($src in $sources) {
         $tmp = $null
         $dir = $src.FullName
         if ($src -is [System.IO.FileInfo]) {
-            $tmp = Join-Path ([IO.Path]::GetTempPath()) ("fleet_" + $src.BaseName)
-            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
-            try {
-                Add-Type -AssemblyName System.IO.Compression.FileSystem
-                [IO.Compression.ZipFile]::ExtractToDirectory($src.FullName, $tmp)
-                $dir = $tmp
-            } catch { Write-Host "cannot extract $($src.Name): $($_.Exception.Message)" -ForegroundColor Red; continue }
+            if (-not $extractMap.ContainsKey($src.Name)) { continue }
+            $tmp = $extractMap[$src.Name]
+            $dir = $tmp
         }
         $host_ = $src.Name -replace '^(OPHIRA|IRCASE)_', '' -replace '_\d{8}_\d{6}.*$', ''
         $caseJson = Join-Path $dir 'case.json'
@@ -712,10 +745,8 @@ function Invoke-AnalyzeMode {
         }
         $hayOut = Join-Path $OutFolder 'fleet_hayabusa_timeline.csv'
         $hayHtml = Join-Path $OutFolder 'fleet_hayabusa_report.html'
-        $hDir = Split-Path $HayabusaExe -Parent
-        Push-Location $hDir
-        try { & $HayabusaExe dfir-timeline -d "$merged" -o "$hayOut" -H "$hayHtml" -q -w -U -C -K -m low 2>&1 | ForEach-Object { Write-Host "    $(($_ -replace ([char]27 + '\[[0-9;]*m'), ''))" -ForegroundColor DarkGray } }
-        finally { Pop-Location }
+        Write-Host "    hayabusa fleet timeline running..." -ForegroundColor Cyan
+        $null = Invoke-NativeTool -ExePath $HayabusaExe -ToolArgs @('dfir-timeline', '-d', $merged, '-o', $hayOut, '-H', $hayHtml, '-q', '-w', '-U', '-C', '-K', '-m', 'low', '-E') -WorkingDirectory (Split-Path $HayabusaExe -Parent) -QuietLog
         if (Test-Path $hayOut) {
             $n = @(Get-Content $hayOut | Select-Object -Skip 1).Count
             Write-Host "    hayabusa: $n detections -> $hayOut" -ForegroundColor Yellow
@@ -1047,6 +1078,159 @@ function Get-UserAssistRows {
         }
     } catch { }
     return $rows
+}
+
+function Invoke-NativeTool {
+    param([string]$ExePath, [string[]]$ToolArgs, [string]$WorkingDir = '', [switch]$QuietLog)
+    $out = ''; $err = ''
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $ExePath
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.Arguments = (@($ToolArgs) | ForEach-Object { if ("$_" -match '\s') { '"' + $_ + '"' } else { "$_" } }) -join ' '
+        if ($WorkingDir) { $psi.WorkingDirectory = $WorkingDir }
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $psi
+        $null = $p.Start()
+        $tOut = $p.StandardOutput.ReadToEndAsync()
+        $tErr = $p.StandardError.ReadToEndAsync()
+        $p.WaitForExit()
+        $out = "$($tOut.Result)"
+        $err = "$($tErr.Result)"
+        if (-not $QuietLog) {
+            foreach ($block in @($out, $err)) {
+                if ($block) {
+                    ($block -split "`r?`n") | Select-Object -Last 40 | Where-Object { $_ } | ForEach-Object {
+                        Write-CaseLog "      $(($_ -replace ([char]27 + '\[[0-9;]*m'), ''))" 'DarkGray'
+                    }
+                }
+            }
+        }
+        return $p.ExitCode
+    } catch {
+        Write-CaseLog "      native tool launch failed: $($_.Exception.Message)" 'DarkYellow'
+        return -1
+    }
+}
+
+$script:SharedFunctions = @(
+    'Get-KitRoot', 'Get-ToolsDir', 'Get-LogStart', 'Get-IocList', 'Test-TrustedPublisher',
+    'Save-Rows', 'Out-RawText', 'Invoke-ExeCapture', 'Invoke-NativeTool', 'Get-WmiOrCim', 'Convert-WmiDate',
+    'Test-IsPublicIp', 'Test-IsUserWritablePath', 'Get-SignatureInfo', 'Get-SysmonState',
+    'Get-UserProfileList', 'Get-UserAssistRows', 'ConvertTo-Rot13', 'Get-FilteredEvents', 'Export-Evtx'
+)
+
+$script:ModuleWorkerText = @'
+param($PreambleText, $ModuleDef)
+Invoke-Expression $PreambleText
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$err = ''
+try {
+    $sb = [scriptblock]::Create($ModuleDef.RunText)
+    & $sb
+} catch { $err = $_.Exception.Message }
+$sw.Stop()
+return [pscustomobject]@{ Id = $ModuleDef.Id; Name = $ModuleDef.Name; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Error = $err }
+'@
+
+function New-WorkerPreamble {
+    param([string]$WorkerLog)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($fn in $script:SharedFunctions) {
+        $def = Get-Command $fn -CommandType Function -ErrorAction SilentlyContinue
+        if ($def) {
+            [void]$sb.AppendLine("function $fn {")
+            [void]$sb.AppendLine($def.Definition)
+            [void]$sb.AppendLine('}')
+            [void]$sb.AppendLine('')
+        }
+    }
+    $seed = @{
+        CaseDir  = $CaseDir;  CsvDir = $CsvDir;  RawDir = $RawDir;  MemDir = $MemDir
+        Computer = $Computer; Preset = $Preset
+    }
+    foreach ($k in $seed.Keys) {
+        $lit = "'" + ("$($seed[$k])" -replace "'", "''") + "'"
+        [void]$sb.AppendLine("`$$k = $lit")
+    }
+    [void]$sb.AppendLine("`$script:LogHours = $($LogHours)")
+    [void]$sb.AppendLine("`$script:SimpleUI = `$$([bool]$script:SimpleUI)")
+    $wl = $WorkerLog -replace "'", "''"
+    $override = "function Write-CaseLog { param([string]`$Message,[string]`$Color = 'Gray',[switch]`$NoConsole) Add-Content -LiteralPath '$wl' -Value (`"[{0}] {1}`" -f (Get-Date -Format 'HH:mm:ss'), `$Message) -Encoding UTF8 } "
+    [void]$sb.AppendLine($override)
+    return $sb.ToString()
+}
+
+function Invoke-ModuleBatch {
+    param([object[]]$Batch, [int]$Workers = 4)
+    $results = @()
+    if (-not $Batch -or $Batch.Count -eq 0) { return $results }
+    if ($Batch.Count -eq 1 -or $Sequential) {
+        foreach ($m in $Batch) {
+            $wlog = Join-Path $CaseDir ("worker_{0}.log" -f $m.Id)
+            $pre = New-WorkerPreamble -WorkerLog $wlog
+            $md = @{ Id = $m.Id; Name = $m.Name; RunText = $m.Run.ToString() }
+            $ps = [powershell]::Create()
+            $null = $ps.AddScript($script:ModuleWorkerText).AddArgument($pre).AddArgument($md)
+            $r = $ps.Invoke() | Select-Object -First 1
+            $ps.Dispose()
+            if ($r) {
+                $results += $r
+                if ($r.Error) { Write-CaseLog ("Module {0} ({1}) ERROR: {2}" -f $r.Id, $r.Name, $r.Error) 'Red' }
+                else { Write-CaseLog ("Module {0} ({1}) done in {2:N1}s [inline]" -f $r.Id, $r.Name, $r.Seconds) 'DarkGray' -NoConsole }
+            }
+            Merge-WorkerLog $wlog
+        }
+        return $results
+    }
+    $pool = [runspacefactory]::CreateRunspacePool(1, $Workers)
+    $pool.Open()
+    $jobs = [System.Collections.ArrayList]::new()
+    foreach ($m in $Batch) {
+        $wlog = Join-Path $CaseDir ("worker_{0}.log" -f $m.Id)
+        $ps = [powershell]::Create()
+        $null = $ps.AddScript($script:ModuleWorkerText).AddArgument((New-WorkerPreamble -WorkerLog $wlog)).AddArgument(@{ Id = $m.Id; Name = $m.Name; RunText = $m.Run.ToString() })
+        $ps.RunspacePool = $pool
+        $null = $jobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Module = $m; Log = $wlog })
+    }
+    while ($jobs.Count -gt 0) {
+        $doneIdx = @()
+        for ($i = 0; $i -lt $jobs.Count; $i++) {
+            if ($jobs[$i].Handle.IsCompleted) { $doneIdx += $i }
+        }
+        foreach ($i in ($doneIdx | Sort-Object -Descending)) {
+            $j = $jobs[$i]
+            try {
+                $r = @($j.PS.EndInvoke($j.Handle)) | Select-Object -First 1
+                if ($r) {
+                    $results += $r
+                    if ($r.Error) { Write-CaseLog ("Module {0} ({1}) ERROR: {2}" -f $r.Id, $r.Name, $r.Error) 'Red' }
+                    else { Write-CaseLog ("Module {0} ({1}) done in {2:N1}s" -f $r.Id, $r.Name, $r.Seconds) 'DarkGray' -NoConsole }
+                }
+            } catch { Write-CaseLog ("Module {0} worker failed: {1}" -f $j.Module.Id, $_.Exception.Message) 'Red' }
+            $j.PS.Dispose()
+            Merge-WorkerLog $j.Log
+            $jobs.RemoveAt($i)
+        }
+        if ($jobs.Count -gt 0) { Start-Sleep -Milliseconds 300 }
+    }
+    $pool.Close()
+    $pool.Dispose()
+    return $results
+}
+
+function Merge-WorkerLog {
+    param([string]$Path)
+    if (Test-Path -LiteralPath $Path) {
+        try {
+            $lines = Get-Content -LiteralPath $Path
+            if ($lines) { Add-Content -LiteralPath $CaseLog -Value $lines -Encoding UTF8 }
+            Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        } catch { }
+    }
 }
 
 $script:Modules = @(
@@ -1386,18 +1570,18 @@ $script:Modules = @(
             if (-not (Test-Path $evtxDir)) { Write-CaseLog "    no evtx exported - skipping" 'DarkGray'; return }
             $out = Join-Path $CsvDir 'hayabusa_timeline.csv'
             $html = Join-Path $CsvDir 'hayabusa_report.html'
-            Write-CaseLog "    hayabusa dfir-timeline Sigma hunt (may take a while)..." 'Cyan'
-            Push-Location $h.DirectoryName
-            try {
-                & $h.FullName dfir-timeline -d "$evtxDir" -o "$out" -H "$html" -q -w -U -C -K -m low 2>&1 | ForEach-Object { Write-CaseLog "      $(($_ -replace ([char]27 + '\[[0-9;]*m'), ''))" 'DarkGray' }
-                if (Test-Path $out) {
-                    $n = @(Get-Content -LiteralPath $out | Select-Object -Skip 1).Count
-                    Write-CaseLog "    hayabusa: $n timeline rows (level>=low) in csv\hayabusa_timeline.csv" $(if ($n -gt 0) { 'Yellow' } else { 'Gray' })
-                } else { Write-CaseLog "    hayabusa timeline produced no output" 'DarkYellow' }
-                Write-CaseLog "    hayabusa logon-summary..." 'Cyan'
-                $lsPrefix = Join-Path $CsvDir 'logon_summary'
-                & $h.FullName logon-summary -d "$evtxDir" -o "$lsPrefix" -q -C -K 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
-            } finally { Pop-Location }
+            $hayArgs = @('dfir-timeline', '-d', "$evtxDir", '-o', "$out", '-H', "$html", '-q', '-w', '-U', '-C', '-K', '-m', 'low', '-E')
+            $huntNote = 'full range'
+            if ($LogHours -gt 0) { $hayArgs += @('--time-offset', "$($LogHours)h"); $huntNote = "last $($LogHours)h" }
+            Write-CaseLog "    hayabusa dfir-timeline Sigma hunt ($huntNote)..." 'Cyan'
+            $null = Invoke-NativeTool -ExePath $h.FullName -ToolArgs $hayArgs -WorkingDirectory $h.DirectoryName
+            if (Test-Path $out) {
+                $n = @(Get-Content -LiteralPath $out | Select-Object -Skip 1).Count
+                Write-CaseLog "    hayabusa: $n timeline rows (level>=low) in csv\hayabusa_timeline.csv" $(if ($n -gt 0) { 'Yellow' } else { 'Gray' })
+            } else { Write-CaseLog "    hayabusa timeline produced no output" 'DarkYellow' }
+            Write-CaseLog "    hayabusa logon-summary..." 'Cyan'
+            $lsPrefix = Join-Path $CsvDir 'logon_summary'
+            $null = Invoke-NativeTool -ExePath $h.FullName -ToolArgs @('logon-summary', '-d', "$evtxDir", '-o', "$lsPrefix", '-q', '-C', '-K') -WorkingDirectory $h.DirectoryName
         } }
     [pscustomobject]@{ Id = '5.1'; Cat = 'ARTIFACTS'; Name = 'Prefetch files'; Default = $true; Quick = $false;
         Run = {
@@ -1460,7 +1644,7 @@ $script:Modules = @(
             $amArgs = @()
             if (Test-Path $amc) { $amArgs = @('-a', $amc) }
             Write-CaseLog "    chainsaw: shimcache/amcache execution timeline..." 'Cyan'
-            & $cs.FullName analyse shimcache "$sys" @amArgs -o "$out" 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+            $null = Invoke-NativeTool -ExePath $cs.FullName -ToolArgs (@('analyse', 'shimcache', $sys) + $amArgs + @('-o', $out))
             if (Test-Path $out) {
                 $n = @(Get-Content -LiteralPath $out | Select-Object -Skip 1).Count
                 Write-CaseLog "    execution timeline: $n entries in csv\execution_timeline.csv" 'Gray'
@@ -1468,14 +1652,14 @@ $script:Modules = @(
             $sruCopy = Join-Path $RawDir 'sru\SRUDB.dat'
             if ((Test-Path $sruCopy) -and (Test-Path $sft)) {
                 Write-CaseLog "    chainsaw: SRUM usage analysis..." 'Cyan'
-                & $cs.FullName analyse srum -s "$sft" "$sruCopy" -o (Join-Path $CsvDir 'srum_usage.csv') -q 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+                $null = Invoke-NativeTool -ExePath $cs.FullName -ToolArgs @('analyse', 'srum', '-s', $sft, $sruCopy, '-o', (Join-Path $CsvDir 'srum_usage.csv'), '-q')
             }
             $evtxDir = Join-Path $RawDir 'evtx'
             if (Test-Path $evtxDir) {
                 $anDir = Join-Path $RawDir 'analysis'
                 if (-not (Test-Path $anDir)) { New-Item -ItemType Directory -Path $anDir -Force | Out-Null }
                 Write-CaseLog "    chainsaw: evtx gap detection (tamper check)..." 'Cyan'
-                & $cs.FullName analyse gaps "$evtxDir" -q -o (Join-Path $anDir 'evtx_gaps.txt') 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+                $null = Invoke-NativeTool -ExePath $cs.FullName -ToolArgs @('analyse', 'gaps', $evtxDir, '-q', '-o', (Join-Path $anDir 'evtx_gaps.txt'))
             }
         } }
     [pscustomobject]@{ Id = '6.1'; Cat = 'DEFENDER'; Name = 'Defender detections, exclusions, status'; Default = $true; Quick = $true;
@@ -1698,7 +1882,7 @@ $script:Modules = @(
             $amcHive = Join-Path $RawDir 'registry\Amcache.hve'
             if ($amcExe -and (Test-Path $amcHive)) {
                 Write-CaseLog "    AmcacheParser: historical execution inventory..." 'Cyan'
-                & $amcExe.FullName -f "$amcHive" --csv "$CsvDir" --csvf amcache.csv 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+                $null = Invoke-NativeTool -ExePath $amcExe.FullName -ToolArgs @('-f', $amcHive, '--csv', $CsvDir, '--csvf', 'amcache.csv')
                 $amcCsv = Join-Path $CsvDir 'amcache.csv'
                 if (Test-Path $amcCsv) {
                     $n = @(Get-Content -LiteralPath $amcCsv | Select-Object -Skip 1).Count
@@ -1725,7 +1909,7 @@ $script:Modules = @(
             $rbSrc = Join-Path $RawDir 'recyclebin'
             if ($rbExe -and (Test-Path $rbSrc) -and @(Get-ChildItem -LiteralPath $rbSrc -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
                 Write-CaseLog "    RBCmd: recycle bin parse..." 'Cyan'
-                & $rbExe.FullName -d "$rbSrc" -q --csv "$CsvDir" --csvf recyclebin.csv 2>&1 | ForEach-Object { Write-CaseLog "      $_" 'DarkGray' }
+                $null = Invoke-NativeTool -ExePath $rbExe.FullName -ToolArgs @('-d', $rbSrc, '-q', '--csv', $CsvDir, '--csvf', 'recyclebin.csv')
             }
         } }
 )
@@ -1837,50 +2021,88 @@ function Invoke-SelectedModules {
     $selected = @($script:Modules | Where-Object { $Selection[$_.Id] })
     $total = $selected.Count
     $done = 0
-    if ($script:SimpleUI) {
-        $friendly = @{
-            'VOLATILE'    = 'Checking what is running right now'
-            'PERSISTENCE' = 'Checking how malware could survive a reboot'
-            'NETWORK MAP' = 'Mapping network connections'
-            'LOGS'        = 'Reviewing Windows security logs'
-            'ARTIFACTS'   = 'Preserving forensic evidence'
-            'CONTEXT'     = 'Collecting attacker activity traces'
-            'DEFENDER'    = 'Checking antivirus history'
-            'MEMORY'      = 'Capturing memory (the long step)'
-        }
-        $cats = @($selected | Group-Object Cat | ForEach-Object { $_.Name })
-        $step = 0
-        $swAll = [System.Diagnostics.Stopwatch]::StartNew()
-        foreach ($cat in $cats) {
-            $step++
-            Write-Host ""
-            Write-Host ("  Step {0}/{1}: {2}..." -f $step, $cats.Count, $friendly[$cat]) -ForegroundColor Cyan
-            foreach ($m in ($selected | Where-Object { $_.Cat -eq $cat })) {
-                $done++
-                $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                try { & $m.Run } catch { Write-CaseLog ("    ERROR: {0}" -f $_.Exception.Message) 'Red' }
-                $sw.Stop()
-                Write-CaseLog ("Module {0} ({1}) done in {2:N1}s" -f $m.Id, $m.Name, $sw.Elapsed.TotalSeconds) 'DarkGray' -NoConsole
-            }
-        }
-        $swAll.Stop()
+    $script:ModuleTimings = @()
+    $phaseOf = {
+        param($m)
+        if ($m.Cat -eq 'VOLATILE') { 'A' }
+        elseif ($m.Id -eq '7.1') { 'CI' }
+        elseif ($m.Id -in @('4.6', '5.4', '8.4')) { 'C' }
+        else { 'B' }
+    }
+    $runInline = {
+        param($m)
+        $script:Progress++
         Write-Host ""
-        Write-Host ("  All steps finished in {0:N0} seconds. Packaging results..." -f $swAll.Elapsed.TotalSeconds) -ForegroundColor Cyan
-    } else {
-        foreach ($m in $selected) {
-            $done++
-            Write-Host ""
-            Write-CaseLog ("[{0}/{1}] Module {2}: {3}" -f $done, $total, $m.Id, $m.Name) 'Cyan'
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            try {
-                & $m.Run
-                $sw.Stop()
-                Write-CaseLog ("    done in {0:N1}s" -f $sw.Elapsed.TotalSeconds) 'DarkGreen'
-            } catch {
-                $sw.Stop()
-                Write-CaseLog ("    ERROR: {0}" -f $_.Exception.Message) 'Red'
-            }
+        Write-CaseLog ("[{0}/{1}] Module {2}: {3}" -f $script:Progress, $total, $m.Id, $m.Name) 'Cyan'
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            & $m.Run
+            $sw.Stop()
+            $script:ModuleTimings += [pscustomobject]@{ Id = $m.Id; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Mode = 'inline' }
+            Write-CaseLog ("    done in {0:N1}s" -f $sw.Elapsed.TotalSeconds) 'DarkGreen'
+        } catch {
+            $sw.Stop()
+            $script:ModuleTimings += [pscustomobject]@{ Id = $m.Id; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Mode = 'inline' }
+            Write-CaseLog ("    ERROR: {0}" -f $_.Exception.Message) 'Red'
         }
+    }
+    if ($Sequential -or $script:SimpleUI) {
+        $script:Progress = 0
+        if ($script:SimpleUI) {
+            $friendly = @{
+                'VOLATILE'    = 'Checking what is running right now'
+                'PERSISTENCE' = 'Checking how malware could survive a reboot'
+                'NETWORK MAP' = 'Mapping network connections'
+                'LOGS'        = 'Reviewing Windows security logs'
+                'ARTIFACTS'   = 'Preserving forensic evidence'
+                'CONTEXT'     = 'Collecting attacker activity traces'
+                'DEFENDER'    = 'Checking antivirus history'
+                'MEMORY'      = 'Capturing memory (the long step)'
+            }
+            $cats = @($selected | Group-Object Cat | ForEach-Object { $_.Name })
+            $step = 0
+            $swAll = [System.Diagnostics.Stopwatch]::StartNew()
+            foreach ($cat in $cats) {
+                $step++
+                Write-Host ""
+                Write-Host ("  Step {0}/{1}: {2}..." -f $step, $cats.Count, $friendly[$cat]) -ForegroundColor Cyan
+                foreach ($m in ($selected | Where-Object { $_.Cat -eq $cat })) { & $runInline $m }
+            }
+            $swAll.Stop()
+            Write-Host ""
+            Write-Host ("  All steps finished in {0:N0} seconds. Packaging results..." -f $swAll.Elapsed.TotalSeconds) -ForegroundColor Cyan
+        } else {
+            foreach ($m in $selected) { & $runInline $m }
+        }
+        return
+    }
+    $phases = @{
+        A = @($selected | Where-Object { (& $phaseOf $_) -eq 'A' })
+        B = @($selected | Where-Object { (& $phaseOf $_) -eq 'B' })
+        C = @($selected | Where-Object { (& $phaseOf $_) -eq 'C' })
+        CI = @($selected | Where-Object { (& $phaseOf $_) -eq 'CI' })
+    }
+    $script:Progress = 0
+    if ($phases.A.Count -gt 0) {
+        Write-Host "`n--- Phase A: volatile (sequential, order of volatility) ---" -ForegroundColor Cyan
+        foreach ($m in $phases.A) { & $runInline $m }
+    }
+    if ($phases.B.Count -gt 0) {
+        Write-Host "`n--- Phase B: collection ($(if ($phases.B.Count -gt 1) { 'parallel' } else { 'inline' }): $(($phases.B.Id) -join ' ') ---" -ForegroundColor Cyan
+        $script:Progress += 0
+        $r = Invoke-ModuleBatch -Batch $phases.B -Workers 4
+        foreach ($x in $r) { $script:ModuleTimings += [pscustomobject]@{ Id = $x.Id; Seconds = $x.Seconds; Mode = 'parallel' } }
+        $script:Progress += $phases.B.Count
+    }
+    if ($phases.C.Count -gt 0) {
+        Write-Host "`n--- Phase C: heavy analytics ($(if ($phases.C.Count -gt 1) { 'parallel' } else { 'inline' })): $(($phases.C.Id) -join ' ') ---" -ForegroundColor Cyan
+        $r = Invoke-ModuleBatch -Batch $phases.C -Workers 4
+        foreach ($x in $r) { $script:ModuleTimings += [pscustomobject]@{ Id = $x.Id; Seconds = $x.Seconds; Mode = 'parallel' } }
+        $script:Progress += $phases.C.Count
+    }
+    if ($phases.CI.Count -gt 0) {
+        Write-Host "`n--- Phase CI: interactive (memory) ---" -ForegroundColor Cyan
+        foreach ($m in $phases.CI) { & $runInline $m }
     }
 }
 
@@ -2224,6 +2446,10 @@ function New-Package {
         SysmonPresent = (Get-SysmonState)
         LogHours = $LogHours
         OutputFolder = $CaseDir
+    }
+    if ($script:ModuleTimings) {
+        $case | Add-Member -NotePropertyName ModuleTimings -NotePropertyValue $script:ModuleTimings -Force
+        $case | Add-Member -NotePropertyName ModuleSecondsTotal -NotePropertyValue ([math]::Round((($script:ModuleTimings | Measure-Object Seconds -Sum).Sum), 1)) -Force
     }
     $case | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $CaseDir 'case.json') -Encoding UTF8
 

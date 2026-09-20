@@ -90,6 +90,9 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 - PowerShell 5.1 baseline (Win 2008 R2+ with updates), no dependencies
 - Fallbacks for 2008-era boxes (netstat/arp/ipconfig parsing when cmdlets missing)
 - Per-module failure isolation; speed/precision via presets (Flash 15s → Quick 1-2 min → Standard 3-5 min)
+- **Phased parallel collection** — volatile first (order of volatility), then independent categories in parallel runspaces, then heavy analytics (hayabusa/chainsaw/EZ) in parallel; `-Sequential` forces the old serial behavior
+- **hayabusa time-boxing** — scans only the configured log range (`--time-offset`) with eid-filter (`-E`); per-module timings recorded in `case.json` (`ModuleTimings`)
+- Native tools launched console-less (`.NET CreateNoWindow`) — avoids console handshake stalls and runspace pipe overhead
 
 ## Roadmap
 
