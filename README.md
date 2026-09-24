@@ -68,7 +68,19 @@ Wizard answers are remembered only when you answer **y** to "Remember these answ
    - CONTEXT — **attacker activity** (PowerShell console history, RDP client targets, recycle bin), **user registry saves** (NTUSER.DAT/UsrClass.dat all profiles), **coverage & context** (Sysmon config, task XML, BITS jobs, domain info), **EZ parsers** (AmcacheParser execution inventory with SHA1×IOC cross-check, RBCmd)
    - DEFENDER — detections, exclusions, status, operational log
    - MEMORY — optional RAM capture (winpmem), optional Volatility 3 quick pass
-3. **Packaging** — SHA256 manifest (per file + package + script self-hash + tool inventory), `case.json`, **report.html**, **supertimeline.csv** (all events merged chronologically), **delta_new.csv** (new findings vs previous collection), **siem_export.ndjson** (Splunk/Elastic-ready records), **logging_gaps.csv** (log cleared/stopped + evtx gap tamper check), ZIP
+3. **Packaging** — SHA256 manifest (per file + package + script self-hash + tool inventory), `case.json`, **compromise verdict** (`verdict.json`: 5-level verdict + coverage-weighted confidence + signals + caveats), `report.html`, **supertimeline.csv** (all events merged chronologically), **delta_new.csv** (new findings vs previous collection), **siem_export.ndjson** (Splunk/Elastic-ready records), **logging_gaps.csv** (log cleared/stopped + evtx gap tamper check), ZIP
+
+## Compromise verdict (v2.6)
+
+Every collection ends with `Get-CompromiseVerdict` correlating all findings into one call:
+
+- **5 levels**: `COMPROMISED` → `LIKELY COMPROMISED` → `SUSPICIOUS` → `NO EVIDENCE OF COMPROMISE` → `INCONCLUSIVE`
+- **Signal floors** — amcache IOC hit or high/critical YARA hit forces COMPROMISED; live IOC hit forces ≥ LIKELY COMPROMISED; critical Sigma / HIGH process verdict / Defender history / log-tamper events force ≥ SUSPICIOUS; two independent strong signals escalate to LIKELY COMPROMISED
+- **Confidence %** = weighted coverage of evidence sources actually collected (volatile, persistence, evtx, Sigma, amcache, prefetch, YARA, Sysmon, RAM; −15 if not elevated)
+- **Caveats** state what could *not* be ruled out (no Sysmon, short log window, no RAM capture...) — i.e., what would change the verdict
+- Surfaced in: console summary, `verdict.json`, `case.json`, and a plain-language RESULT line on the owner screen
+
+Verdicts are correlation heuristics over collected evidence — verify against raw CSV/evtx before acting.
 
 ## Delta collection (pseudo-monitoring)
 

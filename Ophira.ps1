@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.5  -  Windows Incident Response Triage Toolkit
+Ophira v2.6  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -32,7 +32,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.5"
+$ScriptVersion = "2.6"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -2556,6 +2556,119 @@ function Invoke-DeltaCompare {
     if ($tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+function Get-CompromiseVerdict {
+    # Correlates all case findings into one verdict + coverage-weighted confidence.
+    # Levels (rank): 4=COMPROMISED 3=LIKELY COMPROMISED 2=SUSPICIOUS 1=NO EVIDENCE OF COMPROMISE 0=INCONCLUSIVE
+    $iocLive = Import-CaseCsv 'flash_ioc_hits'
+    $iocAmc = Import-CaseCsv 'ioc_hits_amcache'
+    $yara = Import-CaseCsv 'yara_hits'
+    $hay = Import-CaseCsv 'hayabusa_timeline'
+    $proc = Import-CaseCsv 'flash_process_scored'
+    $def = Import-CaseCsv 'defender_threats'
+    $gaps = Import-CaseCsv 'logging_gaps'
+    $brute = Import-CaseCsv 'security_bruteforce_candidates'
+
+    $levelNames = @{ 4 = 'COMPROMISED'; 3 = 'LIKELY COMPROMISED'; 2 = 'SUSPICIOUS'; 1 = 'NO EVIDENCE OF COMPROMISE'; 0 = 'INCONCLUSIVE' }
+
+    $signals = New-Object System.Collections.Generic.List[object]
+    function Add-Signal([string]$name, [int]$floor, [int]$count, [string]$detail) {
+        if ($count -gt 0) { $signals.Add([pscustomobject]@{ Signal = $name; Weight = $floor; Count = $count; Detail = $detail }) }
+    }
+
+    $hayCrit = @($hay | Where-Object { "$($_.Level)" -match 'crit' }).Count
+    $hayHigh = @($hay | Where-Object { "$($_.Level)" -match '^high$' }).Count
+    $hayHighRules = @($hay | Where-Object { "$($_.Level)" -match '^high$' } | Group-Object RuleTitle).Count
+    $procHigh = @($proc | Where-Object { "$($_.Verdict)" -eq 'HIGH' }).Count
+    $procMed = @($proc | Where-Object { "$($_.Verdict)" -eq 'MEDIUM' }).Count
+    $yaraHi = @($yara | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' }).Count
+    $yaraMed = @($yara | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
+    $gapTamper = @($gaps | Where-Object { "$($_.EventId)" -match '^(1102|104)$' -or "$($_.Meaning)" -match 'clear|stop' }).Count
+
+    Add-Signal 'IOC hit - historical execution (amcache SHA1)' 4 @($iocAmc).Count "near-certain true positive evidence"
+    Add-Signal 'YARA hit - high/critical rule' 4 $yaraHi (($yara | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
+    Add-Signal 'IOC hit - live system' 3 @($iocLive).Count (($iocLive | Select-Object -First 3 | ForEach-Object { $_.Indicator }) -join '; ')
+    Add-Signal 'Sigma detection - critical' 3 $hayCrit (($hay | Where-Object { "$($_.Level)" -match 'crit' } | Select-Object -First 3 | ForEach-Object { $_.RuleTitle }) -join '; ')
+    Add-Signal 'YARA hit - medium rule' 2 $yaraMed (($yara | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
+    Add-Signal 'Sigma detection - high' 2 $hayHigh "$hayHigh events from $hayHighRules distinct rules"
+    Add-Signal 'Process anomaly verdict HIGH' 2 $procHigh (($proc | Where-Object { "$($_.Verdict)" -eq 'HIGH' } | Select-Object -First 3 | ForEach-Object { $_.Name }) -join '; ')
+    Add-Signal 'Defender detection history' 2 @($def).Count "antivirus detected something during retention window"
+    Add-Signal 'Security tooling tampering / log clearing' 2 $gapTamper "log cleared or security service stopped"
+    Add-Signal 'Process anomaly verdict MEDIUM' 1 $procMed "unsigned/user-path binaries worth review"
+    Add-Signal 'Brute-force source(s) seen' 0 @($brute).Count "failed logon sources - check for follow-up success"
+
+    # coverage: weighted evidence sources actually collected
+    $cov = New-Object System.Collections.Generic.List[object]
+    function Add-Cov([string]$name, [bool]$present, [int]$weight) {
+        $cov.Add([pscustomobject]@{ Source = $name; Collected = $present; Weight = $weight })
+    }
+    $evtxDir = Join-Path $RawDir 'evtx'
+    Add-Cov 'Volatile process inventory' (Test-Path (Join-Path $CsvDir 'flash_process_scored.csv')) 12
+    Add-Cov 'Live network connections' (Test-Path (Join-Path $CsvDir 'flash_public_connections.csv')) 8
+    $pers = (Test-Path (Join-Path $CsvDir 'autoruns_runkeys.csv')) -or (Test-Path (Join-Path $CsvDir 'services.csv')) -or (Test-Path (Join-Path $CsvDir 'scheduled_tasks.csv'))
+    Add-Cov 'Persistence surface (autoruns/services/tasks)' $pers 15
+    Add-Cov 'Event log export' (Test-Path $evtxDir) 20
+    Add-Cov 'Sigma detection timeline' (Test-Path (Join-Path $CsvDir 'hayabusa_timeline.csv')) 10
+    Add-Cov 'Historical execution (amcache)' (Test-Path (Join-Path $CsvDir 'amcache.csv')) 12
+    Add-Cov 'Prefetch execution history' (Test-Path (Join-Path $CsvDir 'prefetch_index.csv')) 8
+    Add-Cov 'Defender status' (Test-Path (Join-Path $CsvDir 'defender_status.csv')) 5
+    Add-Cov 'YARA binary scan' (Test-Path (Join-Path $CsvDir 'yara_scanned.csv')) 5
+    Add-Cov 'Sysmon telemetry (bonus)' ([bool]$Sysmon) 5
+    Add-Cov 'RAM capture (bonus)' (Test-Path $MemDir) 3
+    $coverageRaw = 0
+    foreach ($c in $cov) { if ($c.Collected) { $coverageRaw += $c.Weight } }
+    $isAdminRun = Test-IsAdmin
+    if (-not $isAdminRun) { $coverageRaw -= 15 }
+    if ($coverageRaw -gt 100) { $coverageRaw = 100 }
+    if ($coverageRaw -lt 0) { $coverageRaw = 0 }
+
+    # verdict level
+    $rank = 0
+    foreach ($s in $signals) { if ($s.Weight -gt $rank) { $rank = $s.Weight } }
+    $distinctStrong = @($signals | Where-Object { $_.Weight -ge 2 }).Count
+    if ($rank -eq 2 -and $distinctStrong -ge 2) { $rank = 3 }
+    if ($rank -eq 0) {
+        if ($coverageRaw -lt 40) { $rank = 0 } else { $rank = 1 }
+    }
+
+    # caveats = what would change this verdict
+    $caveats = New-Object System.Collections.Generic.List[string]
+    if (-not $isAdminRun) { $caveats.Add('Run was NOT elevated - several sources are incomplete or missing') }
+    if (-not $Sysmon) { $caveats.Add('No Sysmon on host - process injection / image-load / per-process network telemetry were not available') }
+    if ($LogHours -gt 0 -and (Test-Path $evtxDir)) { $caveats.Add("Event-log analysis covered only the last $([int]($LogHours/24)) days - older activity not assessed") }
+    if (-not (Test-Path $MemDir)) { $caveats.Add('No RAM capture - fileless / in-memory-only malware is not covered') }
+    if (-not (Test-Path (Join-Path $CsvDir 'prefetch_index.csv'))) { $caveats.Add('Prefetch unavailable - program execution history limited') }
+    if (-not (Test-Path (Join-Path $CsvDir 'amcache.csv'))) { $caveats.Add('Amcache unavailable - historical execution inventory missing') }
+    if (-not (Test-Path $evtxDir)) { $caveats.Add('Event logs not exported - Sigma detection could not run') }
+    if ($rank -eq 0) { $caveats.Add('Too little evidence was collected to draw a conclusion') }
+
+    $ownerLines = @{
+        4 = 'Strong signs of MALICIOUS ACTIVITY were found on this computer.'
+        3 = 'Several suspicious findings - malicious activity is LIKELY.'
+        2 = 'Some SUSPICIOUS items were found - the security team will check them.'
+        1 = 'No signs of compromise were found.'
+        0 = 'Not enough data could be collected to tell for sure.'
+    }
+
+    $counts = [pscustomobject]@{
+        IocLive = @($iocLive).Count; IocAmcache = @($iocAmc).Count; YaraHigh = $yaraHi; YaraMedium = $yaraMed
+        SigmaCritical = $hayCrit; SigmaHigh = $hayHigh; ProcessHigh = $procHigh; ProcessMedium = $procMed
+        DefenderDetections = @($def).Count; TamperEvents = $gapTamper; BruteForceSources = @($brute).Count
+    }
+
+    return [pscustomobject]@{
+        Level = $levelNames[$rank]
+        LevelRank = $rank
+        ConfidencePercent = $coverageRaw
+        OwnerLine = $ownerLines[$rank]
+        Signals = $signals.ToArray()
+        Caveats = $caveats.ToArray()
+        Coverage = $cov.ToArray()
+        CoveragePercentUnadjusted = $coverageRaw
+        Counts = $counts
+        GeneratedUTC = (Get-Date).ToUniversalTime().ToString('o')
+    }
+}
+
 function New-Package {
     Write-Host ""
     Write-CaseLog "Packaging case folder..." 'Cyan'
@@ -2585,6 +2698,23 @@ function New-Package {
     try { New-LoggingGaps } catch { Write-CaseLog "    logging gaps failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-SiemExport } catch { Write-CaseLog "    siem export failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-HtmlReport | Out-Null } catch { Write-CaseLog "    report generation failed: $($_.Exception.Message)" 'DarkYellow' }
+
+    $script:Verdict = $null
+    try {
+        $script:Verdict = Get-CompromiseVerdict
+        if ($script:Verdict) {
+            $script:Verdict | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $CaseDir 'verdict.json') -Encoding UTF8
+            $case | Add-Member -NotePropertyName Verdict -NotePropertyValue ([pscustomobject]@{
+                Level = $script:Verdict.Level
+                ConfidencePercent = $script:Verdict.ConfidencePercent
+                SignalCount = $script:Verdict.Signals.Count
+                CaveatCount = $script:Verdict.Caveats.Count
+            }) -Force
+            $case | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $CaseDir 'case.json') -Encoding UTF8
+            $vColor = switch ($script:Verdict.LevelRank) { 4 { 'Red' } 3 { 'Red' } 2 { 'Yellow' } 1 { 'Green' } default { 'DarkYellow' } }
+            Write-CaseLog "    VERDICT: $($script:Verdict.Level) (confidence $($script:Verdict.ConfidencePercent)%) - $($script:Verdict.Signals.Count) signal(s), $($script:Verdict.Caveats.Count) caveat(s) -> verdict.json" $vColor
+        }
+    } catch { Write-CaseLog "    verdict engine failed: $($_.Exception.Message)" 'DarkYellow' }
 
     $manifest = @()
     $manifest += "Ophira v$ScriptVersion evidence manifest"
@@ -2669,6 +2799,10 @@ function New-Package {
         if ($zipHash) { Write-Host "  Zip SHA256  : $zipHash" -ForegroundColor White }
         if ($shareResult) { Write-Host "  Share copy  : $shareResult" -ForegroundColor $(if ($shareResult -match 'FAILED') { 'Red' } else { 'Green' }) }
         Write-Host "  Memory dump : $(if (Test-Path $MemDir) { "$MemDir (NOT in zip - send separately)" } else { 'not captured' })"
+        if ($script:Verdict) {
+            $vColor = switch ($script:Verdict.LevelRank) { 4 { 'Red' } 3 { 'Red' } 2 { 'Yellow' } 1 { 'Green' } default { 'DarkYellow' } }
+            Write-Host "  VERDICT     : $($script:Verdict.Level)  (confidence $($script:Verdict.ConfidencePercent)%)  - details: report.html / verdict.json" $vColor
+        }
         Write-Host ""
         Write-Host "  Send the ZIP file (and memory dump if captured) to the analyst." -ForegroundColor Yellow
         Write-Host "================================================================" -ForegroundColor Green
@@ -3045,6 +3179,13 @@ if ($script:SimpleUI) {
     Write-Host ""
     Write-Host "     DONE! Everything was collected successfully." -ForegroundColor Green
     Write-Host ""
+    if ($script:Verdict) {
+        $vColor = switch ($script:Verdict.LevelRank) { 4 { 'Red' } 3 { 'Red' } 2 { 'Yellow' } 1 { 'Green' } default { 'DarkYellow' } }
+        Write-Host "     RESULT: $($script:Verdict.OwnerLine)" $vColor
+        Write-Host "     This is an automated first check - please send the file below" -ForegroundColor DarkGray
+        Write-Host "     to your security team so they can confirm it." -ForegroundColor DarkGray
+        Write-Host ""
+    }
     if ($script:DeltaCount -gt 0) {
         Write-Host "     NOTE: $script:DeltaCount NEW items appeared since the last check." -ForegroundColor Yellow
         Write-Host "     Mention this to your security team - they will see the details." -ForegroundColor Yellow
