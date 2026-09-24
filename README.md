@@ -91,7 +91,7 @@ Run Ophira again on the same box days later: it auto-finds the previous case, co
 - **Correlation score** — evidence stacks per binary: user-path (+1), unsigned (+2), binary deleted (+3), public connection (+2), persistence refs (+2 each), IOC hash hit (+4) → verdict
 - **Trusted publishers** — validly-signed binaries from known publishers (or your `tools\trusted.txt`) cap at LOW; IOC hits always override
 - **Amcache SHA1 × IOC** — historical execution matched against your IOC list = near-certain TP with a timestamp
-- **report.html** — verdict cards, IOC hits, severity-colored Sigma detections, execution highlights, brute-force, VT deep links
+- **report.html** — **compromise assessment report v2** (v2.7): verdict banner with confidence bar + contributing signals + "what would change this verdict" caveats, evidence coverage table, **MITRE ATT&CK grid** (tactic chips + technique table from hayabusa tags, with cannot-rule-out telemetry notes), findings grouped by tactic, defanged copy-ready IOC list, YARA findings, logon/account analysis, persistence inventory, recommendations, VT deep links
 - **Raw evidence** — every flag is backed by raw CSV/evtx/hive so any verdict can be verified
 
 ## Analyze mode

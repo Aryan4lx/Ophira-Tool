@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.6  -  Windows Incident Response Triage Toolkit
+Ophira v2.7  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -32,7 +32,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.6"
+$ScriptVersion = "2.7"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -2260,18 +2260,50 @@ function Import-CaseCsv {
 }
 
 function New-HtmlReport {
-    $scored = Import-CaseCsv 'flash_process_scored.csv'
-    $iocHits = Import-CaseCsv 'flash_ioc_hits.csv'
-    $hayRows = Import-CaseCsv 'hayabusa_timeline.csv'
-    $execRows = Import-CaseCsv 'execution_timeline.csv'
-    $brute = Import-CaseCsv 'security_bruteforce_candidates.csv'
-    $pubConns = Import-CaseCsv 'flash_public_connections.csv'
+    $scored = @(Import-CaseCsv 'flash_process_scored.csv')
+    $iocHits = @(Import-CaseCsv 'flash_ioc_hits.csv')
+    $hayRows = @(Import-CaseCsv 'hayabusa_timeline.csv')
+    $execRows = @(Import-CaseCsv 'execution_timeline.csv')
+    $brute = @(Import-CaseCsv 'security_bruteforce_candidates.csv')
+    $pubConns = @(Import-CaseCsv 'flash_public_connections.csv')
+    $amcHits = @(Import-CaseCsv 'ioc_hits_amcache.csv')
+    $yaraHits = @(Import-CaseCsv 'yara_hits.csv')
+    $authSum = @(Import-CaseCsv 'security_auth_summary.csv')
+    $authEv = @(Import-CaseCsv 'security_auth_events.csv')
+    $runKeys = @(Import-CaseCsv 'autoruns_runkeys.csv')
+    $tasksFlag = @(Import-CaseCsv 'scheduled_tasks_flagged.csv')
+    $svcFlag = @(Import-CaseCsv 'services_flagged.csv')
+    $wmiBind = @(Import-CaseCsv 'wmi_bindings.csv')
+    $deltaRows = @(Import-CaseCsv 'delta_new.csv')
+    $gapRows = @(Import-CaseCsv 'logging_gaps.csv')
+
+    function Get-LvlRank([string]$l) {
+        switch -Regex ("$l") { 'crit' { 5; break } 'high' { 4; break } 'med' { 3; break } 'low' { 2; break } default { 1 } }
+    }
+    $tacticNames = @{
+        'Recon' = 'Reconnaissance'; 'ResDevDev' = 'Resource Development'; 'InitAccess' = 'Initial Access'
+        'Exec' = 'Execution'; 'Persis' = 'Persistence'; 'PrivEsc' = 'Privilege Escalation'
+        'DefEvade' = 'Defense Evasion'; 'CredAccess' = 'Credential Access'; 'Disc' = 'Discovery'
+        'LatMov' = 'Lateral Movement'; 'Collect' = 'Collection'; 'C2' = 'Command and Control'
+        'Exfil' = 'Exfiltration'; 'Impact' = 'Impact'; 'ImpairC2' = 'Impair Command and Control'; 'ImpairProc' = 'Impair Process'
+    }
+    function Get-TacticLabel([string]$abbr) {
+        $a = "$abbr".Trim()
+        if ($tacticNames.ContainsKey($a)) { return $tacticNames[$a] }
+        return $a
+    }
+    function Split-TagList([string]$s) {
+        if (-not "$s") { return @() }
+        return @([regex]::Split("$s", '[^A-Za-z0-9.\-]+') | Where-Object { $_ -and $_.Length -gt 1 })
+    }
 
     $css = @'
 <style>
 body{background:#0f1115;color:#d7dce3;font-family:Segoe UI,Arial,sans-serif;margin:0;padding:24px}
 h1{font-size:22px;margin:0 0 4px} h2{font-size:16px;margin:32px 0 10px;color:#8ab4f8;border-bottom:1px solid #2a2f3a;padding-bottom:6px}
 .meta{color:#7d8590;font-size:12px}
+.nav{position:sticky;top:0;background:#0f1115ee;border-bottom:1px solid #2a2f3a;padding:8px 0;z-index:9}
+.nav a{color:#8ab4f8;font-size:12px;text-decoration:none;margin-right:14px}
 .chips{margin:16px 0}.chip{display:inline-block;padding:6px 14px;border-radius:16px;margin-right:8px;font-size:14px;font-weight:600}
 .card{background:#181b21;border:1px solid #2a2f3a;border-radius:8px;padding:14px;margin:10px 0}
 .badge{display:inline-block;padding:3px 10px;border-radius:10px;font-size:12px;font-weight:700;margin-right:8px}
@@ -2282,15 +2314,85 @@ table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid 
 th{background:#1d222c;color:#8ab4f8}tr:nth-child(even){background:#151920}
 .crit{color:#ff8789;font-weight:700}.high{color:#ffb35c}.med{color:#ffce6b}.low{color:#9ec1f0}.info{color:#7d8590}
 a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
+.vbanner{border-radius:10px;padding:18px 22px;margin:18px 0;border:2px solid}
+.v4{background:#2a0f12;border-color:#a33}.v3{background:#2a150f;border-color:#b33}.v2{background:#2a220f;border-color:#b93}.v1{background:#0f2418;border-color:#3a5}.v0{background:#1c1c22;border-color:#666}
+.vtitle{font-size:24px;font-weight:800;margin:0 0 4px}
+.vowner{font-size:14px;margin:6px 0 0}
+.confwrap{background:#1d222c;border-radius:8px;height:18px;margin-top:12px;position:relative;overflow:hidden}
+.confbar{height:18px}
+.conftext{position:absolute;left:10px;top:1px;font-size:12px;font-weight:700;color:#d7dce3}
+.sig{display:inline-block;background:#232833;border:1px solid #333b49;border-radius:6px;padding:6px 10px;margin:3px 6px 3px 0;font-size:12px}
+.cov-ok{color:#7ee2a8}.cov-miss{color:#ff8789}
+.tac{display:inline-block;padding:5px 12px;border-radius:14px;margin:3px 6px 3px 0;font-size:12px;font-weight:600;background:#243447;color:#9ec1f0}
+.tac.hi{background:#5c1a1e;color:#ff8789}.tac.md{background:#5c470f;color:#ffce6b}
+pre.ioc{background:#181b21;border:1px solid #2a2f3a;border-radius:8px;padding:12px;font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.rec{background:#181b21;border-left:4px solid #8ab4f8;border-radius:6px;padding:10px 14px;margin:8px 0}
+details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
 </style>
 '@
 
     $sb = New-Object System.Text.StringBuilder
     $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
-    $null = $sb.AppendLine("<h1>OPHIRA TRIAGE REPORT</h1>")
-    $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' })</div>")
+    $null = $sb.AppendLine("<h1>OPHIRA COMPROMISE ASSESSMENT REPORT</h1>")
+    $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' }) &nbsp;|&nbsp; Elevated: $(if (Test-IsAdmin) { 'yes' } else { 'NO' })</div>")
+    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#network'>Network</a><a href='#recommendations'>Recommendations</a></div>")
 
-    $deltaRows = Import-CaseCsv 'delta_new.csv'
+    # ---------- verdict banner ----------
+    $null = $sb.AppendLine("<a name='verdict'></a><h2>Verdict</h2>")
+    if ($script:Verdict) {
+        $v = $script:Verdict
+        $null = $sb.AppendLine("<div class='vbanner v$($v.LevelRank)'>")
+        $null = $sb.AppendLine("<p class='vtitle'>$(ConvertTo-HtmlEsc $v.Level)</p>")
+        $null = $sb.AppendLine("<p class='vowner'>$(ConvertTo-HtmlEsc $v.OwnerLine) &nbsp; Confidence: $($v.ConfidencePercent)% (evidence coverage)</p>")
+        $null = $sb.AppendLine("<div class='confwrap'><div class='confbar' style='width:$([math]::Min(100, [int]$v.ConfidencePercent))%;background:#b93'></div><div class='conftext'>$($v.ConfidencePercent)% of weighted evidence sources collected</div></div>")
+        if (@($v.Signals).Count -gt 0) {
+            $null = $sb.AppendLine("<p style='margin-top:12px'><b>Contributing signals</b></p>")
+            foreach ($s in @($v.Signals)) {
+                $wcol = if ($s.Weight -ge 4) { 'crit' } elseif ($s.Weight -ge 3) { 'high' } elseif ($s.Weight -ge 2) { 'med' } else { 'info' }
+                $null = $sb.AppendLine("<div class='sig'><span class='$wcol'>[w$($s.Weight)]</span> $(ConvertTo-HtmlEsc $s.Signal) x$($s.Count) $(if ("$($s.Detail)") { " - <span class='path'>$(ConvertTo-HtmlEsc $s.Detail)</span>" })</div>")
+            }
+        } else {
+            $null = $sb.AppendLine("<p style='margin-top:12px' class='meta'>No compromising signals were observed in the collected evidence.</p>")
+        }
+        if (@($v.Caveats).Count -gt 0) {
+            $null = $sb.AppendLine("<p style='margin-top:12px'><b>What would change this verdict (caveats)</b></p><ul>")
+            foreach ($c in @($v.Caveats)) { $null = $sb.AppendLine("<li>$(ConvertTo-HtmlEsc $c)</li>") }
+            $null = $sb.AppendLine("</ul>")
+        }
+        $null = $sb.AppendLine("</div>")
+    } else {
+        $null = $sb.AppendLine("<div class='vbanner v0'><p class='vtitle'>VERDICT UNAVAILABLE</p><p class='vowner'>The verdict engine did not run - review the raw sections below.</p></div>")
+    }
+
+    # ---------- evidence coverage ----------
+    $null = $sb.AppendLine("<a name='coverage'></a><h2>Evidence coverage & data quality</h2>")
+    if ($script:Verdict -and @($script:Verdict.Coverage).Count -gt 0) {
+        $null = $sb.AppendLine("<table><tr><th>Evidence source</th><th>Collected</th><th>Weight</th></tr>")
+        foreach ($c in @($script:Verdict.Coverage)) {
+            $mark = if ($c.Collected) { "<span class='cov-ok'>yes</span>" } else { "<span class='cov-miss'>NO</span>" }
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $c.Source)</td><td>$mark</td><td>$($c.Weight)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Coverage confidence: $($script:Verdict.ConfidencePercent)% - missing sources narrow what can be ruled out.</div>")
+    } else {
+        $null = $sb.AppendLine("<div class='meta'>Coverage data not available.</div>")
+    }
+    if ($gapRows.Count -gt 0) {
+        $null = $sb.AppendLine("<h3>Logging continuity (check for tampering)</h3><table><tr><th>Time</th><th>Event</th><th>Meaning</th></tr>")
+        foreach ($g in ($gapRows | Select-Object -First 25)) {
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $g.Time)</td><td>$($g.EventId)</td><td>$(ConvertTo-HtmlEsc $g.Meaning)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table>")
+    }
+
+    # ---------- summary chips ----------
+    $high = @($scored | Where-Object Verdict -eq 'HIGH').Count
+    $med = @($scored | Where-Object Verdict -eq 'MEDIUM').Count
+    $low = @($scored | Where-Object Verdict -eq 'LOW').Count
+    $hayCrit = @($hayRows | Where-Object { "$($_.Level)" -match 'crit' }).Count
+    $hayHigh = @($hayRows | Where-Object { "$($_.Level)" -match '^high$' }).Count
+    $null = $sb.AppendLine("<div class='chips'>" +
+        "<span class='chip HIGH'>Proc HIGH: $high</span><span class='chip MEDIUM'>Proc MED: $med</span><span class='chip LOW'>Proc LOW: $low</span>" +
+        "<span class='chip INFO'>IOC hits: $($iocHits.Count)</span><span class='chip INFO'>YARA hits: $($yaraHits.Count)</span><span class='chip INFO'>Sigma rows: $($hayRows.Count) (crit:$hayCrit high:$hayHigh)</span></div>")
     if ($deltaRows.Count -gt 0) {
         $null = $sb.AppendLine("<h2>NEW since previous collection ($(ConvertTo-HtmlEsc $script:DeltaBaseline))</h2><table><tr><th>Type</th><th>Item</th><th>Detail</th></tr>")
         foreach ($d in ($deltaRows | Select-Object -First 40)) {
@@ -2298,42 +2400,134 @@ a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
         }
         $null = $sb.AppendLine("</table>")
     }
-    $gapRows = Import-CaseCsv 'logging_gaps.csv'
-    if ($gapRows.Count -gt 0) {
-        $null = $sb.AppendLine("<h2>Logging continuity (check for tampering)</h2><table><tr><th>Time</th><th>Event</th><th>Meaning</th></tr>")
-        foreach ($g in ($gapRows | Select-Object -First 25)) {
-            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $g.Time)</td><td>$($g.EventId)</td><td>$(ConvertTo-HtmlEsc $g.Meaning)</td></tr>")
+
+    # ---------- MITRE ATT&CK ----------
+    $null = $sb.AppendLine("<a name='attack'></a><h2>MITRE ATT&CK observed (from Sigma detections)</h2>")
+    $techRows = @()
+    $tacticCounts = @{}
+    $tacticMaxRank = @{}
+    foreach ($r in $hayRows) {
+        $tacs = @(Split-TagList "$($r.MitreTactics)" | Select-Object -First 1)
+        $tags = @(Split-TagList "$($r.MitreTags)")
+        $rk = Get-LvlRank "$($r.Level)"
+        foreach ($t in $tacs) {
+            if (-not $tacticCounts.ContainsKey($t)) { $tacticCounts[$t] = 0; $tacticMaxRank[$t] = 0 }
+            $tacticCounts[$t]++
+            if ($rk -gt $tacticMaxRank[$t]) { $tacticMaxRank[$t] = $rk }
         }
-        $null = $sb.AppendLine("</table>")
+        foreach ($tg in ($tags | Where-Object { $_ -match '^T\d{4}' })) {
+            $techRows += [pscustomobject]@{ Tech = $tg; Tactic = ($tacs -join ','); Rank = $rk; Rule = "$($r.RuleTitle)"; Level = "$($r.Level)"; Last = "$($r.Timestamp)" }
+        }
+    }
+    if ($tacticCounts.Count -gt 0) {
+        foreach ($tk in ($tacticCounts.Keys | Sort-Object)) {
+            $cls = if ($tacticMaxRank[$tk] -ge 4) { 'hi' } elseif ($tacticMaxRank[$tk] -ge 3) { 'md' } else { '' }
+            $null = $sb.AppendLine("<span class='tac $cls'>$(ConvertTo-HtmlEsc (Get-TacticLabel $tk)) : $($tacticCounts[$tk])</span>")
+        }
+        $null = $sb.AppendLine("")
+    }
+    $techGroups = @($techRows | Group-Object Tech | ForEach-Object {
+        [pscustomobject]@{ Tech = $_.Name; Count = $_.Count; MaxRank = (@($_.Group | ForEach-Object { $_.Rank } | Measure-Object -Maximum).Maximum); Group = $_.Group }
+    } | Sort-Object MaxRank, Count -Descending | Select-Object -First 60)
+    if ($techGroups.Count -gt 0) {
+        $null = $sb.AppendLine("<table><tr><th>Technique</th><th>Tactic</th><th>Events</th><th>Max level</th><th>Example alert</th><th>Last seen</th></tr>")
+        foreach ($g in $techGroups) {
+            $best = @($g.Group | Sort-Object Rank -Descending | Select-Object -First 1)
+            $lvlClass = switch -Regex ("$($best.Level)") { 'crit' { 'crit'; break } 'high' { 'high'; break } 'med' { 'med'; break } default { 'info' } }
+            $tacLbl = (@(Split-TagList $best.Tactic | ForEach-Object { Get-TacticLabel $_ }) -join ', ')
+            $null = $sb.AppendLine("<tr><td><b>$($g.Tech)</b></td><td>$(ConvertTo-HtmlEsc $tacLbl)</td><td>$($g.Count)</td><td class='$lvlClass'>$($best.Level)</td><td>$(ConvertTo-HtmlEsc $best.Rule)</td><td>$(ConvertTo-HtmlEsc $best.Last)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Source: csv\hayabusa_timeline.csv (MitreTactics/MitreTags). Reference: <a target='_blank' href='https://attack.mitre.org/techniques/enterprise/'>attack.mitre.org</a></div>")
+    } else {
+        $null = $sb.AppendLine("<div class='meta'>No ATT&CK-tagged detections in the analyzed window.</div>")
+    }
+    $noTelNote = @()
+    if (-not (Test-Path (Join-Path $RawDir 'evtx'))) { $noTelNote += 'No event logs exported - Sigma/ATT&CK coverage is nil for this collection.' }
+    if (-not $Sysmon) { $noTelNote += 'No Sysmon - injection, image-load and per-process network techniques (e.g. T1055, T1003.001 via Sysmon) are not visible in these logs.' }
+    if ($noTelNote.Count -gt 0) {
+        $null = $sb.AppendLine("<div class='card'><b>Cannot rule out (telemetry gaps):</b><ul>")
+        foreach ($n in $noTelNote) { $null = $sb.AppendLine("<li>$(ConvertTo-HtmlEsc $n)</li>") }
+        $null = $sb.AppendLine("</ul></div>")
     }
 
-    $high = @($scored | Where-Object Verdict -eq 'HIGH').Count
-    $med = @($scored | Where-Object Verdict -eq 'MEDIUM').Count
-    $low = @($scored | Where-Object Verdict -eq 'LOW').Count
-    $hayCrit = @($hayRows | Where-Object { $_.Level -match 'crit' }).Count
-    $hayHigh = @($hayRows | Where-Object { $_.Level -match '^high$' }).Count
-    $null = $sb.AppendLine("<div class='chips'>" +
-        "<span class='chip HIGH'>HIGH: $high</span><span class='chip MEDIUM'>MEDIUM: $med</span><span class='chip LOW'>LOW: $low</span>" +
-        "<span class='chip INFO'>IOC hits: $($iocHits.Count)</span><span class='chip INFO'>Sigma timeline: $($hayRows.Count) rows (crit:$hayCrit high:$hayHigh)</span></div>")
-
+    # ---------- IOC section ----------
+    $null = $sb.AppendLine("<a name='ioc'></a><h2>Indicators of compromise</h2>")
     if ($iocHits.Count -gt 0) {
-        $null = $sb.AppendLine("<h2>IOC HITS - investigate first</h2><table><tr><th>Type</th><th>Indicator</th><th>Where</th><th>Context</th><th></th></tr>")
+        $null = $sb.AppendLine("<h3>IOC hits (live system) - investigate first</h3><table><tr><th>Type</th><th>Indicator</th><th>Where</th><th>Context</th><th></th></tr>")
         foreach ($h in $iocHits) {
             $null = $sb.AppendLine("<tr><td><b>$($(ConvertTo-HtmlEsc $h.Type))</b></td><td class='path'>$(ConvertTo-HtmlEsc $h.Indicator)</td><td class='path'>$(ConvertTo-HtmlEsc $h.Where)</td><td>$(ConvertTo-HtmlEsc $h.Context)</td><td>$(New-VtLink $h.Indicator)</td></tr>")
         }
         $null = $sb.AppendLine("</table>")
     }
-
-    $amcHits = Import-CaseCsv 'ioc_hits_amcache.csv'
     if ($amcHits.Count -gt 0) {
-        $null = $sb.AppendLine("<h2>HISTORICAL EXECUTION IOC HITS (amcache) - near-certain TP evidence</h2><table><tr><th>SHA1</th><th>Application</th><th>Source</th><th></th></tr>")
+        $null = $sb.AppendLine("<h3>Historical execution IOC hits (amcache SHA1) - near-certain TP evidence</h3><table><tr><th>SHA1</th><th>Application</th><th>Source</th><th></th></tr>")
         foreach ($h in $amcHits) {
             $null = $sb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $h.Indicator)</td><td>$(ConvertTo-HtmlEsc $h.Application)</td><td>$(ConvertTo-HtmlEsc $h.SourceFile)</td><td>$(New-VtLink $h.Indicator)</td></tr>")
         }
         $null = $sb.AppendLine("</table>")
     }
+    $iocBlock = New-Object System.Collections.Generic.List[string]
+    foreach ($h in $iocHits) { if ("$($h.Indicator)") { $iocBlock.Add("ioc-$("$($h.Type)".ToLower())  $($h.Indicator)") } }
+    foreach ($h in $amcHits) { if ("$($h.Indicator)") { $iocBlock.Add("sha1  $($h.Indicator)") } }
+    foreach ($b in $brute) { if ("$($b.SourceIp)") { $iocBlock.Add("ip  $($b.SourceIp)") } }
+    $yaraScanned = @(Import-CaseCsv 'yara_scanned.csv')
+    foreach ($y in ($yaraScanned | Where-Object { "$($_.Hits)" -match '^\d+$' -and [int]$_.Hits -gt 0 -and "$($_.SHA256)" })) { $iocBlock.Add("sha256  $($y.SHA256)") }
+    $iocUnique = @($iocBlock.ToArray() | Sort-Object -Unique)
+    if ($iocUnique.Count -gt 0) {
+        $null = $sb.AppendLine("<h3>Copy-ready indicator list (defanged)</h3><pre class='ioc'>")
+        foreach ($l in $iocUnique) {
+            $dl = "$l" -replace '(?i)http', 'hxxp'
+            if ($dl -notmatch '^(?i)sha') { $dl = $dl -replace '\.', '[.]' }
+            $null = $sb.AppendLine((ConvertTo-HtmlEsc $dl))
+        }
+        $null = $sb.AppendLine("</pre>")
+    } else {
+        $null = $sb.AppendLine("<div class='meta'>No indicators to export.</div>")
+    }
 
-    $null = $sb.AppendLine("<h2>Process verdicts (correlation scored)</h2>")
+    # ---------- findings by tactic (med+ alerts) ----------
+    $null = $sb.AppendLine("<a name='tactics'></a><h2>Findings by tactic (med+ Sigma alerts)</h2>")
+    $sigAlerts = @($hayRows | Where-Object { (Get-LvlRank "$($_.Level)") -ge 3 })
+    if ($sigAlerts.Count -gt 0) {
+        $byTactic = @{}
+        foreach ($r in $sigAlerts) {
+            $tacs = @(Split-TagList "$($r.MitreTactics)")
+            if ($tacs.Count -eq 0) { $tacs = @('Other') }
+            foreach ($t in ($tacs | Select-Object -First 2)) {
+                if (-not $byTactic.ContainsKey($t)) { $byTactic[$t] = New-Object System.Collections.Generic.List[object] }
+                $byTactic[$t].Add($r)
+            }
+        }
+        foreach ($tk in ($byTactic.Keys | Sort-Object)) {
+            $rows = @($byTactic[$tk])
+            $null = $sb.AppendLine("<h3>$(ConvertTo-HtmlEsc (Get-TacticLabel $tk)) ($($rows.Count) events)</h3><details><summary>show alerts</summary><table><tr><th>Alert</th><th>Level</th><th>Hits</th><th>Last seen</th></tr>")
+            foreach ($g in @($rows | Group-Object RuleTitle | Sort-Object Count -Descending | Select-Object -First 15)) {
+                $best = @($g.Group | Sort-Object { Get-LvlRank "$($_.Level)" } -Descending | Select-Object -First 1)
+                $lvlClass = switch -Regex ("$($best.Level)") { 'crit' { 'crit'; break } 'high' { 'high'; break } 'med' { 'med'; break } default { 'info' } }
+                $last = (@($g.Group | ForEach-Object { "$($_.Timestamp)" } | Sort-Object -Descending | Select-Object -First 1) -join '')
+                $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $g.Name)</td><td class='$lvlClass'>$($best.Level)</td><td>$($g.Count)</td><td>$(ConvertTo-HtmlEsc $last)</td></tr>")
+            }
+            $null = $sb.AppendLine("</table></details>")
+        }
+    } else {
+        $null = $sb.AppendLine("<div class='meta'>No medium+ severity Sigma alerts in the analyzed window.</div>")
+    }
+
+    # ---------- YARA ----------
+    $null = $sb.AppendLine("<a name='yara'></a><h2>YARA findings</h2>")
+    if ($yaraHits.Count -gt 0) {
+        $null = $sb.AppendLine("<table><tr><th>Severity</th><th>Rule</th><th>Description</th><th>File</th></tr>")
+        foreach ($y in ($yaraHits | Sort-Object { Get-LvlRank "$($_.Severity)" } -Descending)) {
+            $sevCls = switch -Regex ("$($y.Severity)") { 'crit|high' { 'crit'; break } 'med' { 'med'; break } default { 'info' } }
+            $null = $sb.AppendLine("<tr><td class='$sevCls'><b>$(ConvertTo-HtmlEsc $y.Severity)</b></td><td>$(ConvertTo-HtmlEsc $y.Rule)</td><td>$(ConvertTo-HtmlEsc $y.Description)</td><td class='path'>$(ConvertTo-HtmlEsc $y.File)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Scanned binaries: csv\yara_scanned.csv</div>")
+    } else {
+        $null = $sb.AppendLine("<div class='meta'>No YARA hits (or YARA module not run).</div>")
+    }
+
+    # ---------- process verdicts ----------
+    $null = $sb.AppendLine("<a name='processes'></a><h2>Process verdicts (correlation scored)</h2>")
     foreach ($p in ($scored | Sort-Object { [int]$_.Score } -Descending | Select-Object -First 30)) {
         $evs = ($p.Evidence -split ';' | Where-Object { $_ }) | ForEach-Object { "<span class='ev'>$(ConvertTo-HtmlEsc $_)</span>" }
         $null = $sb.AppendLine("<div class='card'><span class='badge $($p.Verdict)'>$($p.Verdict) &nbsp;$($p.Score)</span><b>$(ConvertTo-HtmlEsc $p.Name)</b> <span class='meta'>PID $(ConvertTo-HtmlEsc $p.PID)</span> $(New-VtLink $p.Name)<br><span class='path'>$(ConvertTo-HtmlEsc $p.Path)</span><br>$($evs -join ' ')</div>")
@@ -2344,14 +2538,15 @@ a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
         foreach ($cand in @('RuleTitle', 'Alert', 'RuleFile')) {
             if ($hayRows[0].PSObject.Properties[$cand]) { $alertCol = $cand; break }
         }
-        $null = $sb.AppendLine("<h2>Top Sigma detections (hayabusa)</h2>")
+        $null = $sb.AppendLine("<a name='sigma'></a><h2>Top Sigma detections (hayabusa)</h2>")
         if ($alertCol) {
             $groups = $hayRows | Group-Object $alertCol | Sort-Object Count -Descending | Select-Object -First 20
             $null = $sb.AppendLine("<table><tr><th>Alert</th><th>Hits</th><th>Max level</th><th>Last seen</th></tr>")
             foreach ($g in $groups) {
-                $lvl = (@($g.Group | ForEach-Object { $_.Level }) | Sort-Object -Descending | Select-Object -First 1)
-                $lvlClass = switch -Regex ("$lvl") { 'crit' { 'crit'; break } 'high' { 'high'; break } 'med' { 'med'; break } default { 'info' } }
-                $last = (@($g.Group | ForEach-Object { $_.Timestamp } | Sort-Object -Descending | Select-Object -First 1) -join '')
+                $best = @($g.Group | Sort-Object { Get-LvlRank "$($_.Level)" } -Descending | Select-Object -First 1)
+                $lvl = "$($best.Level)"
+                $lvlClass = switch -Regex ($lvl) { 'crit' { 'crit'; break } 'high' { 'high'; break } 'med' { 'med'; break } default { 'info' } }
+                $last = (@($g.Group | ForEach-Object { "$($_.Timestamp)" } | Sort-Object -Descending | Select-Object -First 1) -join '')
                 $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $g.Name)</td><td>$($g.Count)</td><td class='$lvlClass'>$lvl</td><td>$(ConvertTo-HtmlEsc $last)</td></tr>")
             }
             $null = $sb.AppendLine("</table>")
@@ -2359,6 +2554,66 @@ a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
         $null = $sb.AppendLine("<div class='meta'>Full timeline: csv\hayabusa_timeline.csv &nbsp;|&nbsp; hayabusa's own summary: csv\hayabusa_report.html</div>")
     }
 
+    # ---------- logon & account analysis ----------
+    $null = $sb.AppendLine("<a name='logons'></a><h2>Logon & account activity</h2>")
+    $inter = @($authEv | Where-Object { "$($_.EventId)" -eq '4624' -and "$($_.LogonType)" -match '^(2|10)$' } | Group-Object Account, SourceIp | Sort-Object Count -Descending | Select-Object -First 15)
+    if ($inter.Count -gt 0) {
+        $null = $sb.AppendLine("<h3>Interactive / RDP logons</h3><table><tr><th>Account @ Source</th><th>Logons</th></tr>")
+        foreach ($g in $inter) { $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $g.Name)</td><td><b>$($g.Count)</b></td></tr>") }
+        $null = $sb.AppendLine("</table>")
+    }
+    if ($authSum.Count -gt 0) {
+        $null = $sb.AppendLine("<h3>Top account/source combinations (all auth events)</h3><details><summary>show top 25</summary><table><tr><th>Account @ Source</th><th>Events</th></tr>")
+        foreach ($a in ($authSum | Select-Object -First 25)) { $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $a.AccountSource)</td><td>$($a.Count)</td></tr>") }
+        $null = $sb.AppendLine("</table></details>")
+    }
+    if ($brute.Count -gt 0) {
+        $null = $sb.AppendLine("<h3>Brute-force candidates</h3><table><tr><th>Source IP</th><th>Failed logons</th><th></th></tr>")
+        foreach ($b in $brute) { $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $b.SourceIp)</td><td><b>$($b.FailedLogons)</b></td><td>$(New-VtLink $b.SourceIp)</td></tr>") }
+        $null = $sb.AppendLine("</table>")
+    } else {
+        $null = $sb.AppendLine("<div class='meta'>No brute-force candidate sources (threshold: 5+ failed logons). Hayabusa logon summaries: csv\logon_summary* (if module 4.6 ran).</div>")
+    }
+
+    # ---------- persistence inventory ----------
+    $null = $sb.AppendLine("<a name='persistence'></a><h2>Persistence inventory</h2>")
+    $persAny = $false
+    if ($tasksFlag.Count -gt 0) {
+        $persAny = $true
+        $null = $sb.AppendLine("<h3>Flagged scheduled tasks</h3><table><tr><th>Task</th><th>Actions</th><th>Flags</th></tr>")
+        foreach ($t in ($tasksFlag | Select-Object -First 40)) {
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $t.Name)</td><td class='path'>$(ConvertTo-HtmlEsc $t.Actions)</td><td>$(ConvertTo-HtmlEsc $t.Flags)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table>")
+    }
+    if ($svcFlag.Count -gt 0) {
+        $persAny = $true
+        $null = $sb.AppendLine("<h3>Flagged services</h3><table><tr><th>Service</th><th>Binary</th><th>Flags</th></tr>")
+        foreach ($s in ($svcFlag | Select-Object -First 40)) {
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $s.Name)</td><td class='path'>$(ConvertTo-HtmlEsc $s.PathName)</td><td>$(ConvertTo-HtmlEsc $s.Flags)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table>")
+    }
+    if ($wmiBind.Count -gt 0) {
+        $persAny = $true
+        $null = $sb.AppendLine("<h3>WMI event subscriptions (rare on clean hosts - review each)</h3><table><tr><th>Binding</th></tr>")
+        foreach ($w in ($wmiBind | Select-Object -First 25)) {
+            $line = ($w.PSObject.Properties | ForEach-Object { "$($_.Value)" }) -join ' | '
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $line)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table>")
+    }
+    if ($runKeys.Count -gt 0) {
+        $persAny = $true
+        $null = $sb.AppendLine("<h3>Run keys / startup entries</h3><details><summary>show $($runKeys.Count) entries</summary><table><tr><th>Name</th><th>Command</th></tr>")
+        foreach ($r in ($runKeys | Select-Object -First 60)) {
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $r.Name)</td><td class='path'>$(ConvertTo-HtmlEsc $r.Value)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table></details>")
+    }
+    if (-not $persAny) { $null = $sb.AppendLine("<div class='meta'>No persistence entries captured (modules not run or nothing found).</div>") }
+
+    # ---------- execution history ----------
     if ($execRows.Count -gt 0) {
         $null = $sb.AppendLine("<h2>Execution history highlights (user-writable paths)</h2><table>")
         $shown = 0
@@ -2376,19 +2631,47 @@ a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
         $null = $sb.AppendLine("</table><div class='meta'>First $shown of $($execRows.Count) entries - full: csv\execution_timeline.csv</div>")
     }
 
-    if ($brute.Count -gt 0) {
-        $null = $sb.AppendLine("<h2>Brute-force candidates</h2><table><tr><th>Source IP</th><th>Failed logons</th><th></th></tr>")
-        foreach ($b in $brute) { $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $b.SourceIp)</td><td><b>$($b.FailedLogons)</b></td><td>$(New-VtLink $b.SourceIp)</td></tr>") }
-        $null = $sb.AppendLine("</table>")
-    }
-
+    # ---------- network ----------
+    $null = $sb.AppendLine("<a name='network'></a><h2>Public connections (live)</h2>")
     if ($pubConns.Count -gt 0) {
-        $null = $sb.AppendLine("<h2>Public connections (live)</h2><table><tr><th>Remote</th><th>State</th><th>PID</th><th>Process</th><th></th></tr>")
+        $null = $sb.AppendLine("<table><tr><th>Remote</th><th>State</th><th>PID</th><th>Process</th><th></th></tr>")
         foreach ($c in ($pubConns | Select-Object -First 25)) {
             $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $c.RemoteAddress):$(ConvertTo-HtmlEsc $c.RemotePort)</td><td>$(ConvertTo-HtmlEsc $c.State)</td><td>$(ConvertTo-HtmlEsc $c.PID)</td><td class='path'>$(ConvertTo-HtmlEsc $c.ProcessPath)</td><td>$(New-VtLink $c.RemoteAddress)</td></tr>")
         }
         $null = $sb.AppendLine("</table>")
+    } else {
+        $null = $sb.AppendLine("<div class='meta'>No public IP connections at collection time.</div>")
     }
+
+    # ---------- recommendations ----------
+    $null = $sb.AppendLine("<a name='recommendations'></a><h2>Recommendations</h2>")
+    $recs = New-Object System.Collections.Generic.List[string]
+    if ($script:Verdict -and $script:Verdict.LevelRank -ge 3) {
+        $recs.Add('Likely/confirmed compromise: preserve evidence (do not wipe yet), isolate the host from the network, and treat credentials used on it as suspect - rotate them.')
+    }
+    if ($gapRows.Count -gt 0) {
+        $recs.Add('Security log clearing/stopping events were observed - determine who/what cleared them and when (csv\logging_gaps.csv, raw evtx).')
+    }
+    if ($brute.Count -gt 0) {
+        $recs.Add('Brute-force sources observed - check whether any 4625 failure was followed by a 4624 success from the same IP (csv\security_auth_events.csv), and enforce account lockout policy.')
+    }
+    if (-not $Sysmon) {
+        $recs.Add('Deploy Sysmon with a community configuration (e.g. SwiftOnSecurity) to gain process/network/image-load telemetry needed for ATT&CK-level detection.')
+    }
+    if (-not (Test-Path (Join-Path $RawDir 'evtx'))) {
+        $recs.Add('Event logs were not exported (module 4.x skipped or access denied) - rerun elevated with the Standard preset for Sigma/ATT&CK coverage.')
+    }
+    if (-not (Test-IsAdmin)) {
+        $recs.Add('This collection ran WITHOUT admin rights - rerun elevated to include registry hives, amcache, Security log and other key sources.')
+    }
+    if ($LogHours -gt 0 -and $LogHours -le 168) {
+        $recs.Add("Analysis window was only the last $([int]($LogHours/24)) day(s) - rerun with a wider window (e.g. -LogHours 720 or 0 = all) if the intrusion may be older.")
+    }
+    if ($script:Verdict -and $script:Verdict.ConfidencePercent -lt 80) {
+        $recs.Add('Evidence coverage was below 80% - address the missing sources in the coverage table before treating a clean verdict as final.')
+    }
+    if ($recs.Count -eq 0) { $recs.Add('No specific hardening actions indicated by this collection - keep collecting baselines (delta mode) at a regular cadence.') }
+    foreach ($r in $recs.ToArray()) { $null = $sb.AppendLine("<div class='rec'>$(ConvertTo-HtmlEsc $r)</div>") }
 
     $null = $sb.AppendLine("<div class='foot'>Generated $(Get-Date -Format u) by Ophira v$ScriptVersion - all verdicts are correlation heuristics; verify against raw CSV/evtx evidence before acting.</div>")
     $null = $sb.AppendLine("</body></html>")
@@ -2697,7 +2980,6 @@ function New-Package {
     try { New-SuperTimeline } catch { Write-CaseLog "    supertimeline failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-LoggingGaps } catch { Write-CaseLog "    logging gaps failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-SiemExport } catch { Write-CaseLog "    siem export failed: $($_.Exception.Message)" 'DarkYellow' }
-    try { New-HtmlReport | Out-Null } catch { Write-CaseLog "    report generation failed: $($_.Exception.Message)" 'DarkYellow' }
 
     $script:Verdict = $null
     try {
@@ -2715,6 +2997,8 @@ function New-Package {
             Write-CaseLog "    VERDICT: $($script:Verdict.Level) (confidence $($script:Verdict.ConfidencePercent)%) - $($script:Verdict.Signals.Count) signal(s), $($script:Verdict.Caveats.Count) caveat(s) -> verdict.json" $vColor
         }
     } catch { Write-CaseLog "    verdict engine failed: $($_.Exception.Message)" 'DarkYellow' }
+
+    try { New-HtmlReport | Out-Null } catch { Write-CaseLog "    report generation failed: $($_.Exception.Message)" 'DarkYellow' }
 
     $manifest = @()
     $manifest += "Ophira v$ScriptVersion evidence manifest"
