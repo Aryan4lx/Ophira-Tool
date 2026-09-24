@@ -1,2 +1,6 @@
 Place winpmem64.exe (RAM capture) and/or vol.exe (Volatility 3 standalone) here.
 Module 7.1 finds them automatically. Without them, everything else still works.
+
+Other tools (hayabusa, chainsaw, AmcacheParser, RBCmd, yara-x/yr.exe) live in
+their own subfolders - run: .\Ophira.ps1 -Mode Setup -SetupTools yara,hayabusa
+YARA rules: drop extra *.yar files into tools\yara\rules\ (bundled: ophira-pack.yar)

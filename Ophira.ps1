@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.2  -  Windows Incident Response Triage Toolkit
+Ophira v2.5  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -32,7 +32,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.4"
+$ScriptVersion = "2.5"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -51,6 +51,7 @@ function Get-ArgString {
         elseif ($v -is [int]) { $parts += "-$k $v" }
         else { $parts += "-$k `"$v`"" }
     }
+    if ($script:ExtraRelaunchArgs.Count -gt 0) { $parts += $script:ExtraRelaunchArgs }
     $parts -join ' '
 }
 
@@ -60,20 +61,52 @@ function Get-KitRoot {
 }
 
 $cfgFile = Join-Path (Get-KitRoot) 'ophira.config.txt'
+$script:OphiraRole = ''
+$script:CfgTargets = ''
+$script:CfgDeployPreset = ''
+$script:CfgPushTools = $false
+$script:CfgDeployShare = ''
+$script:CfgThreads = 0
+$script:ExtraRelaunchArgs = @()
 if (Test-Path -LiteralPath $cfgFile) {
     try {
         foreach ($line in (Get-Content -LiteralPath $cfgFile)) {
             $l = ($line -replace '#.*$', '').Trim()
-            if ($l -match '^(SHARE|CASE|ANALYST)\s*=\s*(.+)$') {
+            if ($l -match '^(SHARE|CASE|ANALYST|ROLE|TARGETS|PRESET|PUSHTOOLS|DEPLOYSHARE|THREADS)\s*=\s*(.+)$') {
                 $val = $Matches[2].Trim()
                 switch ($Matches[1]) {
                     'SHARE' { if (-not $PSBoundParameters.ContainsKey('SharePath') -and $val) { $SharePath = $val } }
                     'CASE' { if (-not $PSBoundParameters.ContainsKey('CaseID') -and $val) { $CaseID = $val } }
                     'ANALYST' { if (-not $PSBoundParameters.ContainsKey('Analyst') -and $val) { $Analyst = $val } }
+                    'ROLE' { if ($val -match '^(?i)(responder|owner)$') { $script:OphiraRole = $val.ToLower() } }
+                    'TARGETS' { $script:CfgTargets = $val }
+                    'PRESET' { if ($val -match '^(?i)(quick|standard)$') { $script:CfgDeployPreset = (Get-Culture).TextInfo.ToTitleCase($val.ToLower()) } }
+                    'PUSHTOOLS' { $script:CfgPushTools = ($val -match '^(?i)(1|y|yes|true|t)$') }
+                    'DEPLOYSHARE' { $script:CfgDeployShare = $val }
+                    'THREADS' { $n = 0; if ([int]::TryParse($val, [ref]$n) -and $n -gt 0) { $script:CfgThreads = $n } }
                 }
             }
         }
     } catch { }
+}
+
+function Save-OphiraConfig {
+    param([hashtable]$Values)
+    try {
+        $path = Join-Path (Get-KitRoot) 'ophira.config.txt'
+        $lines = @()
+        if (Test-Path -LiteralPath $path) { $lines = @(Get-Content -LiteralPath $path) }
+        foreach ($key in $Values.Keys) {
+            $pattern = "^\s*$key\s*="
+            $found = $false
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match $pattern) { $lines[$i] = "$key=$($Values[$key])"; $found = $true }
+            }
+            if (-not $found) { $lines += "$key=$($Values[$key])" }
+        }
+        Set-Content -LiteralPath $path -Value $lines -Encoding UTF8
+        return $true
+    } catch { return $false }
 }
 $script:SimpleUI = [bool]$SimpleUI
 
@@ -360,6 +393,7 @@ function Show-ToolLinks {
         [pscustomobject]@{ Tool = 'chainsaw (artifact analysis)'; Url = 'https://github.com/WithSecureOpenSource/chainsaw/releases'; Use = 'offline: sigma hunt + shimcache/amcache timeline' }
         [pscustomobject]@{ Tool = 'AmcacheParser (EZ)'; Url = 'https://github.com/EricZimmerman/AmcacheParser/releases'; Use = 'module 8.4 execution inventory + SHA1 x IOC' }
         [pscustomobject]@{ Tool = 'RBCmd (EZ)'; Url = 'https://github.com/EricZimmerman/RBCmd/releases'; Use = 'module 8.4 recycle bin parse' }
+        [pscustomobject]@{ Tool = 'yara-x (binary scanning)'; Url = 'https://github.com/VirusTotal/yara-x/releases'; Use = 'module 4.7 YARA scan of flagged binaries; bundled pack in tools\yara\rules' }
         [pscustomobject]@{ Tool = 'velociraptor (enterprise)'; Url = 'https://github.com/Velocidex/velociraptor/releases'; Use = 'if you move to always-on agent-based DFIR' }
     )
     $rows | Format-Table Tool, Url, Use -AutoSize | Out-String -Width 200 | Write-Host
@@ -378,6 +412,7 @@ function Invoke-SetupMode {
         [pscustomobject]@{ Name = 'chainsaw';    Repo = 'WithSecureOpenSource/chainsaw';     Pattern = '^chainsaw_all_platforms\+rules\.zip$'; Zip = $true }
         [pscustomobject]@{ Name = 'AmcacheParser'; Direct = 'https://download.ericzimmermanstools.com/AmcacheParser.zip'; Zip = $true }
         [pscustomobject]@{ Name = 'RBCmd';       Direct = 'https://download.ericzimmermanstools.com/RBCmd.zip'; Zip = $true }
+        [pscustomobject]@{ Name = 'yara';        Repo = 'VirusTotal/yara-x';                 Pattern = '^yara-x-v[\d\.]+-x86_64-pc-windows-msvc\.zip$'; Zip = $true }
     )
     $installed = @()
     foreach ($t in $catalog) {
@@ -406,8 +441,18 @@ function Invoke-SetupMode {
             Invoke-WebRequest -Uri $assetUrl -OutFile $tmp -UseBasicParsing -ErrorAction Stop
             if ($t.Zip) {
                 $dest = Join-Path $toolsDir $t.Name
+                $keepRules = $null
+                if ($t.Name -eq 'yara') {
+                    $keepRules = Join-Path $dest 'rules'
+                    if (Test-Path $keepRules) {
+                        $bak = "$keepRules.bak"
+                        if (Test-Path $bak) { Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue }
+                        Move-Item -LiteralPath $keepRules -Destination $bak -Force -ErrorAction SilentlyContinue
+                    } else { $keepRules = $null }
+                }
                 if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
                 Expand-Archive -LiteralPath $tmp -DestinationPath $dest -Force -ErrorAction Stop
+                if ($keepRules -and (Test-Path "$keepRules.bak")) { Move-Item -LiteralPath "$keepRules.bak" -Destination $keepRules -Force -ErrorAction SilentlyContinue }
                 Write-Host "  extracted -> tools\$($t.Name)\" -ForegroundColor Green
             } else {
                 Copy-Item -LiteralPath $tmp -Destination (Join-Path $toolsDir $assetName) -Force -ErrorAction Stop
@@ -746,7 +791,7 @@ function Invoke-AnalyzeMode {
         $hayOut = Join-Path $OutFolder 'fleet_hayabusa_timeline.csv'
         $hayHtml = Join-Path $OutFolder 'fleet_hayabusa_report.html'
         Write-Host "    hayabusa fleet timeline running..." -ForegroundColor Cyan
-        $null = Invoke-NativeTool -ExePath $HayabusaExe -ToolArgs @('dfir-timeline', '-d', $merged, '-o', $hayOut, '-H', $hayHtml, '-q', '-w', '-U', '-C', '-K', '-m', 'low', '-E') -WorkingDirectory (Split-Path $HayabusaExe -Parent) -QuietLog
+        $null = Invoke-NativeTool -ExePath $HayabusaExe -ToolArgs @('dfir-timeline', '-p', 'verbose', '-d', $merged, '-o', $hayOut, '-H', $hayHtml, '-q', '-w', '-U', '-C', '-K', '-m', 'low', '-E') -WorkingDirectory (Split-Path $HayabusaExe -Parent) -QuietLog
         if (Test-Path $hayOut) {
             $n = @(Get-Content $hayOut | Select-Object -Skip 1).Count
             Write-Host "    hayabusa: $n detections -> $hayOut" -ForegroundColor Yellow
@@ -1081,7 +1126,7 @@ function Get-UserAssistRows {
 }
 
 function Invoke-NativeTool {
-    param([string]$ExePath, [string[]]$ToolArgs, [string]$WorkingDir = '', [switch]$QuietLog)
+    param([string]$ExePath, [string[]]$ToolArgs, [string]$WorkingDir = '', [switch]$QuietLog, [switch]$CaptureOut)
     $out = ''; $err = ''
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -1109,6 +1154,7 @@ function Invoke-NativeTool {
                 }
             }
         }
+        if ($CaptureOut) { return [pscustomobject]@{ ExitCode = $p.ExitCode; StdOut = $out; StdErr = $err } }
         return $p.ExitCode
     } catch {
         Write-CaseLog "      native tool launch failed: $($_.Exception.Message)" 'DarkYellow'
@@ -1570,7 +1616,7 @@ $script:Modules = @(
             if (-not (Test-Path $evtxDir)) { Write-CaseLog "    no evtx exported - skipping" 'DarkGray'; return }
             $out = Join-Path $CsvDir 'hayabusa_timeline.csv'
             $html = Join-Path $CsvDir 'hayabusa_report.html'
-            $hayArgs = @('dfir-timeline', '-d', "$evtxDir", '-o', "$out", '-H', "$html", '-q', '-w', '-U', '-C', '-K', '-m', 'low', '-E')
+            $hayArgs = @('dfir-timeline', '-p', 'verbose', '-d', "$evtxDir", '-o', "$out", '-H', "$html", '-q', '-w', '-U', '-C', '-K', '-m', 'low', '-E')
             $huntNote = 'full range'
             if ($LogHours -gt 0) { $hayArgs += @('--time-offset', "$($LogHours)h"); $huntNote = "last $($LogHours)h" }
             Write-CaseLog "    hayabusa dfir-timeline Sigma hunt ($huntNote)..." 'Cyan'
@@ -1582,6 +1628,87 @@ $script:Modules = @(
             Write-CaseLog "    hayabusa logon-summary..." 'Cyan'
             $lsPrefix = Join-Path $CsvDir 'logon_summary'
             $null = Invoke-NativeTool -ExePath $h.FullName -ToolArgs @('logon-summary', '-d', "$evtxDir", '-o', "$lsPrefix", '-q', '-C', '-K') -WorkingDirectory $h.DirectoryName
+        } }
+    [pscustomobject]@{ Id = '4.7'; Cat = 'LOGS'; Name = 'YARA scan of flagged/user-path binaries (needs tools\yara)'; Default = $true; Quick = $false;
+        Run = {
+            $tDir = Get-ToolsDir
+            $yr = $null
+            if ($tDir) { $yr = Get-ChildItem -Path $tDir -Recurse -Filter 'yr.exe' -ErrorAction SilentlyContinue | Select-Object -First 1 }
+            if (-not $yr) { Write-CaseLog "    yr.exe not in tools\ - skipping (run Setup, tool 'yara')" 'DarkGray'; return }
+            $rulesDir = Join-Path $yr.DirectoryName 'rules'
+            if (-not (Test-Path -LiteralPath $rulesDir)) { Write-CaseLog "    no rules\ folder next to yr.exe - skipping" 'DarkGray'; return }
+            $ruleFiles = @(Get-ChildItem -LiteralPath $rulesDir -Recurse -File -Include '*.yar', '*.yara' -ErrorAction SilentlyContinue)
+            if ($ruleFiles.Count -eq 0) { Write-CaseLog "    rules\ contains no .yar files - skipping" 'DarkGray'; return }
+
+            $seen = @{}
+            $targets = New-Object System.Collections.Generic.List[string]
+            foreach ($src in @('flash_process_scored', 'processes_flagged', 'services_flagged', 'scheduled_tasks_flagged', 'autoruns_runkeys', 'autoruns_startup_folders', 'drivers_flagged', 'amcache')) {
+                $f = Join-Path $CsvDir "$src.csv"
+                if (-not (Test-Path -LiteralPath $f)) { continue }
+                try { $rows = @(Import-Csv -LiteralPath $f -ErrorAction Stop) } catch { continue }
+                foreach ($r in $rows) {
+                    $line = ($r.PSObject.Properties | ForEach-Object { "$($_.Value)" }) -join ' '
+                    foreach ($mm in [regex]::Matches($line, '(?i)(?:[a-z]:\\|\\\\)[^\s'',\|]+\.(?:exe|dll|scr|com|ps1|bat|cmd|vbs|js|hta|jar)')) {
+                        $p2 = $mm.Value
+                        if (-not $seen.ContainsKey($p2.ToLower())) {
+                            $seen[$p2.ToLower()] = $true
+                            if (Test-Path -LiteralPath $p2 -PathType Leaf) { $targets.Add($p2) }
+                        }
+                    }
+                }
+            }
+            $maxScan = 200
+            if ($targets.Count -eq 0) { Write-CaseLog "    no on-disk candidate files found - nothing to scan" 'Gray'; Save-Rows -Name 'yara_hits' -Rows @(); Save-Rows -Name 'yara_scanned' -Rows @(); return }
+            $scanList = @($targets | Select-Object -First $maxScan)
+            Write-CaseLog "    yara: scanning $($scanList.Count) candidate file(s) with $($ruleFiles.Count) rule file(s)..." 'Cyan'
+            if ($targets.Count -gt $maxScan) { Write-CaseLog "    (capped at $maxScan of $($targets.Count) candidates)" 'DarkYellow' }
+
+            $hits = New-Object System.Collections.Generic.List[object]
+            $scanned = New-Object System.Collections.Generic.List[object]
+            $failed = 0
+            foreach ($f2 in $scanList) {
+                $res = Invoke-NativeTool -ExePath $yr.FullName -ToolArgs @('scan', '-m', '--output-format=ndjson', $rulesDir, $f2) -WorkingDirectory $yr.DirectoryName -QuietLog -CaptureOut
+                if ($res -isnot [pscustomobject] -or $res.ExitCode -ne 0) {
+                    $failed++
+                    if ($failed -eq 1 -and $res -is [pscustomobject] -and $res.StdErr) { Write-CaseLog "    yr.exe error: $(($res.StdErr -split '\r?\n' | Where-Object { $_ } | Select-Object -First 1))" 'DarkYellow' }
+                    continue
+                }
+                $hitRules = @()
+                if ($res.StdOut) {
+                    foreach ($ln in ($res.StdOut -split "`r?`n" | Where-Object { $_ -match '^\s*\{' })) {
+                        try { $j = $ln | ConvertFrom-Json } catch { continue }
+                        if (@($j.rules).Count -gt 0) {
+                            foreach ($ru in @($j.rules)) {
+                                $meta = @{}
+                                if ($ru.meta) { foreach ($kv in @($ru.meta)) { $meta["$($kv[0])"] = "$($kv[1])" } }
+                                $sev = if ($meta['severity']) { $meta['severity'] } else { 'unknown' }
+                                $hits.Add([pscustomobject]@{
+                                    Severity = $sev
+                                    Rule = "$($ru.identifier)"
+                                    Description = "$($meta['description'])"
+                                    File = $f2
+                                })
+                                $hitRules += "$($ru.identifier)"
+                            }
+                        }
+                    }
+                }
+                $sha = ''
+                try { $fi = Get-Item -LiteralPath $f2 -ErrorAction Stop; if ($fi.Length -lt 200MB) { $sha = (Get-FileHash -LiteralPath $f2 -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash } } catch { }
+                $scanned.Add([pscustomobject]@{ File = $f2; SHA256 = $sha; Hits = $hitRules.Count; Rules = ($hitRules -join ';') })
+            }
+            Save-Rows -Name 'yara_hits' -Rows $hits.ToArray()
+            Save-Rows -Name 'yara_scanned' -Rows $scanned.ToArray()
+            $hitArr = $hits.ToArray()
+            $hi = @($hitArr | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' }).Count
+            if ($hitArr.Count -gt 0) {
+                Write-CaseLog "    YARA: $($hitArr.Count) hit(s) on $($scanned.Count) scanned file(s) ($hi high/crit) - csv\yara_hits.csv" $(if ($hi -gt 0) { 'Red' } else { 'Yellow' })
+                foreach ($h2 in ($hitArr | Select-Object -First 10)) {
+                    Write-CaseLog ("      [{0}] {1}  {2}" -f $h2.Severity, $h2.Rule, $h2.File) $(if ("$($h2.Severity)" -match '^(?i)(high|critical)$') { 'Red' } else { 'Yellow' })
+                }
+            } else {
+                Write-CaseLog "    yara: no hits on $($scanned.Count) scanned file(s)$(if ($failed) { " ($failed scan failures)" } else { '' })" 'Gray'
+            }
         } }
     [pscustomobject]@{ Id = '5.1'; Cat = 'ARTIFACTS'; Name = 'Prefetch files'; Default = $true; Quick = $false;
         Run = {
@@ -2025,7 +2152,7 @@ function Invoke-SelectedModules {
     $phaseOf = {
         param($m)
         if ($m.Cat -eq 'VOLATILE') { 'A' }
-        elseif ($m.Id -eq '7.1') { 'CI' }
+        elseif ($m.Id -in @('7.1', '4.7')) { 'CI' }
         elseif ($m.Id -in @('4.6', '5.4', '8.4')) { 'C' }
         else { 'B' }
     }
@@ -2470,7 +2597,7 @@ function New-Package {
     } catch { $manifest += "SCRIPT: Ophira v$ScriptVersion  (self-hash unavailable)" }
     $tDirM = Get-ToolsDir
     if ($tDirM) {
-        $toolExes = Get-ChildItem -Path $tDirM -Recurse -File -Include 'hayabusa*.exe', 'chainsaw*.exe', 'vol.exe', '*winpmem*.exe', 'AmcacheParser*.exe', 'RBCmd*.exe' -ErrorAction SilentlyContinue
+        $toolExes = Get-ChildItem -Path $tDirM -Recurse -File -Include 'hayabusa*.exe', 'chainsaw*.exe', 'vol.exe', '*winpmem*.exe', 'AmcacheParser*.exe', 'RBCmd*.exe', 'yr.exe' -ErrorAction SilentlyContinue
         if ($toolExes) {
             $manifest += "TOOLS AVAILABLE:"
             foreach ($exe in $toolExes) {
@@ -2548,6 +2675,269 @@ function New-Package {
     }
 }
 
+function Show-RoleGate {
+    if ($script:OphiraRole -eq 'responder') { return 'responder' }
+    if ($script:OphiraRole -eq 'owner') { return 'owner' }
+    while ($true) {
+        Clear-Host
+        Write-Host "================================================================" -ForegroundColor Cyan
+        Write-Host "   ___  ___  ___ _  _ ___ _____ _   ___ ___   " -ForegroundColor Cyan
+        Write-Host "  | _ \/ _ \| __| \| | _ \_   _/_\ | _ \ _ \ " -ForegroundColor Cyan
+        Write-Host "  |  _/ (_) | _|| .\` |  _/ | |/ _ \|   /  _/" -ForegroundColor Cyan
+        Write-Host "  |_|  \___/|___|_|\_|_|   |_/_/ \_\_|_\_|_\ " -ForegroundColor Cyan
+        Write-Host "================================================================" -ForegroundColor Cyan
+        Write-Host "  Ophira v$ScriptVersion  -  single-script Windows IR toolkit" -ForegroundColor White
+        Write-Host "  READ-ONLY: collects evidence, never changes the system" -ForegroundColor DarkGray
+        Write-Host "----------------------------------------------------------------" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  Who is using this tool?" -ForegroundColor White
+        Write-Host ""
+        Write-Host "   [1]  I am on the security / incident response team" -ForegroundColor Yellow
+        Write-Host "        Full menu: collect, push & run on remote PCs, analyze." -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "   [2]  The security team asked me to run this" -ForegroundColor Yellow
+        Write-Host "        Guided automatic collection - nothing to decide." -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "----------------------------------------------------------------" -ForegroundColor DarkGray
+        $inp = Read-Host "  Choose 1 or 2"
+        switch -Regex ($inp) {
+            '^1$' { return 'responder' }
+            '^2$' { return 'owner' }
+            default { }
+        }
+    }
+}
+
+function Show-TaskMenu {
+    while ($true) {
+        Clear-Host
+        Write-Host "================================================================" -ForegroundColor Cyan
+        Write-Host "  OPHIRA v$ScriptVersion   |   $($env:COMPUTERNAME)   |   RESPONDER" -ForegroundColor Cyan
+        Write-Host "================================================================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  What do you want to do?" -ForegroundColor White
+        Write-Host ""
+        Write-Host "   [1]  Collect evidence on THIS PC" -ForegroundColor Yellow
+        Write-Host "   [2]  Push & run on REMOTE PCs (WinRM)" -ForegroundColor Yellow
+        Write-Host "   [3]  Analyze collected results (fleet report)" -ForegroundColor Yellow
+        Write-Host "   [4]  Setup / download companion tools" -ForegroundColor Yellow
+        Write-Host "   [5]  Update detection rules (hayabusa)" -ForegroundColor Yellow
+        Write-Host "   [6]  Tool links" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "   [Q]  Quit" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "----------------------------------------------------------------" -ForegroundColor DarkGray
+        $inp = Read-Host "  Command"
+        switch -Regex ($inp) {
+            '^(?i)1$' { return 'Collect' }
+            '^(?i)2$' { return 'Deploy' }
+            '^(?i)3$' { return 'Analyze' }
+            '^(?i)4$' { return 'Setup' }
+            '^(?i)5$' { return 'UpdateRules' }
+            '^(?i)6$' { return 'Links' }
+            '^(?i)q$' { return $null }
+            default { }
+        }
+    }
+}
+
+function Invoke-SetupWizard {
+    Write-Host ""
+    Write-Host "=== Setup companion tools ===" -ForegroundColor Cyan
+    Write-Host "Tools live in tools\ subfolders. Available:" -ForegroundColor Gray
+    Write-Host "  winpmem  hayabusa  volatility3  chainsaw  AmcacheParser  RBCmd  yara" -ForegroundColor White
+    Write-Host "ENTER = walk through all tools (confirm each download)," 
+    Write-Host "or give a comma-separated list (e.g. hayabusa,winpmem)."
+    $inp = (Read-Host "Tools [all]").Trim()
+    $wanted = $null
+    if ($inp) { $wanted = $inp }
+    Invoke-SetupMode -Wanted $wanted
+}
+
+function Invoke-UpdateRulesMode {
+    $tDir = Get-ToolsDir
+    $h = $null
+    if ($tDir) { $h = Get-ChildItem -Path $tDir -Recurse -Filter 'hayabusa*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch 'live-response' } | Select-Object -First 1 }
+    if (-not $h) { Write-Host "hayabusa not found in tools\ - run Setup first" -ForegroundColor Red; return $false }
+    $rulesDir = Join-Path $h.DirectoryName 'rules'
+    $confirm = Read-Host "Replace hayabusa detection rules with the latest from hayabusa-rules? [Y/n]"
+    if ($confirm -match '^[Nn]') { return $true }
+    $bak = $null
+    if (Test-Path $rulesDir) {
+        $bak = "$rulesDir.bak"
+        if (Test-Path $bak) { Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue }
+        Move-Item -LiteralPath $rulesDir -Destination $bak -Force
+    }
+    try {
+        Write-Host "Downloading latest rules from hayabusa-rules..." -ForegroundColor Cyan
+        $zip = Join-Path ([IO.Path]::GetTempPath()) 'hayabusa-rules.zip'
+        Invoke-WebRequest -Uri 'https://github.com/Yamato-Security/hayabusa-rules/archive/refs/heads/main.zip' -OutFile $zip -UseBasicParsing -ErrorAction Stop
+        $ex = Join-Path ([IO.Path]::GetTempPath()) 'hayabusa-rules-extract'
+        if (Test-Path $ex) { Remove-Item $ex -Recurse -Force }
+        Expand-Archive -LiteralPath $zip -DestinationPath $ex -Force -ErrorAction Stop
+        $inner = Get-ChildItem $ex -Directory | Select-Object -First 1
+        if (-not $inner) { throw 'archive layout unexpected' }
+        Move-Item -LiteralPath $inner.FullName -Destination $rulesDir -Force -ErrorAction Stop
+        Remove-Item $zip, $ex -Recurse -Force -ErrorAction SilentlyContinue
+        $n = @(Get-ChildItem $rulesDir -Recurse -Filter '*.yml' -ErrorAction SilentlyContinue).Count
+        if ($n -eq 0) { throw 'no rule files found after extract' }
+        if ($bak -and (Test-Path $bak)) { Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue }
+        Write-Host "Rules updated ($n rule files). (Chainsaw Sigma rules: git pull in tools\chainsaw\sigma)" -ForegroundColor Green
+        return $true
+    } catch {
+        if ($bak -and (Test-Path $bak)) { Move-Item -LiteralPath $bak -Destination $rulesDir -Force }
+        Write-Host "Rules update FAILED ($($_.Exception.Message)) - previous rules restored." -ForegroundColor Red
+        return $false
+    }
+}
+
+function Invoke-DeployWizard {
+    $kit = Get-KitRoot
+    $hostsFile = Join-Path $kit 'hosts.txt'
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Cyan
+    Write-Host "  PUSH & RUN ON REMOTE PCS" -ForegroundColor Cyan
+    Write-Host "================================================================" -ForegroundColor Cyan
+    Write-Host "  Pushes Ophira to remote PCs over WinRM, runs a collection there"
+    Write-Host "  and pulls the result ZIPs back to this PC (or uploads to a share)."
+    Write-Host "  Needs: WinRM enabled on targets + an admin account on them."
+    Write-Host "================================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    $defTargets = $script:CfgTargets
+    if (-not $defTargets -and (Test-Path -LiteralPath $hostsFile)) { $defTargets = 'hosts.txt' }
+    $targets = @()
+    $targetsIn = ''
+    while ($targets.Count -eq 0) {
+        $prompt = "  Target PCs (comma-separated, or a .txt file path)$(if ($defTargets) { " [$defTargets]" })"
+        $targetsIn = (Read-Host $prompt).Trim()
+        if (-not $targetsIn -and $defTargets) { $targetsIn = $defTargets.Trim() }
+        if (-not $targetsIn) { Write-Host "  please enter at least one target" -ForegroundColor Red; continue }
+        if ($targetsIn -match '\.txt$') {
+            $tf = $null
+            if (Test-Path -LiteralPath $targetsIn) { $tf = $targetsIn }
+            elseif (Test-Path -LiteralPath (Join-Path $kit $targetsIn)) { $tf = Join-Path $kit $targetsIn }
+            if ($tf) {
+                $targets = @(Get-Content -LiteralPath $tf | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_ })
+                if ($targets.Count -eq 0) { Write-Host "  file has no host entries: $tf" -ForegroundColor Red }
+            } else { Write-Host "  file not found: $targetsIn" -ForegroundColor Red }
+        } else {
+            $targets = @($targetsIn -split '[,;\s]+' | Where-Object { $_ })
+        }
+    }
+
+    Write-Host ""
+    $cred = $null
+    $cIn = (Read-Host "  Credentials: ENTER = your current account ($env:USERDOMAIN\$env:USERNAME), or type a username").Trim()
+    if ($cIn) {
+        $cred = Get-Credential -UserName $cIn -Message "Password for remote PCs"
+        if (-not $cred) { Write-Host "  no credentials entered - using current account" -ForegroundColor Yellow; $cred = $null }
+    }
+
+    $defPreset = if ($script:CfgDeployPreset) { $script:CfgDeployPreset } else { 'Standard' }
+    $pIn = (Read-Host "  Collection depth: 1=Quick (~1-2 min/PC) or 2=Standard (~3-5 min/PC) [$defPreset]").Trim()
+    $preset = $defPreset
+    if ($pIn -match '^1' -or $pIn -match '^(?i)q(uick)?$') { $preset = 'Quick' }
+    elseif ($pIn -match '^2' -or $pIn -match '^(?i)s(tandard)?$') { $preset = 'Standard' }
+
+    $pushDef = if ($script:CfgPushTools) { 'Y' } else { 'N' }
+    $p2In = (Read-Host "  Also push hayabusa for on-host Sigma detection (removed after run)? [y/N] (default $pushDef)").Trim()
+    $push = if ($p2In) { $p2In -match '^(?i)y' } else { [bool]$script:CfgPushTools }
+
+    $shareIn = ''
+    if ($script:CfgDeployShare) {
+        $shareIn = (Read-Host "  Upload results to share (UNC path, 'none' = pull to collections\, ENTER = $($script:CfgDeployShare))").Trim()
+        if ($shareIn -ieq 'none') { $shareIn = '' }
+    } else {
+        $shareIn = (Read-Host "  Upload results to a central share instead of pulling back? (UNC path, ENTER = pull to collections\)").Trim()
+    }
+    if ($shareIn -and -not (Test-Path $shareIn)) {
+        Write-Host "  WARNING: share not reachable right now ($shareIn) - will retry during run" -ForegroundColor Yellow
+    }
+
+    $threads = if ($script:CfgThreads -gt 0) { $script:CfgThreads } else { $MaxThreads }
+
+    $shown = ($targets | Select-Object -First 5) -join ', '
+    if ($targets.Count -gt 5) { $shown += ", ...($($targets.Count) total)" }
+    $credNote = if ($cred) { $cred.UserName } else { "$env:USERDOMAIN\$env:USERNAME (current)" }
+    Write-Host ""
+    Write-Host "  ----------------------------------------------------------------" -ForegroundColor Cyan
+    Write-Host "  Ready to deploy. Please confirm:" -ForegroundColor White
+    Write-Host "    Targets   : $shown"
+    Write-Host "    Depth     : $preset"
+    Write-Host "    Account   : $credNote"
+    Write-Host "    hayabusa  : $(if ($push) { 'push + run + remove' } else { 'not pushed' })"
+    Write-Host "    Results   : $(if ($shareIn) { "upload to $shareIn" } else { 'pull to collections\' })"
+    if ($CaseID) { Write-Host "    Case ID   : $CaseID" }
+    Write-Host "    Parallel  : $threads hosts at once"
+    Write-Host "  ----------------------------------------------------------------" -ForegroundColor Cyan
+    $go = (Read-Host "  Start? [Y/n]").Trim()
+    if ($go -match '^[Nn]') { Write-Host "  Deploy cancelled." -ForegroundColor Yellow; return }
+
+    Invoke-DeployMode -Targets $targets -DeployPreset $preset -Cred $cred -DeployCaseID $CaseID -DeploySharePath $shareIn -Threads $threads -PushBin $push
+
+    $rem = (Read-Host "  Remember these answers for next time? [y/N]").Trim()
+    if ($rem -match '^(?i)y') {
+        $vals = @{ TARGETS = $targetsIn; PRESET = $preset; PUSHTOOLS = $(if ($push) { 'yes' } else { 'no' }) }
+        if ($shareIn) { $vals['DEPLOYSHARE'] = $shareIn }
+        if (Save-OphiraConfig -Values $vals) { Write-Host "  Saved to ophira.config.txt" -ForegroundColor Green }
+    }
+}
+
+function Invoke-AnalyzeWizard {
+    $kit = Get-KitRoot
+    $def = Join-Path $kit 'collections'
+    if (-not (Test-Path -LiteralPath $def)) { $def = $kit }
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Cyan
+    Write-Host "  ANALYZE COLLECTED RESULTS" -ForegroundColor Cyan
+    Write-Host "================================================================" -ForegroundColor Cyan
+    Write-Host "  Merges OPHIRA_*.zip case files in a folder into one fleet report"
+    Write-Host "  (deploy pulls results into 'collections' by default)."
+    Write-Host "================================================================" -ForegroundColor Cyan
+    while ($true) {
+        $pIn = (Read-Host "  Folder with case ZIPs [$def]").Trim()
+        $path = if ($pIn) { $pIn } else { $def }
+        if (-not (Test-Path -LiteralPath $path)) {
+            Write-Host "  not found: $path" -ForegroundColor Red
+            $retry = (Read-Host "  Enter another path, or press ENTER to cancel").Trim()
+            if (-not $retry) { return }
+            $def = $retry
+            continue
+        }
+        Invoke-AnalyzeMode -Path $path -HayabusaExe $HayabusaPath
+        return
+    }
+}
+
+$bareLaunch = ($Mode -eq 'Collect' -and -not $PSBoundParameters.ContainsKey('Mode') -and -not $NoMenu -and -not $script:SimpleUI)
+if ($bareLaunch -and [Environment]::UserInteractive) {
+    $role = Show-RoleGate
+    if ($role -eq 'owner') {
+        $script:SimpleUI = $true
+        $script:ExtraRelaunchArgs += @('-SimpleUI')
+    } else {
+        while ($true) {
+            $chosenTask = Show-TaskMenu
+            if (-not $chosenTask) { exit 0 }
+            if ($chosenTask -eq 'Collect') {
+                $script:ExtraRelaunchArgs += @('-Mode', 'Collect')
+                break
+            }
+            switch ($chosenTask) {
+                'Deploy' { Invoke-DeployWizard }
+                'Analyze' { Invoke-AnalyzeWizard }
+                'Setup' { Invoke-SetupWizard }
+        'UpdateRules' { if (-not (Invoke-UpdateRulesMode)) { exit 1 } }
+                'Links' { Show-ToolLinks }
+            }
+            Write-Host ""
+            Write-Host "Press any key to return to the menu..." -ForegroundColor DarkGray
+            try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
+        }
+    }
+}
+
 if ($Mode -ne 'Collect') {
     switch ($Mode) {
         'Links' { Show-ToolLinks }
@@ -2560,41 +2950,7 @@ if ($Mode -ne 'Collect') {
             if (-not $ComputerName) { Write-Host "-ComputerName or -TargetsFile required for Deploy mode" -ForegroundColor Red; exit 1 }
             Invoke-DeployMode -Targets $ComputerName -DeployPreset $Preset -Cred $Credential -DeployCaseID $CaseID -DeploySharePath $SharePath -Threads $MaxThreads -PushBin ([bool]$PushTools)
         }
-        'UpdateRules' {
-            $tDir = Get-ToolsDir
-            $h = $null
-            if ($tDir) { $h = Get-ChildItem -Path $tDir -Recurse -Filter 'hayabusa*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch 'live-response' } | Select-Object -First 1 }
-            if (-not $h) { Write-Host "hayabusa not found in tools\ - run -Mode Setup first" -ForegroundColor Red; exit 1 }
-            $rulesDir = Join-Path $h.DirectoryName 'rules'
-            $confirm = Read-Host "Replace hayabusa detection rules with the latest from hayabusa-rules? [Y/n]"
-            if ($confirm -match '^[Nn]') { exit 0 }
-            $bak = $null
-            if (Test-Path $rulesDir) {
-                $bak = "$rulesDir.bak"
-                if (Test-Path $bak) { Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue }
-                Move-Item -LiteralPath $rulesDir -Destination $bak -Force
-            }
-            try {
-                Write-Host "Downloading latest rules from hayabusa-rules..." -ForegroundColor Cyan
-                $zip = Join-Path ([IO.Path]::GetTempPath()) 'hayabusa-rules.zip'
-                Invoke-WebRequest -Uri 'https://github.com/Yamato-Security/hayabusa-rules/archive/refs/heads/main.zip' -OutFile $zip -UseBasicParsing -ErrorAction Stop
-                $ex = Join-Path ([IO.Path]::GetTempPath()) 'hayabusa-rules-extract'
-                if (Test-Path $ex) { Remove-Item $ex -Recurse -Force }
-                Expand-Archive -LiteralPath $zip -DestinationPath $ex -Force -ErrorAction Stop
-                $inner = Get-ChildItem $ex -Directory | Select-Object -First 1
-                if (-not $inner) { throw 'archive layout unexpected' }
-                Move-Item -LiteralPath $inner.FullName -Destination $rulesDir -Force -ErrorAction Stop
-                Remove-Item $zip, $ex -Recurse -Force -ErrorAction SilentlyContinue
-                $n = @(Get-ChildItem $rulesDir -Recurse -Filter '*.yml' -ErrorAction SilentlyContinue).Count
-                if ($n -eq 0) { throw 'no rule files found after extract' }
-                if ($bak -and (Test-Path $bak)) { Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue }
-                Write-Host "Rules updated ($n rule files). (Chainsaw Sigma rules: git pull in tools\chainsaw\sigma)" -ForegroundColor Green
-            } catch {
-                if ($bak -and (Test-Path $bak)) { Move-Item -LiteralPath $bak -Destination $rulesDir -Force }
-                Write-Host "Rules update FAILED ($($_.Exception.Message)) - previous rules restored." -ForegroundColor Red
-                exit 1
-            }
-        }
+        'UpdateRules' { Invoke-UpdateRulesMode }
     }
     exit 0
 }

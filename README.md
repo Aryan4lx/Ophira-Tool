@@ -33,6 +33,29 @@
 
 **Owner handoff:** send the whole folder. They double-click `RUN-OPHIRA.bat`, accept UAC, wait 3-5 minutes. A folder window opens with the result file selected and its path is copied to the clipboard — they paste it into an email. If you pre-fill `ophira.config.txt` (SHARE=/CASE=/ANALYST=), results upload to your share automatically and there's literally nothing to send.
 
+## Interactive launcher (role gate + task menu)
+
+Running `.\Ophira.ps1` bare (no flags) first asks **who is using the tool**:
+
+- `[1] Security / IR team` → **task menu**: collect this PC · push & run on remote PCs · analyze collected results · setup tools · update rules · tool links. Deploy and Analyze are guided wizards (targets, credentials, depth, share — plain questions with `[defaults]`, confirm summary, then the existing parallel engine runs). After each task you return to the menu.
+- `[2] The security team asked me to run this` → the guided automatic owner flow (same as the .bat).
+
+Flags always win: `-SimpleUI`, `-NoMenu`, or any explicit `-Mode` skips the gate entirely, so automation and `RUN-OPHIRA.bat` behave exactly as before. Non-interactive sessions never see the gate.
+
+`ophira.config.txt` keys:
+
+| Key | Effect |
+|---|---|
+| `SHARE=` / `CASE=` / `ANALYST=` | collect-mode defaults (as before) |
+| `ROLE=responder\|owner` | pre-selects the gate — never asked |
+| `TARGETS=` | deploy wizard default (host list or `hosts.txt`) |
+| `PRESET=Quick\|Standard` | deploy wizard depth default |
+| `PUSHTOOLS=yes\|no` | deploy wizard hayabusa push default |
+| `DEPLOYSHARE=` | deploy wizard upload share default |
+| `THREADS=` | deploy parallelism default |
+
+Wizard answers are remembered only when you answer **y** to "Remember these answers?" at the end of a deploy — they become the `[defaults]` shown next time.
+
 ## Collect mode
 
 1. **Flash triage (auto, ~15s)** — process anomalies with **correlation scoring** (LOW/MEDIUM/HIGH verdicts), public IP connections, DNS/ARP, SMB + saved credentials, Defender last detection, **IOC matching**
@@ -40,7 +63,7 @@
    - VOLATILE — processes, full hashing, connections, DNS+ARP, sessions, drivers
    - PERSISTENCE — Run keys, startup folders, services, scheduled tasks, WMI subscriptions
    - NETWORK MAP — interfaces, reachable subnets, SMB, saved creds, Kerberos, proxy/WPAD, opt-in active probes
-   - LOGS — Security (4625 brute-force candidates), PowerShell 4104, Sysmon (auto-detected), RDP, System 7045, raw evtx export, **detection pack** (hayabusa Sigma timeline + HTML + logon summary)
+   - LOGS — Security (4625 brute-force candidates), PowerShell 4104, Sysmon (auto-detected), RDP, System 7045, raw evtx export, **detection pack** (hayabusa Sigma timeline with MITRE ATT&CK tags + HTML + logon summary), **YARA scan of flagged/user-path binaries** (bundled rule pack, drop your own `*.yar` into `tools\yara\rules\`)
    - ARTIFACTS — Prefetch, registry hives (SYSTEM/SOFTWARE/SAM/SECURITY, Amcache.hve), UserAssist, SRUM, **chainsaw execution timeline + SRUM + evtx gap detection**
    - CONTEXT — **attacker activity** (PowerShell console history, RDP client targets, recycle bin), **user registry saves** (NTUSER.DAT/UsrClass.dat all profiles), **coverage & context** (Sysmon config, task XML, BITS jobs, domain info), **EZ parsers** (AmcacheParser execution inventory with SHA1×IOC cross-check, RBCmd)
    - DEFENDER — detections, exclusions, status, operational log
@@ -77,6 +100,7 @@ Bundled in `tools\` in this repo (self-contained kit). Refresh via `-Mode Setup`
 | chainsaw | execution timeline, SRUM, evtx gaps (5.4) + offline Sigma | https://github.com/WithSecureOpenSource/chainsaw/releases |
 | AmcacheParser (EZ) | execution inventory + SHA1×IOC (8.4) | https://github.com/EricZimmerman/AmcacheParser/releases |
 | RBCmd (EZ) | recycle bin parse (8.4) | https://github.com/EricZimmerman/RBCmd/releases |
+| yara-x | YARA scan of flagged binaries (4.7), MIT rule pack bundled | https://github.com/VirusTotal/yara-x/releases |
 
 Analyst-side quick wins on a collected case:
 ```
@@ -96,7 +120,7 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 
 ## Roadmap
 
-- [ ] YARA scan of flagged binaries
+- [x] YARA scan of flagged binaries (module 4.7 + bundled `ophira-pack.yar`)
 - [ ] Role-based presets (WebServer / DC / Workstation)
 
 ## License
