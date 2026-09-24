@@ -96,7 +96,7 @@ Run Ophira again on the same box days later: it auto-finds the previous case, co
 
 ## Analyze mode
 
-Merges N case zips → `fleet_report.csv` + **`fleet_report.html`** (host matrix, high-priority findings, cross-host indicator + hash dedup, top fleet Sigma detections, **baselining proposals**) + one merged hayabusa timeline. Accepts legacy `IRCASE_*` packages too.
+Merges N case zips → `fleet_report.csv` + **`fleet_report.html`** (**per-host verdicts inherited from each case's `verdict.json`**: verdict chips, worst-first host matrix, ATTENTION FIRST list) + **`fleet_hosts.csv`** (host/verdict/confidence for SIEM), high-priority findings, cross-host indicator + hash dedup, top fleet Sigma detections, **baselining proposals** + one merged hayabusa timeline. Accepts legacy `IRCASE_*` packages too (shown as "no verdict").
 
 **Fleet baselining:** publishers present on ≥60% of hosts with zero HIGH verdicts are written to `proposed_trusted.txt` — review once, merge into `tools\trusted.txt`, and your false-positive rate drops with every host you scan.
 

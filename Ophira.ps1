@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.7  -  Windows Incident Response Triage Toolkit
+Ophira v2.8  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -32,7 +32,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.7"
+$ScriptVersion = "2.8"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -685,9 +685,17 @@ function Invoke-AnalyzeMode {
         $meta = $null
         if (Test-Path $caseJson) { try { $meta = Get-Content $caseJson -Raw | ConvertFrom-Json } catch { } }
         if ($meta -and $meta.Computer) { $host_ = $meta.Computer }
+        $vd = $null
+        $verdictJson = Join-Path $dir 'verdict.json'
+        if (Test-Path $verdictJson) { try { $vd = Get-Content $verdictJson -Raw | ConvertFrom-Json } catch { } }
         $hosts += [pscustomobject]@{
             Host = $host_; Source = $src.Name; CaseID = $meta.CaseID
             Collected = $meta.StartedUTC; Admin = $meta.AdminElevated; Sysmon = $meta.SysmonPresent
+            Verdict = "$(if ($vd) { $vd.Level } else { '' })"
+            VerdictRank = $(if ($vd) { [int]$vd.LevelRank } else { -1 })
+            Confidence = $(if ($vd) { $vd.ConfidencePercent } else { $null })
+            Signals = $(if ($vd) { @($vd.Signals).Count } else { 0 })
+            Caveats = $(if ($vd) { @($vd.Caveats).Count } else { 0 })
         }
         $csvDir = Join-Path $dir 'csv'
         if (Test-Path $csvDir) {
@@ -738,6 +746,17 @@ function Invoke-AnalyzeMode {
     $byType = $findings | Group-Object Type | Sort-Object Count -Descending
     Write-Host "`n  Findings by type:" -ForegroundColor White
     foreach ($g in $byType) { Write-Host ("    {0,-14} {1}" -f $g.Name, $g.Count) }
+    $withVerdict = @($hosts | Where-Object { $_.VerdictRank -ge 0 })
+    if ($withVerdict.Count -gt 0) {
+        Write-Host "`n  Verdicts:" -ForegroundColor White
+        foreach ($g in @($withVerdict | Group-Object Verdict)) { Write-Host ("    {0,-30} {1} host(s)" -f $g.Name, $g.Count) }
+        $attention = @($withVerdict | Where-Object { $_.VerdictRank -ge 3 } | Sort-Object VerdictRank -Descending)
+        if ($attention.Count -gt 0) {
+            Write-Host "    ATTENTION FIRST:" -ForegroundColor Red
+            foreach ($a in $attention) { Write-Host ("      {0,-22} {1} (conf {2}%)" -f $a.Host, $a.Verdict, $a.Confidence) -ForegroundColor Red }
+        }
+        if ($hosts.Count -gt $withVerdict.Count) { Write-Host "    ($($hosts.Count - $withVerdict.Count) legacy case(s) without verdict - rerun those hosts with Ophira v2.6+)" -ForegroundColor DarkGray }
+    }
     $highRisk = @($findings | Where-Object { $_.Type -in @('IOC-HIT', 'AVDetection') })
     if ($highRisk.Count) {
         Write-Host "`n  *** HIGH-PRIORITY (IOC hits / AV detections) ***" -ForegroundColor Red
@@ -800,6 +819,8 @@ function Invoke-AnalyzeMode {
     }
     $reportCsv = Join-Path $OutFolder 'fleet_report.csv'
     $findings | Sort-Object Host, Type | Export-Csv -LiteralPath $reportCsv -NoTypeInformation -Encoding UTF8
+    $hostsCsv = Join-Path $OutFolder 'fleet_hosts.csv'
+    $hosts | Sort-Object Host | Select-Object Host, Verdict, VerdictRank, Confidence, Signals, Caveats, Collected, Admin, Sysmon, Source, CaseID | Export-Csv -LiteralPath $hostsCsv -NoTypeInformation -Encoding UTF8
 
     $fleetHtml = Join-Path $OutFolder 'fleet_report.html'
     $css = @'
@@ -810,22 +831,36 @@ h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:32px 0 10px;color:#8ab
 table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #2a2f3a;padding:6px 10px;text-align:left}
 th{background:#1d222c;color:#8ab4f8}tr:nth-child(even){background:#151920}
 .HIGH{color:#ff8789;font-weight:700}.IOC{color:#ff8789}.path{font-family:Consolas,monospace;font-size:12px;color:#8ab4f8;word-break:break-all}
+.V4{color:#ff8789;font-weight:800}.V3{color:#ff8789;font-weight:700}.V2{color:#ffce6b}.V1{color:#7ee2a8}.V0{color:#9ec1f0}.VN{color:#7d8590}
+.chips{margin:14px 0}.chip{display:inline-block;padding:5px 13px;border-radius:14px;margin-right:6px;font-size:13px;font-weight:600;background:#243447;color:#9ec1f0}
 a{color:#8ab4f8}.foot{margin-top:40px;color:#565e6b;font-size:11px}
 </style>
 '@
     $fsb = New-Object System.Text.StringBuilder
     $null = $fsb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira Fleet</title>$css</head><body>")
     $null = $fsb.AppendLine("<h1>OPHIRA FLEET REPORT</h1><div class='meta'>$(Get-Date -Format u) - $($hosts.Count) hosts - $($findings.Count) findings - Ophira v$ScriptVersion</div>")
-    $null = $fsb.AppendLine("<h2>Host summary</h2><table><tr><th>Host</th><th>High-priority</th><th>Proc anomalies</th><th>Brute force</th><th>Collected</th></tr>")
-    foreach ($h in ($hosts | Sort-Object Host)) {
+    if (@($hosts | Where-Object { $_.VerdictRank -ge 0 }).Count -gt 0) {
+        $chipParts = @()
+        foreach ($lvl in @(4, 3, 2, 1, 0)) {
+            $n = @($hosts | Where-Object VerdictRank -eq $lvl).Count
+            if ($n -gt 0) { $chipParts += "<span class='chip V$lvl'>$((@{4='COMPROMISED';3='LIKELY COMPROMISED';2='SUSPICIOUS';1='NO EVIDENCE';0='INCONCLUSIVE'})[$lvl]): $n</span>" }
+        }
+        $leg = @($hosts | Where-Object VerdictRank -lt 0).Count
+        if ($leg -gt 0) { $chipParts += "<span class='chip VN'>no verdict: $leg</span>" }
+        $null = $fsb.AppendLine("<div class='chips'>$($chipParts -join '')</div>")
+    }
+    $null = $fsb.AppendLine("<h2>Host summary (worst verdict first)</h2><table><tr><th>Host</th><th>Verdict</th><th>Conf</th><th>High-priority</th><th>Proc anomalies</th><th>Brute force</th><th>Collected</th></tr>")
+    foreach ($h in ($hosts | Sort-Object -Property @{Expression='VerdictRank';Descending=$true}, 'Host')) {
         $hf = @($findings | Where-Object Host -eq $h.Host)
         $hp = @($hf | Where-Object { $_.Type -in @('IOC-HIT', 'AVDetection') }).Count
         $pa = @($hf | Where-Object { $_.Type -eq 'ProcAnomaly' -and $_.Detail -match '^\[HIGH' }).Count
         $bf = @($hf | Where-Object Type -eq 'BruteForce').Count
         $rowClass = if ($hp -gt 0 -or $pa -gt 0) { 'HIGH' } else { '' }
-        $null = $fsb.AppendLine("<tr><td class='$rowClass'>$(ConvertTo-HtmlEsc $h.Host)</td><td>$hp</td><td>$pa</td><td>$bf</td><td>$(ConvertTo-HtmlEsc $h.Collected)</td></tr>")
+        $vCell = if ($h.VerdictRank -ge 0) { "<span class='V$($h.VerdictRank)'>$(ConvertTo-HtmlEsc $h.Verdict)</span>" } else { "<span class='VN'>n/a</span>" }
+        $cCell = if ($h.VerdictRank -ge 0) { "$($h.Confidence)%" } else { '' }
+        $null = $fsb.AppendLine("<tr><td class='$rowClass'>$(ConvertTo-HtmlEsc $h.Host)</td><td>$vCell</td><td>$cCell</td><td>$hp</td><td>$pa</td><td>$bf</td><td>$(ConvertTo-HtmlEsc $h.Collected)</td></tr>")
     }
-    $null = $fsb.AppendLine("</table>")
+    $null = $fsb.AppendLine("</table><div class='meta'>Per-host verdict details: each case zip's verdict.json + report.html. Host list CSV: fleet_hosts.csv</div>")
     if ($highRisk.Count -gt 0) {
         $null = $fsb.AppendLine("<h2>High-priority findings (IOC / AV)</h2><table><tr><th>Host</th><th>Type</th><th>Detail</th></tr>")
         foreach ($f in ($highRisk | Sort-Object Host | Select-Object -First 100)) {
