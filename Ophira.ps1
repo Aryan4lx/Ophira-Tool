@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.10  -  Windows Incident Response Triage Toolkit
+Ophira v2.11  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -32,7 +32,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.10"
+$ScriptVersion = "2.11"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -1489,6 +1489,131 @@ $script:Modules = @(
             Save-Rows -Name 'wmi_event_consumers' -Rows $consumers
             Save-Rows -Name 'wmi_bindings' -Rows $bindings
         } }
+    [pscustomobject]@{ Id = '2.6'; Cat = 'PERSISTENCE'; Name = 'ASEP deep sweep (IFEO, AppInit, Winlogon, COM hijacks, netsh, LSA, StartupApproved)'; Default = $true; Quick = $false;
+        Run = {
+            $asepList = New-Object System.Collections.Generic.List[object]
+            function Add-Asep([string]$Category, [string]$Location, [string]$Name, [string]$Value, [string[]]$Flags) {
+                $asepList.Add([pscustomobject]@{ Category = $Category; Location = $Location; Name = $Name; Value = $Value; Flags = ($Flags -join ';') })
+            }
+            $flagFor = {
+                param([string]$v)
+                $f = @()
+                if ($v -and (Test-IsUserWritablePath $v)) { $f += 'user-path' }
+                return $f
+            }
+            # IFEO: any Debugger value (incl. accessibility sticky-keys backdoors)
+            foreach ($hive in @('HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options', 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options')) {
+                if (Test-Path $hive) {
+                    foreach ($k in (Get-ChildItem -Path $hive -ErrorAction SilentlyContinue)) {
+                        $p = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+                        foreach ($vn in @('Debugger', 'GlobalFlag', 'MonitorProcess', 'SilentProcessExit')) {
+                            $v = $null; try { $v = $p.$vn } catch { }
+                            if ("$v") { Add-Asep 'IFEO' $k.PSPath $vn "$v" (& $flagFor "$v") }
+                        }
+                    }
+                }
+            }
+            # AppInit_DLLs (32/64)
+            foreach ($hive in @('HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows', 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows NT\CurrentVersion\Windows')) {
+                $p = Get-ItemProperty -Path $hive -ErrorAction SilentlyContinue
+                if ($p) {
+                    $v = "$($p.AppInit_DLLs)"
+                    if ($v.Trim()) { Add-Asep 'AppInit_DLLs' $hive 'AppInit_DLLs' $v ((& $flagFor $v) + 'nondefault') }
+                }
+            }
+            # Winlogon core values (Shell/Userinit/Taskman/AppSetup replaced or appended)
+            $wl = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
+            if ($wl) {
+                foreach ($vn in @('Shell', 'Userinit', 'Taskman', 'AppSetup')) {
+                    $v = $null; try { $v = $wl.$vn } catch { }
+                    if (-not "$v") { continue }
+                    $ok = $false
+                    $entries = @("$v" -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                    if ($vn -eq 'Shell') { $ok = ($entries -contains 'explorer.exe') }
+                    elseif ($vn -eq 'Userinit') { $ok = (@($entries | Where-Object { $_ -notmatch '(?i)userinit\.exe$' }).Count -eq 0) }
+                    $f = @()
+                    if (-not $ok) { $f += 'nondefault' }
+                    $f += (& $flagFor "$v")
+                    if ($f.Count -gt 0) { Add-Asep 'Winlogon' 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' $vn "$v" $f }
+                }
+            }
+            # WinlogonNotify DLLs
+            $notify = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Notify'
+            if (Test-Path $notify) {
+                foreach ($k in (Get-ChildItem -Path $notify -ErrorAction SilentlyContinue)) {
+                    $v = "$((Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue).DLLName)"
+                    if ($v) { Add-Asep 'WinlogonNotify' $k.PSPath 'DLLName' $v (& $flagFor $v) }
+                }
+            }
+            # netsh helper DLLs
+            $netsh = 'HKLM:\SOFTWARE\Microsoft\Netsh'
+            if (Test-Path $netsh) {
+                foreach ($k in (Get-ChildItem -Path $netsh -ErrorAction SilentlyContinue)) {
+                    $p = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+                    foreach ($prop in ($p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
+                        $v = "$($prop.Value)"
+                        if ($v -match '\.dll') { Add-Asep 'NetshHelper' $k.PSPath $prop.Name $v (& $flagFor $v) }
+                    }
+                }
+            }
+            # LSA security/authentication packages (DLL list values)
+            $lsa = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -ErrorAction SilentlyContinue
+            if ($lsa) {
+                foreach ($vn in @('Security Packages', 'Authentication Packages', 'Notification Packages')) {
+                    $v = $null; try { $v = $lsa.$vn } catch { }
+                    if ("$v") {
+                        $f = @()
+                        foreach ($dll in @("$v" -split '[,; ]+' | Where-Object { $_ })) { if (Test-IsUserWritablePath $dll) { $f += "user-path($dll)" } }
+                        Add-Asep 'LsaPackages' 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' $vn "$v" $f
+                    }
+                }
+            }
+            # HKCU COM InprocServer32 entries (per-user COM hijack suspects)
+            try {
+                $sids = Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-' }
+                foreach ($sid in $sids) {
+                    $clsidRoot = "Registry::HKEY_USERS\$($sid.PSChildName)\Software\Classes\CLSID"
+                    if (-not (Test-Path $clsidRoot)) { continue }
+                    foreach ($clsid in (Get-ChildItem -Path $clsidRoot -ErrorAction SilentlyContinue | Select-Object -First 4000)) {
+                        $ips = "$($clsid.PSPath)\InprocServer32"
+                        if (Test-Path $ips) {
+                            $v = "$((Get-ItemProperty -Path $ips -ErrorAction SilentlyContinue).'(default)')"
+                            if ($v -and $v -notmatch '^[Hh]ttp') {
+                                $f = & $flagFor $v
+                                if ($f) { Add-Asep 'ComHijack-HKCU' $ips "$($clsid.PSChildName)" $v $f }
+                            }
+                        }
+                    }
+                }
+            } catch { }
+            # StartupApproved stamps (enabled/disabled per autorun entry)
+            foreach ($root in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved')) {
+                if (-not (Test-Path $root)) { continue }
+                $hiveName = if ($root -like 'HKCU:*') { 'HKCU' } else { 'HKLM' }
+                foreach ($sub in @('Run', 'RunOnce', 'StartupFolder')) {
+                    $k = "$root\$sub"
+                    if (-not (Test-Path $k)) { continue }
+                    $p = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue
+                    foreach ($prop in ($p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
+                        $bytes = $null; try { $bytes = $prop.Value } catch { }
+                        $state = 'unknown'
+                        if ($bytes -is [byte[]] -and $bytes.Count -gt 0) {
+                            if ($bytes[0] -in @(2, 3)) { $state = 'enabled' } elseif ($bytes[0] -in @(6, 7, 13)) { $state = 'disabled' }
+                        }
+                        Add-Asep 'StartupApproved' $k $prop.Name $state @()
+                    }
+                }
+            }
+            $rows = $asepList.ToArray()
+            Save-Rows -Name 'asep_sweep' -Rows $rows
+            $hot = @($rows | Where-Object { $_.Flags -match 'user-path|nondefault' })
+            if ($hot.Count -gt 0) {
+                Write-CaseLog "    ASEP sweep: $($rows.Count) entries, $($hot.Count) UNCOMMON/USER-PATH (IFEO/AppInit/COM/netsh/LSA) -> csv\asep_sweep.csv" 'Red'
+                foreach ($h in ($hot | Select-Object -First 5)) { Write-CaseLog "      [$($h.Category)] $($h.Name) = $($h.Value)" 'Red' }
+            } else {
+                Write-CaseLog "    ASEP sweep: $($rows.Count) entries, none flagged" 'Gray'
+            }
+        } }
     [pscustomobject]@{ Id = '3.1'; Cat = 'NETWORK MAP'; Name = 'Passive map (interfaces, routes, SMB, creds, proxy)'; Default = $true; Quick = $true;
         Run = {
             $net = @()
@@ -1586,6 +1711,34 @@ $script:Modules = @(
                 $r += [pscustomobject]@{ Check = 'DNS-Resolve'; Target = 'www.microsoft.com'; Result = $false }
             }
             Save-Rows -Name 'net_active_probes' -Rows $r
+        } }
+    [pscustomobject]@{ Id = '3.3'; Cat = 'NETWORK MAP'; Name = 'Firewall profiles + firewall log copy'; Default = $true; Quick = $false;
+        Run = {
+            $prof = @()
+            try {
+                if (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue) {
+                    foreach ($p in (Get-NetFirewallProfile -ErrorAction SilentlyContinue)) {
+                        $prof += [pscustomobject]@{
+                            Profile = $p.Name; Enabled = $p.Enabled
+                            InboundDefault = $p.DefaultInboundAction; OutboundDefault = $p.DefaultOutboundAction
+                            LogFileName = "$($p.LogFileName)"; LogMaxKB = $p.LogMaxSizeKilobytes
+                        }
+                    }
+                } else {
+                    $raw = (& netsh.exe advfirewall show allprofiles 2>$null | Where-Object { $_ }) -join "`r`n"
+                    if ($raw) { Out-RawText -SubDir 'net' -Name 'firewall_profiles_netsh.txt' -Text $raw }
+                }
+            } catch { }
+            Save-Rows -Name 'firewall_profiles' -Rows $prof
+            $dst = Join-Path $RawDir 'firewall'
+            New-Item -ItemType Directory -Path $dst -Force | Out-Null
+            $copied = 0
+            foreach ($logPath in @("$env:SystemRoot\System32\LogFiles\Firewall\pfirewall.log", "$env:SystemRoot\System32\LogFiles\Firewall\domainfw.log", "$env:SystemRoot\System32\LogFiles\Firewall\privatefw.log", "$env:SystemRoot\System32\LogFiles\Firewall\publicfw.log")) {
+                if (Test-Path -LiteralPath $logPath) {
+                    try { Copy-Item -LiteralPath $logPath -Destination $dst -Force -ErrorAction Stop; $copied++ } catch { }
+                }
+            }
+            Write-CaseLog "    firewall: $($prof.Count) profile row(s), $copied log file(s) -> raw\firewall\" 'Gray'
         } }
     [pscustomobject]@{ Id = '4.1'; Cat = 'LOGS'; Name = 'Security log (auth events + evtx export)'; Default = $true; Quick = $false;
         Run = {
@@ -2306,6 +2459,74 @@ $script:Modules = @(
                 if ($jlCsv) { Write-CaseLog "    jump lists parsed -> $(@($jlCsv | ForEach-Object { $_.Name }) -join ', ')" 'Gray' } else { Write-CaseLog "    JLECmd produced no output" 'DarkYellow' }
             }
         } }
+    [pscustomobject]@{ Id = '8.6'; Cat = 'CONTEXT'; Name = 'Certificate store inventory (T1553 root-trust abuse)'; Default = $true; Quick = $false;
+        Run = {
+            $rows = @()
+            $stores = @(
+                @{ Path = 'Cert:\LocalMachine\Root'; Store = 'LocalMachine\Root' }
+                @{ Path = 'Cert:\LocalMachine\CA'; Store = 'LocalMachine\CA' }
+                @{ Path = 'Cert:\LocalMachine\TrustedPublisher'; Store = 'LocalMachine\TrustedPublisher' }
+                @{ Path = 'Cert:\CurrentUser\Root'; Store = 'CurrentUser\Root' }
+            )
+            $cutoff = (Get-Date).AddDays(-90)
+            foreach ($st in $stores) {
+                try {
+                    foreach ($c in (Get-ChildItem -Path $st.Path -ErrorAction SilentlyContinue)) {
+                        $flags = @()
+                        if ($c.NotBefore -and $c.NotBefore -ge $cutoff) { $flags += 'recently-added' }
+                        if ($c.Subject -and $c.Issuer -and ("$($c.Subject)" -eq "$($c.Issuer)")) { $flags += 'self-signed' }
+                        if ($st.Store -eq 'CurrentUser\Root') { $flags += 'user-store' }
+                        $rows += [pscustomobject]@{
+                            Store = $st.Store; Thumbprint = $c.Thumbprint; Subject = "$($c.Subject)"
+                            Issuer = "$($c.Issuer)"; NotBefore = $c.NotBefore; NotAfter = $c.NotAfter
+                            HasPrivateKey = $c.HasPrivateKey; Flags = ($flags -join ';')
+                        }
+                    }
+                } catch { }
+            }
+            Save-Rows -Name 'certificates' -Rows $rows
+            $hot = @($rows | Where-Object { $_.Flags -match 'recently-added' -and $_.Flags -match 'self-signed' })
+            if ($hot.Count -gt 0) {
+                Write-CaseLog "    certificates: $($rows.Count) inventoried, $($hot.Count) RECENT + SELF-SIGNED (verify: enterprise root CAs are self-signed by design) -> csv\certificates.csv" 'Yellow'
+            } else {
+                Write-CaseLog "    certificates: $($rows.Count) inventoried -> csv\certificates.csv" 'Gray'
+            }
+        } }
+    [pscustomobject]@{ Id = '8.7'; Cat = 'CONTEXT'; Name = 'Browser artifacts raw save (Chrome/Edge History + Downloads, per profile)'; Default = $true; Quick = $false;
+        Run = {
+            $dst = Join-Path $RawDir 'browser'
+            New-Item -ItemType Directory -Path $dst -Force | Out-Null
+            $inv = @()
+            $browsers = @(
+                @{ Name = 'chrome'; Root = Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data' }
+                @{ Name = 'edge';   Root = Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data' }
+            )
+            foreach ($b in $browsers) {
+                if (-not (Test-Path -LiteralPath $b.Root)) { continue }
+                $profileDirs = @()
+                $prof = Join-Path $b.Root 'Default'
+                if (Test-Path -LiteralPath $prof) { $profileDirs += 'Default' }
+                try {
+                    $profileDirs += @(Get-ChildItem -LiteralPath $b.Root -Directory -Filter 'Profile *' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+                } catch { }
+                foreach ($pd in $profileDirs) {
+                    foreach ($file in @('History', 'Downloads', 'Preferences', 'Bookmarks')) {
+                        $src = Join-Path $b.Root "$pd\$file"
+                        if (-not (Test-Path -LiteralPath $src)) { continue }
+                        $sub = Join-Path $dst "$($b.Name)_$pd"
+                        if (-not (Test-Path -LiteralPath $sub)) { New-Item -ItemType Directory -Path $sub -Force | Out-Null }
+                        $outFile = Join-Path $sub $file
+                        $ok = $false
+                        try { Copy-Item -LiteralPath $src -Destination $outFile -Force -ErrorAction Stop; $ok = $true } catch { }
+                        if (-not $ok) { & esentutl.exe /y /vss "$src" /d "$outFile" 2>&1 | Out-Null; $ok = (Test-Path -LiteralPath $outFile) }
+                        if ($ok) { $inv += [pscustomobject]@{ Browser = $b.Name; Profile = $pd; File = $file; Bytes = (Get-Item -LiteralPath $outFile).Length } }
+                    }
+                }
+            }
+            Save-Rows -Name 'browser_files' -Rows $inv
+            $mb = [math]::Round((($inv | Measure-Object Bytes -Sum).Sum) / 1MB, 1)
+            Write-CaseLog "    browser: $($inv.Count) file(s) ($mb MB) saved to raw\browser\ (SQLite parsed offline)" 'Gray'
+        } }
 )
 
 function Get-FilteredEvents {
@@ -2547,6 +2768,9 @@ function New-HtmlReport {
     $wmiBind = @(Import-CaseCsv 'wmi_bindings.csv')
     $deltaRows = @(Import-CaseCsv 'delta_new.csv')
     $gapRows = @(Import-CaseCsv 'logging_gaps.csv')
+    $asepRows = @(Import-CaseCsv 'asep_sweep.csv')
+    $certs = @(Import-CaseCsv 'certificates.csv')
+    $asepHot = @($asepRows | Where-Object { $_.Flags -match 'user-path|nondefault' })
 
     function Get-LvlRank([string]$l) {
         switch -Regex ("$l") { 'crit' { 5; break } 'high' { 4; break } 'med' { 3; break } 'low' { 2; break } default { 1 } }
@@ -2883,6 +3107,27 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         }
         $null = $sb.AppendLine("</table></details>")
     }
+    if ($asepHot.Count -gt 0) {
+        $persAny = $true
+        $null = $sb.AppendLine("<h3>Uncommon persistence mechanisms (IFEO / AppInit / Winlogon / netsh / LSA)</h3><table><tr><th>Category</th><th>Target</th><th>Setting</th><th>Value</th><th>Flags</th></tr>")
+        foreach ($a in ($asepHot | Select-Object -First 40)) {
+            $target = ''
+            try { $target = Split-Path "$($a.Location)" -Leaf } catch { }
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $a.Category)</td><td>$(ConvertTo-HtmlEsc $target)</td><td>$(ConvertTo-HtmlEsc $a.Name)</td><td class='path'>$(ConvertTo-HtmlEsc $a.Value)</td><td>$(ConvertTo-HtmlEsc $a.Flags)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>These autostart extensibility points are rarely used by legitimate software (exception: OEM Winlogon Shell entries). Full inventory incl. per-user COM: csv\asep_sweep.csv</div>")
+    }
+    if ($certs.Count -gt 0) {
+        $certHot = @($certs | Where-Object { $_.Flags -match 'recently-added' -and $_.Flags -match 'self-signed' })
+        if ($certHot.Count -gt 0) {
+            $persAny = $true
+            $null = $sb.AppendLine("<h3>Recently added self-signed certificates (root trust)</h3><table><tr><th>Store</th><th>Subject</th><th>NotBefore</th><th>Flags</th></tr>")
+            foreach ($c in ($certHot | Select-Object -First 25)) {
+                $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $c.Store)</td><td>$(ConvertTo-HtmlEsc $c.Subject)</td><td>$(ConvertTo-HtmlEsc $c.NotBefore)</td><td>$(ConvertTo-HtmlEsc $c.Flags)</td></tr>")
+            }
+            $null = $sb.AppendLine("</table><div class='meta'>Enterprise root CAs are self-signed by design - verify against the org's PKI. Malware adds root CAs to enable HTTPS interception. Full inventory: csv\certificates.csv</div>")
+        }
+    }
     if (-not $persAny) { $null = $sb.AppendLine("<div class='meta'>No persistence entries captured (modules not run or nothing found).</div>") }
 
     # ---------- execution history ----------
@@ -3176,6 +3421,7 @@ function Get-CompromiseVerdict {
     $brute = Import-CaseCsv 'security_bruteforce_candidates'
     $beacons = Import-CaseCsv 'beacon_candidates'
     $usnBursts = Import-CaseCsv 'usn_write_bursts'
+    $asep = Import-CaseCsv 'asep_sweep'
 
     $levelNames = @{ 4 = 'COMPROMISED'; 3 = 'LIKELY COMPROMISED'; 2 = 'SUSPICIOUS'; 1 = 'NO EVIDENCE OF COMPROMISE'; 0 = 'INCONCLUSIVE' }
 
@@ -3195,11 +3441,14 @@ function Get-CompromiseVerdict {
     $beaconHi = @($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' }).Count
     $beaconMed = @($beacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
     $usnBurstN = @($usnBursts).Count
+    # ponytail: COM hijacks + StartupApproved excluded from the signal (per-user COM has many legit users, e.g. Teams/OneDrive); they stay report-visible
+    $asepHotN = @($asep | Where-Object { $_.Flags -match 'user-path|nondefault' -and "$($_.Category)" -notmatch 'ComHijack|StartupApproved' }).Count
 
     Add-Signal 'IOC hit - historical execution (amcache SHA1)' 4 @($iocAmc).Count "near-certain true positive evidence"
     Add-Signal 'YARA hit - high/critical rule' 4 $yaraHi (($yara | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'C2 beaconing - highly regular callbacks' 3 $beaconHi (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp):$($_.Port) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'Ransomware-like mass file modification (USN journal)' 3 $usnBurstN (($usnBursts | Select-Object -First 3 | ForEach-Object { "$($_.WindowStart): $($_.WriteEvents) writes / $($_.DistinctFiles) files" }) -join '; ')
+    Add-Signal 'Uncommon persistence mechanism (IFEO/AppInit/Winlogon/netsh/LSA)' 2 $asepHotN (($asep | Where-Object { $_.Flags -match 'user-path|nondefault' -and "$($_.Category)" -notmatch 'ComHijack|StartupApproved' } | Select-Object -First 3 | ForEach-Object { "$($_.Category): $($_.Name) = $($_.Value)" }) -join '; ')
     Add-Signal 'IOC hit - live system' 3 @($iocLive).Count (($iocLive | Select-Object -First 3 | ForEach-Object { $_.Indicator }) -join '; ')
     Add-Signal 'Sigma detection - critical' 3 $hayCrit (($hay | Where-Object { "$($_.Level)" -match 'crit' } | Select-Object -First 3 | ForEach-Object { $_.RuleTitle }) -join '; ')
     Add-Signal 'YARA hit - medium rule' 2 $yaraMed (($yara | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
@@ -3227,6 +3476,8 @@ function Get-CompromiseVerdict {
     Add-Cov 'Prefetch execution history' (Test-Path (Join-Path $CsvDir 'prefetch_index.csv')) 8
     Add-Cov 'USN journal (file modification history)' (Test-Path (Join-Path $CsvDir 'usn_write_bursts.csv')) 10
     Add-Cov 'MFT file timeline (filtered)' (Test-Path (Join-Path $CsvDir 'mft_recent.csv')) 8
+    Add-Cov 'ASEP deep sweep (IFEO/AppInit/COM/netsh/LSA)' (Test-Path (Join-Path $CsvDir 'asep_sweep.csv')) 5
+    Add-Cov 'Browser history artifacts' (Test-Path (Join-Path $CsvDir 'browser_files.csv')) 4
     Add-Cov 'Defender status' (Test-Path (Join-Path $CsvDir 'defender_status.csv')) 5
     Add-Cov 'YARA binary scan' (Test-Path (Join-Path $CsvDir 'yara_scanned.csv')) 5
     Add-Cov 'Sysmon telemetry (bonus)' ([bool]$Sysmon) 5

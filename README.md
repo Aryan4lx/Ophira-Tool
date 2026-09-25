@@ -61,11 +61,11 @@ Wizard answers are remembered only when you answer **y** to "Remember these answ
 1. **Flash triage (auto, ~15s)** — process anomalies with **correlation scoring** (LOW/MEDIUM/HIGH verdicts), public IP connections, DNS/ARP, SMB + saved credentials, Defender last detection, **IOC matching**
 2. **Deep modules** (menu or presets `Flash|Quick|Standard|Full`):
    - VOLATILE — processes, full hashing, connections, DNS+ARP, sessions, drivers
-   - PERSISTENCE — Run keys, startup folders, services, scheduled tasks, WMI subscriptions
-   - NETWORK MAP — interfaces, reachable subnets, SMB, saved creds, Kerberos, proxy/WPAD, opt-in active probes
+   - PERSISTENCE — Run keys, startup folders, services, scheduled tasks, WMI subscriptions, **ASEP deep sweep** (IFEO debuggers incl. sticky-keys, AppInit_DLLs, Winlogon Shell/Userinit/Notify, HKCU COM hijack suspects, netsh helpers, LSA packages, StartupApproved stamps → `asep_sweep.csv` with flags)
+   - NETWORK MAP — interfaces, reachable subnets, SMB, saved creds, Kerberos, proxy/WPAD, opt-in active probes, **firewall profiles + `pfirewall.log` copy**
    - LOGS — Security (4625 brute-force candidates), PowerShell 4104, Sysmon (auto-detected), RDP, System 7045, raw evtx export, **detection pack** (hayabusa Sigma timeline with MITRE ATT&CK tags + HTML + logon summary), **YARA scan of flagged/user-path binaries** (bundled rule pack, drop your own `*.yar` into `tools\yara\rules\`), **C2 beaconing analysis** (periodicity/jitter/regularity on Sysmon network events → `beacon_candidates.csv`, feeds verdict + report)
    - ARTIFACTS — Prefetch (copied **+ parsed run counts via PECmd**), registry hives (SYSTEM/SOFTWARE/SAM/SECURITY, Amcache.hve), UserAssist, SRUM, **chainsaw execution timeline + SRUM + evtx gap detection**, **NTFS forensics** (live `$MFT` filtered executable inventory + **USN journal ransomware-burst detection** via MFTECmd)
-   - CONTEXT — **attacker activity** (PowerShell console history, RDP client targets, recycle bin), **LNK + Jump Lists** (raw save + parse via LECmd/JLECmd), **user registry saves** (NTUSER.DAT/UsrClass.dat all profiles), **coverage & context** (Sysmon config, task XML, BITS jobs, domain info), **EZ parsers** (AmcacheParser execution inventory with SHA1×IOC cross-check, RBCmd)
+   - CONTEXT — **attacker activity** (PowerShell console history, RDP client targets, recycle bin), **LNK + Jump Lists** (raw save + parse via LECmd/JLECmd), **user registry saves** (NTUSER.DAT/UsrClass.dat all profiles), **coverage & context** (Sysmon config, task XML, BITS jobs, domain info), **EZ parsers** (AmcacheParser execution inventory with SHA1×IOC cross-check, RBCmd), **certificate store inventory** (T1553: recent/self-signed root CAs flagged in `certificates.csv`), **browser artifacts raw save** (Chrome/Edge History+Downloads per profile, `esentutl /vss` fallback for locked files)
    - DEFENDER — detections, exclusions, status, operational log
    - MEMORY — optional RAM capture (winpmem), optional Volatility 3 quick pass
 3. **Packaging** — SHA256 manifest (per file + package + script self-hash + tool inventory), `case.json`, **compromise verdict** (`verdict.json`: 5-level verdict + coverage-weighted confidence + signals + caveats), `report.html`, **supertimeline.csv** (all events merged chronologically), **delta_new.csv** (new findings vs previous collection), **siem_export.ndjson** (Splunk/Elastic-ready records), **logging_gaps.csv** (log cleared/stopped + evtx gap tamper check), ZIP
@@ -75,7 +75,7 @@ Wizard answers are remembered only when you answer **y** to "Remember these answ
 Every collection ends with `Get-CompromiseVerdict` correlating all findings into one call:
 
 - **5 levels**: `COMPROMISED` → `LIKELY COMPROMISED` → `SUSPICIOUS` → `NO EVIDENCE OF COMPROMISE` → `INCONCLUSIVE`
-- **Signal floors** — amcache IOC hit or high/critical YARA hit forces COMPROMISED; live IOC hit, critical Sigma, **C2 beaconing (high)** or **USN ransomware-style mass file modification** force ≥ LIKELY COMPROMISED; critical Sigma / HIGH process verdict / Defender history / log-tamper events force ≥ SUSPICIOUS; two independent strong signals escalate to LIKELY COMPROMISED
+- **Signal floors** — amcache IOC hit or high/critical YARA hit forces COMPROMISED; live IOC hit, critical Sigma, **C2 beaconing (high)** or **USN ransomware-style mass file modification** force ≥ LIKELY COMPROMISED; critical Sigma / HIGH process verdict / Defender history / log-tamper events / **uncommon persistence (IFEO/AppInit/Winlogon/netsh/LSA)** force ≥ SUSPICIOUS; two independent strong signals escalate to LIKELY COMPROMISED
 - **Confidence %** = weighted coverage of evidence sources actually collected (volatile, persistence, evtx, Sigma, amcache, prefetch, USN journal, MFT timeline, YARA, Sysmon, RAM; −15 if not elevated)
 - **Caveats** state what could *not* be ruled out (no Sysmon, short log window, no RAM capture...) — i.e., what would change the verdict
 - Surfaced in: console summary, `verdict.json`, `case.json`, and a plain-language RESULT line on the owner screen
@@ -138,8 +138,8 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 - [x] YARA scan of flagged binaries (module 4.7 + bundled `ophira-pack.yar`)
 - [x] C2 beaconing detection (module 4.8, v2.9)
 - [x] NTFS forensics: $MFT + USN ransomware bursts + prefetch/LNK parsing (v2.10)
+- [x] Persistence sweep + quick wins: ASEP, cert store, firewall log, browser copy (v2.11)
 - [ ] Real-host pilot run (validate hayabusa timing + MFTECmd on live volume)
-- [ ] Persistence sweep expansion (IFEO, AppInit, COM hijacks, netsh helpers)
 - [ ] Report completeness: evidence index of all CSV artifacts
 - [ ] Role-based presets (WebServer / DC / Workstation)
 
