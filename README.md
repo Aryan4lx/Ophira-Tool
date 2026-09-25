@@ -37,7 +37,7 @@
 
 Running `.\Ophira.ps1` bare (no flags) first asks **who is using the tool**:
 
-- `[1] Security / IR team` → **task menu**: collect this PC · push & run on remote PCs · analyze collected results · setup tools · update rules · tool links. Deploy and Analyze are guided wizards (targets, credentials, depth, share — plain questions with `[defaults]`, confirm summary, then the existing parallel engine runs). After each task you return to the menu.
+- `[1] Security / IR team` → **task menu**: collect this PC · push & run on remote PCs · analyze collected results · setup tools · update rules · tool links. Deploy and Analyze are guided wizards (targets, credentials, depth, share — plain questions with `[defaults]`, confirm summary, then the existing parallel engine runs). Deploy has an **advanced options** prompt (Full depth, log analysis window, host parallelism). After each task you return to the menu.
 - `[2] The security team asked me to run this` → the guided automatic owner flow (same as the .bat).
 
 Flags always win: `-SimpleUI`, `-NoMenu`, or any explicit `-Mode` skips the gate entirely, so automation and `RUN-OPHIRA.bat` behave exactly as before. Non-interactive sessions never see the gate.
@@ -63,7 +63,7 @@ Wizard answers are remembered only when you answer **y** to "Remember these answ
    - VOLATILE — processes, full hashing, connections, DNS+ARP, sessions, drivers
    - PERSISTENCE — Run keys, startup folders, services, scheduled tasks, WMI subscriptions
    - NETWORK MAP — interfaces, reachable subnets, SMB, saved creds, Kerberos, proxy/WPAD, opt-in active probes
-   - LOGS — Security (4625 brute-force candidates), PowerShell 4104, Sysmon (auto-detected), RDP, System 7045, raw evtx export, **detection pack** (hayabusa Sigma timeline with MITRE ATT&CK tags + HTML + logon summary), **YARA scan of flagged/user-path binaries** (bundled rule pack, drop your own `*.yar` into `tools\yara\rules\`)
+   - LOGS — Security (4625 brute-force candidates), PowerShell 4104, Sysmon (auto-detected), RDP, System 7045, raw evtx export, **detection pack** (hayabusa Sigma timeline with MITRE ATT&CK tags + HTML + logon summary), **YARA scan of flagged/user-path binaries** (bundled rule pack, drop your own `*.yar` into `tools\yara\rules\`), **C2 beaconing analysis** (periodicity/jitter/regularity on Sysmon network events → `beacon_candidates.csv`, feeds verdict + report)
    - ARTIFACTS — Prefetch, registry hives (SYSTEM/SOFTWARE/SAM/SECURITY, Amcache.hve), UserAssist, SRUM, **chainsaw execution timeline + SRUM + evtx gap detection**
    - CONTEXT — **attacker activity** (PowerShell console history, RDP client targets, recycle bin), **user registry saves** (NTUSER.DAT/UsrClass.dat all profiles), **coverage & context** (Sysmon config, task XML, BITS jobs, domain info), **EZ parsers** (AmcacheParser execution inventory with SHA1×IOC cross-check, RBCmd)
    - DEFENDER — detections, exclusions, status, operational log
@@ -123,7 +123,7 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 ## Design rules
 
 - Read-only; degrades gracefully without admin (logs what failed)
-- PowerShell 5.1 baseline (Win 2008 R2+ with updates), no dependencies
+- PowerShell 5.1 baseline (Win 2008 R2+ with updates), no dependencies. Hosts with PowerShell < 5.0 get a clear fail-fast message with remote-collection alternatives instead of cryptic errors
 - Fallbacks for 2008-era boxes (netstat/arp/ipconfig parsing when cmdlets missing)
 - Per-module failure isolation; speed/precision via presets (Flash 15s → Quick 1-2 min → Standard 3-5 min)
 - **Phased parallel collection** — volatile first (order of volatility), then independent categories in parallel runspaces, then heavy analytics (hayabusa/chainsaw/EZ) in parallel; `-Sequential` forces the old serial behavior

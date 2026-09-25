@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.8  -  Windows Incident Response Triage Toolkit
+Ophira v2.9  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -32,9 +32,23 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.8"
+$ScriptVersion = "2.9"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
+
+if ($PSVersionTable.PSVersion.Major -lt 5) {
+    Write-Host "================================================================" -ForegroundColor Red
+    Write-Host " Ophira needs PowerShell 5.0 or newer - this host runs" -ForegroundColor Red
+    Write-Host " PowerShell v$($PSVersionTable.PSVersion). Collection here is not possible." -ForegroundColor Red
+    Write-Host " What works instead:" -ForegroundColor White
+    Write-Host "  - Run Ophira on a PC with PowerShell 5.1 and use menu option 2" -ForegroundColor Gray
+    Write-Host "    (Push & run on REMOTE PCs) - it reaches this host over WinRM" -ForegroundColor Gray
+    Write-Host "  - Or collect manually: evtx logs, registry hives, Prefetch folder" -ForegroundColor Gray
+    Write-Host "  - Or have the security team install WMF 5.1 on this host first" -ForegroundColor Gray
+    Write-Host "================================================================" -ForegroundColor Red
+    try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
+    exit 1
+}
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
 
 function Test-IsAdmin {
@@ -472,7 +486,7 @@ function Invoke-SetupMode {
 }
 
 function Invoke-DeployMode {
-    param([string[]]$Targets, [string]$DeployPreset, $Cred, [string]$DeployCaseID, [string]$DeploySharePath, [int]$Threads = 8, [bool]$PushBin = $false)
+    param([string[]]$Targets, [string]$DeployPreset, $Cred, [string]$DeployCaseID, [string]$DeploySharePath, [int]$Threads = 8, [bool]$PushBin = $false, [int]$DeployLogHours = 0)
 
     $kit = Get-KitRoot
     $scriptPath = Join-Path $kit 'Ophira.ps1'
@@ -496,7 +510,7 @@ function Invoke-DeployMode {
     }
 
     $worker = {
-        param($c, $scriptPath, $toolsDir, $preset, $caseID, $sharePath, $cred, $outFolder, $binZip)
+        param($c, $scriptPath, $toolsDir, $preset, $caseID, $sharePath, $cred, $outFolder, $binZip, $logHours)
         $result = [pscustomobject]@{ Host = $c; Ok = $false; Detail = '' }
         $s = $null
         $remoteDir = 'C:\Windows\Temp\Ophira'
@@ -523,6 +537,7 @@ function Invoke-DeployMode {
             }
             $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$remoteDir\Ophira.ps1`" -Mode Collect -NoMenu -NoElevate -Preset $preset -OutputPath `"$remoteDir\out`" -CaseID `"$caseID`""
             if ($sharePath) { $cmd += " -SharePath `"$sharePath`"" }
+            if ($logHours -ge 0) { $cmd += " -LogHours $logHours" }
             $res = Invoke-Command -Session $s -ScriptBlock {
                 param($k, $t)
                 $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $k -Wait -PassThru -WindowStyle Hidden
@@ -555,7 +570,7 @@ function Invoke-DeployMode {
         $jobs = [System.Collections.ArrayList]::new()
         foreach ($c in $Batch) {
             $ps = [powershell]::Create()
-            $null = $ps.AddScript($worker.ToString()).AddArgument($c).AddArgument($scriptPath).AddArgument($toolsDir).AddArgument($DeployPreset).AddArgument($DeployCaseID).AddArgument($DeploySharePath).AddArgument($Cred).AddArgument($outFolder).AddArgument($binZip)
+            $null = $ps.AddScript($worker.ToString()).AddArgument($c).AddArgument($scriptPath).AddArgument($toolsDir).AddArgument($DeployPreset).AddArgument($DeployCaseID).AddArgument($DeploySharePath).AddArgument($Cred).AddArgument($outFolder).AddArgument($binZip).AddArgument($DeployLogHours)
             $ps.RunspacePool = $pool
             $null = $jobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Target = $c })
         }
@@ -1745,6 +1760,71 @@ $script:Modules = @(
                 Write-CaseLog "    yara: no hits on $($scanned.Count) scanned file(s)$(if ($failed) { " ($failed scan failures)" } else { '' })" 'Gray'
             }
         } }
+    [pscustomobject]@{ Id = '4.8'; Cat = 'LOGS'; Name = 'C2 beaconing analysis (needs Sysmon network events)'; Default = $true; Quick = $false;
+        Run = {
+            $f = Join-Path $CsvDir 'sysmon_network.csv'
+            if (-not (Test-Path -LiteralPath $f)) { Write-CaseLog "    no sysmon_network.csv (no Sysmon / module 3.4 skipped) - beaconing not analyzable" 'DarkGray'; return }
+            try { $rows = @(Import-Csv -LiteralPath $f -ErrorAction Stop) } catch { Write-CaseLog "    cannot read sysmon_network.csv" 'DarkYellow'; return }
+            if ($rows.Count -lt 15) { Write-CaseLog "    too few Sysmon network events ($($rows.Count)) for beaconing analysis" 'Gray'; Save-Rows -Name 'beacon_candidates' -Rows @(); return }
+            $parsed = @()
+            foreach ($r in $rows) {
+                $t = $null
+                try { $t = [datetime]"$($r.Time)" } catch { }
+                if ($t) { $parsed += [pscustomobject]@{ T = $t; Image = "$($r.Image)"; Ip = "$($r.DestIp)"; Port = "$($r.DestPort)" } }
+            }
+            $flagged = @{}
+            $fps = Join-Path $CsvDir 'flash_process_scored.csv'
+            if (Test-Path -LiteralPath $fps) {
+                try { foreach ($fr in @(Import-Csv -LiteralPath $fps)) { if ("$($fr.Verdict)" -match '^(HIGH|MEDIUM)$' -and "$($fr.Path)") { $flagged["$($fr.Path)".ToLower()] = $true } } } catch { }
+            }
+            $out = @()
+            foreach ($g in ($parsed | Group-Object Image, Ip, Port)) {
+                if ($g.Count -lt 15) { continue }
+                $ev = @($g.Group | Sort-Object T)
+                $span = ($ev[-1].T - $ev[0].T).TotalMinutes
+                if ($span -lt 15) { continue }
+                $deltas = @()
+                for ($i = 1; $i -lt $ev.Count; $i++) {
+                    $d = ($ev[$i].T - $ev[$i - 1].T).TotalSeconds
+                    if ($d -gt 0 -and $d -le 3600) { $deltas += $d }
+                }
+                if ($deltas.Count -lt 10) { continue }
+                $sortedD = @($deltas | Sort-Object)
+                $median = $sortedD[[int][math]::Floor($sortedD.Count / 2)]
+                $mean = ($deltas | Measure-Object -Average).Average
+                $variance = (($deltas | ForEach-Object { [math]::Pow($_ - $mean, 2) } | Measure-Object -Sum).Sum) / $deltas.Count
+                $jitter = if ($mean -gt 0) { [math]::Round([math]::Sqrt($variance) / $mean, 2) } else { 9.99 }
+                $inBand = @($deltas | Where-Object { $_ -ge ($median * 0.5) -and $_ -le ($median * 1.5) }).Count
+                $reg = [math]::Round($inBand / $deltas.Count, 2)
+                if ($reg -lt 0.6) { continue }
+                $img = "$($ev[0].Image)"; $ip = "$($ev[0].Ip)"
+                $isPub = Test-IsPublicIp $ip
+                $flags = @()
+                if ($isPub) { $flags += 'public-ip' }
+                if (Test-IsUserWritablePath $img) { $flags += 'user-path' }
+                if ($flagged.ContainsKey($img.ToLower())) { $flags += 'flagged-process' }
+                $sev = 'low'; $rk = 1
+                if ($reg -ge 0.7 -and ($isPub -or ($flags -contains 'user-path'))) { $sev = 'medium'; $rk = 2 }
+                if ($reg -ge 0.85 -and $g.Count -ge 30 -and $isPub) { $sev = 'high'; $rk = 3 }
+                $out += [pscustomobject]@{
+                    Severity = $sev; Rank = $rk; Process = $img; RemoteIp = $ip; Port = "$($ev[0].Port)"
+                    Events = $g.Count; SpanMin = [math]::Round($span, 0); MedianIntervalSec = [math]::Round($median, 0)
+                    Jitter = $jitter; Regularity = $reg; Flags = ($flags -join ';')
+                }
+            }
+            $out2 = @($out | Sort-Object Rank, Regularity -Descending)
+            Save-Rows -Name 'beacon_candidates' -Rows $out2
+            $bh = @($out2 | Where-Object { "$($_.Severity)" -eq 'high' }).Count
+            $bm = @($out2 | Where-Object { "$($_.Severity)" -eq 'medium' }).Count
+            if ($out2.Count -gt 0) {
+                Write-CaseLog "    beaconing: $($out2.Count) periodic pattern(s) ($bh high, $bm medium) -> csv\beacon_candidates.csv" $(if ($bh -gt 0) { 'Red' } else { 'Yellow' })
+                foreach ($b in ($out2 | Select-Object -First 5)) {
+                    Write-CaseLog ("      [{0}] {1} -> {2}:{3} every ~{4}s x{5} (reg {6}, jitter {7}) {8}" -f $b.Severity, (Split-Path $b.Process -Leaf), $b.RemoteIp, $b.Port, $b.MedianIntervalSec, $b.Events, $b.Regularity, $b.Jitter, $b.Flags) $(if ("$($b.Severity)" -eq 'high') { 'Red' } else { 'Yellow' })
+                }
+            } else {
+                Write-CaseLog "    beaconing: no periodic outbound patterns detected in $($parsed.Count) Sysmon network events" 'Gray'
+            }
+        } }
     [pscustomobject]@{ Id = '5.1'; Cat = 'ARTIFACTS'; Name = 'Prefetch files'; Default = $true; Quick = $false;
         Run = {
             $pf = Join-Path $env:SystemRoot 'Prefetch'
@@ -2187,7 +2267,7 @@ function Invoke-SelectedModules {
     $phaseOf = {
         param($m)
         if ($m.Cat -eq 'VOLATILE') { 'A' }
-        elseif ($m.Id -in @('7.1', '4.7')) { 'CI' }
+        elseif ($m.Id -in @('7.1', '4.7', '4.8')) { 'CI' }
         elseif ($m.Id -in @('4.6', '5.4', '8.4')) { 'C' }
         else { 'B' }
     }
@@ -2303,6 +2383,7 @@ function New-HtmlReport {
     $pubConns = @(Import-CaseCsv 'flash_public_connections.csv')
     $amcHits = @(Import-CaseCsv 'ioc_hits_amcache.csv')
     $yaraHits = @(Import-CaseCsv 'yara_hits.csv')
+    $beacons = @(Import-CaseCsv 'beacon_candidates.csv')
     $authSum = @(Import-CaseCsv 'security_auth_summary.csv')
     $authEv = @(Import-CaseCsv 'security_auth_events.csv')
     $runKeys = @(Import-CaseCsv 'autoruns_runkeys.csv')
@@ -2370,7 +2451,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
     $null = $sb.AppendLine("<h1>OPHIRA COMPROMISE ASSESSMENT REPORT</h1>")
     $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' }) &nbsp;|&nbsp; Elevated: $(if (Test-IsAdmin) { 'yes' } else { 'NO' })</div>")
-    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#network'>Network</a><a href='#recommendations'>Recommendations</a></div>")
+    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#recommendations'>Recommendations</a></div>")
 
     # ---------- verdict banner ----------
     $null = $sb.AppendLine("<a name='verdict'></a><h2>Verdict</h2>")
@@ -2505,6 +2586,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     foreach ($h in $iocHits) { if ("$($h.Indicator)") { $iocBlock.Add("ioc-$("$($h.Type)".ToLower())  $($h.Indicator)") } }
     foreach ($h in $amcHits) { if ("$($h.Indicator)") { $iocBlock.Add("sha1  $($h.Indicator)") } }
     foreach ($b in $brute) { if ("$($b.SourceIp)") { $iocBlock.Add("ip  $($b.SourceIp)") } }
+    foreach ($b in ($beacons | Where-Object { "$($_.Severity)" -match '^(?i)(high|medium)$' -and "$($_.RemoteIp)" })) { $iocBlock.Add("ip  $($b.RemoteIp)") }
     $yaraScanned = @(Import-CaseCsv 'yara_scanned.csv')
     foreach ($y in ($yaraScanned | Where-Object { "$($_.Hits)" -match '^\d+$' -and [int]$_.Hits -gt 0 -and "$($_.SHA256)" })) { $iocBlock.Add("sha256  $($y.SHA256)") }
     $iocUnique = @($iocBlock.ToArray() | Sort-Object -Unique)
@@ -2664,6 +2746,19 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
             }
         }
         $null = $sb.AppendLine("</table><div class='meta'>First $shown of $($execRows.Count) entries - full: csv\execution_timeline.csv</div>")
+    }
+
+    # ---------- C2 beaconing ----------
+    $null = $sb.AppendLine("<a name='beacons'></a><h2>C2 beaconing candidates (periodic outbound patterns)</h2>")
+    if ($beacons.Count -gt 0) {
+        $null = $sb.AppendLine("<table><tr><th>Severity</th><th>Process</th><th>Remote</th><th>Events</th><th>Span</th><th>Interval</th><th>Jitter</th><th>Regularity</th><th>Flags</th></tr>")
+        foreach ($b in ($beacons | Select-Object -First 30)) {
+            $sevCls = switch -Regex ("$($b.Severity)") { '^high$' { 'crit'; break } '^medium$' { 'med'; break } default { 'info' } }
+            $null = $sb.AppendLine("<tr><td class='$sevCls'><b>$(ConvertTo-HtmlEsc $b.Severity)</b></td><td class='path'>$(ConvertTo-HtmlEsc $b.Process)</td><td>$(New-VtLink $b.RemoteIp):$(ConvertTo-HtmlEsc $b.Port)</td><td>$($b.Events)</td><td>$($b.SpanMin)min</td><td>~$(ConvertTo-HtmlEsc $b.MedianIntervalSec)s</td><td>$(ConvertTo-HtmlEsc $b.Jitter)</td><td>$(ConvertTo-HtmlEsc $b.Regularity)</td><td>$(ConvertTo-HtmlEsc $b.Flags)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Regularity = share of inter-arrival times within 0.5x-1.5x of the median. Legitimate updaters/telemetry also beacon - weigh process path, signer and destination. Source: csv\beacon_candidates.csv</div>")
+    } else {
+        $null = $sb.AppendLine("<div class='meta'>No periodic outbound patterns detected (or no Sysmon network events available - beaconing analysis requires Sysmon event ID 3).</div>")
     }
 
     # ---------- network ----------
@@ -2885,6 +2980,7 @@ function Get-CompromiseVerdict {
     $def = Import-CaseCsv 'defender_threats'
     $gaps = Import-CaseCsv 'logging_gaps'
     $brute = Import-CaseCsv 'security_bruteforce_candidates'
+    $beacons = Import-CaseCsv 'beacon_candidates'
 
     $levelNames = @{ 4 = 'COMPROMISED'; 3 = 'LIKELY COMPROMISED'; 2 = 'SUSPICIOUS'; 1 = 'NO EVIDENCE OF COMPROMISE'; 0 = 'INCONCLUSIVE' }
 
@@ -2901,12 +2997,16 @@ function Get-CompromiseVerdict {
     $yaraHi = @($yara | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' }).Count
     $yaraMed = @($yara | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
     $gapTamper = @($gaps | Where-Object { "$($_.EventId)" -match '^(1102|104)$' -or "$($_.Meaning)" -match 'clear|stop' }).Count
+    $beaconHi = @($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' }).Count
+    $beaconMed = @($beacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
 
     Add-Signal 'IOC hit - historical execution (amcache SHA1)' 4 @($iocAmc).Count "near-certain true positive evidence"
     Add-Signal 'YARA hit - high/critical rule' 4 $yaraHi (($yara | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
+    Add-Signal 'C2 beaconing - highly regular callbacks' 3 $beaconHi (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp):$($_.Port) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'IOC hit - live system' 3 @($iocLive).Count (($iocLive | Select-Object -First 3 | ForEach-Object { $_.Indicator }) -join '; ')
     Add-Signal 'Sigma detection - critical' 3 $hayCrit (($hay | Where-Object { "$($_.Level)" -match 'crit' } | Select-Object -First 3 | ForEach-Object { $_.RuleTitle }) -join '; ')
     Add-Signal 'YARA hit - medium rule' 2 $yaraMed (($yara | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
+    Add-Signal 'C2 beaconing - periodic callbacks' 2 $beaconMed (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'Sigma detection - high' 2 $hayHigh "$hayHigh events from $hayHighRules distinct rules"
     Add-Signal 'Process anomaly verdict HIGH' 2 $procHigh (($proc | Where-Object { "$($_.Verdict)" -eq 'HIGH' } | Select-Object -First 3 | ForEach-Object { $_.Name }) -join '; ')
     Add-Signal 'Defender detection history' 2 @($def).Count "antivirus detected something during retention window"
@@ -2971,6 +3071,7 @@ function Get-CompromiseVerdict {
         IocLive = @($iocLive).Count; IocAmcache = @($iocAmc).Count; YaraHigh = $yaraHi; YaraMedium = $yaraMed
         SigmaCritical = $hayCrit; SigmaHigh = $hayHigh; ProcessHigh = $procHigh; ProcessMedium = $procMed
         DefenderDetections = @($def).Count; TamperEvents = $gapTamper; BruteForceSources = @($brute).Count
+        BeaconHigh = $beaconHi; BeaconMedium = $beaconMed
     }
 
     return [pscustomobject]@{
@@ -3310,6 +3411,17 @@ function Invoke-DeployWizard {
 
     $threads = if ($script:CfgThreads -gt 0) { $script:CfgThreads } else { $MaxThreads }
 
+    $advLogHours = -1
+    $advIn = (Read-Host "  Advanced options (Full depth, log window, parallelism)? [y/N]").Trim()
+    if ($advIn -match '^(?i)y') {
+        $dIn = (Read-Host "  Depth: 1=Quick  2=Standard  3=Full - heaviest, includes SRUM etc. [current: $preset]").Trim()
+        if ($dIn -match '^3' -or $dIn -match '^(?i)f(ull)?$') { $preset = 'Full' }
+        $lhIn = (Read-Host "  Log analysis window in hours (ENTER = 168 = 7 days, 0 = all available)").Trim()
+        if ($lhIn -match '^\d+$') { $advLogHours = [int]$lhIn }
+        $thIn = (Read-Host "  Hosts to process in parallel (ENTER = current setting)").Trim()
+        if ($thIn -match '^\d+$' -and [int]$thIn -gt 0) { $threads = [int]$thIn }
+    }
+
     $shown = ($targets | Select-Object -First 5) -join ', '
     if ($targets.Count -gt 5) { $shown += ", ...($($targets.Count) total)" }
     $credNote = if ($cred) { $cred.UserName } else { "$env:USERDOMAIN\$env:USERNAME (current)" }
@@ -3318,6 +3430,7 @@ function Invoke-DeployWizard {
     Write-Host "  Ready to deploy. Please confirm:" -ForegroundColor White
     Write-Host "    Targets   : $shown"
     Write-Host "    Depth     : $preset"
+    if ($advLogHours -ge 0) { Write-Host "    Log window: $(if ($advLogHours -eq 0) { 'all available' } else { "$advLogHours hours" })" }
     Write-Host "    Account   : $credNote"
     Write-Host "    hayabusa  : $(if ($push) { 'push + run + remove' } else { 'not pushed' })"
     Write-Host "    Results   : $(if ($shareIn) { "upload to $shareIn" } else { 'pull to collections\' })"
@@ -3327,7 +3440,7 @@ function Invoke-DeployWizard {
     $go = (Read-Host "  Start? [Y/n]").Trim()
     if ($go -match '^[Nn]') { Write-Host "  Deploy cancelled." -ForegroundColor Yellow; return }
 
-    Invoke-DeployMode -Targets $targets -DeployPreset $preset -Cred $cred -DeployCaseID $CaseID -DeploySharePath $shareIn -Threads $threads -PushBin $push
+    Invoke-DeployMode -Targets $targets -DeployPreset $preset -Cred $cred -DeployCaseID $CaseID -DeploySharePath $shareIn -Threads $threads -PushBin $push -DeployLogHours $advLogHours
 
     $rem = (Read-Host "  Remember these answers for next time? [y/N]").Trim()
     if ($rem -match '^(?i)y') {
@@ -3401,7 +3514,7 @@ if ($Mode -ne 'Collect') {
                 $ComputerName += @(Get-Content -LiteralPath $TargetsFile | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_ })
             }
             if (-not $ComputerName) { Write-Host "-ComputerName or -TargetsFile required for Deploy mode" -ForegroundColor Red; exit 1 }
-            Invoke-DeployMode -Targets $ComputerName -DeployPreset $Preset -Cred $Credential -DeployCaseID $CaseID -DeploySharePath $SharePath -Threads $MaxThreads -PushBin ([bool]$PushTools)
+            Invoke-DeployMode -Targets $ComputerName -DeployPreset $Preset -Cred $Credential -DeployCaseID $CaseID -DeploySharePath $SharePath -Threads $MaxThreads -PushBin ([bool]$PushTools) -DeployLogHours $LogHours
         }
         'UpdateRules' { Invoke-UpdateRulesMode }
     }
