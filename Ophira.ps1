@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.9  -  Windows Incident Response Triage Toolkit
+Ophira v2.10  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -32,7 +32,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.9"
+$ScriptVersion = "2.10"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -408,6 +408,10 @@ function Show-ToolLinks {
         [pscustomobject]@{ Tool = 'AmcacheParser (EZ)'; Url = 'https://github.com/EricZimmerman/AmcacheParser/releases'; Use = 'module 8.4 execution inventory + SHA1 x IOC' }
         [pscustomobject]@{ Tool = 'RBCmd (EZ)'; Url = 'https://github.com/EricZimmerman/RBCmd/releases'; Use = 'module 8.4 recycle bin parse' }
         [pscustomobject]@{ Tool = 'yara-x (binary scanning)'; Url = 'https://github.com/VirusTotal/yara-x/releases'; Use = 'module 4.7 YARA scan of flagged binaries; bundled pack in tools\yara\rules' }
+        [pscustomobject]@{ Tool = 'MFTECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 5.5 live $MFT + USN journal forensics' }
+        [pscustomobject]@{ Tool = 'PECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 5.1 prefetch parse (run counts)' }
+        [pscustomobject]@{ Tool = 'LECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.5 LNK parse (Recent docs)' }
+        [pscustomobject]@{ Tool = 'JLECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.5 Jump List parse' }
         [pscustomobject]@{ Tool = 'velociraptor (enterprise)'; Url = 'https://github.com/Velocidex/velociraptor/releases'; Use = 'if you move to always-on agent-based DFIR' }
     )
     $rows | Format-Table Tool, Url, Use -AutoSize | Out-String -Width 200 | Write-Host
@@ -426,6 +430,10 @@ function Invoke-SetupMode {
         [pscustomobject]@{ Name = 'chainsaw';    Repo = 'WithSecureOpenSource/chainsaw';     Pattern = '^chainsaw_all_platforms\+rules\.zip$'; Zip = $true }
         [pscustomobject]@{ Name = 'AmcacheParser'; Direct = 'https://download.ericzimmermanstools.com/AmcacheParser.zip'; Zip = $true }
         [pscustomobject]@{ Name = 'RBCmd';       Direct = 'https://download.ericzimmermanstools.com/RBCmd.zip'; Zip = $true }
+        [pscustomobject]@{ Name = 'MFTECmd';     Direct = 'https://download.ericzimmermanstools.com/MFTECmd.zip'; Zip = $true }
+        [pscustomobject]@{ Name = 'PECmd';       Direct = 'https://download.ericzimmermanstools.com/PECmd.zip'; Zip = $true }
+        [pscustomobject]@{ Name = 'LECmd';       Direct = 'https://download.ericzimmermanstools.com/LECmd.zip'; Zip = $true }
+        [pscustomobject]@{ Name = 'JLECmd';      Direct = 'https://download.ericzimmermanstools.com/JLECmd.zip'; Zip = $true }
         [pscustomobject]@{ Name = 'yara';        Repo = 'VirusTotal/yara-x';                 Pattern = '^yara-x-v[\d\.]+-x86_64-pc-windows-msvc\.zip$'; Zip = $true }
     )
     $installed = @()
@@ -466,6 +474,7 @@ function Invoke-SetupMode {
                 }
                 if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
                 Expand-Archive -LiteralPath $tmp -DestinationPath $dest -Force -ErrorAction Stop
+                Get-ChildItem -Path $dest -Recurse -File -ErrorAction SilentlyContinue | Unblock-File
                 if ($keepRules -and (Test-Path "$keepRules.bak")) { Move-Item -LiteralPath "$keepRules.bak" -Destination $keepRules -Force -ErrorAction SilentlyContinue }
                 Write-Host "  extracted -> tools\$($t.Name)\" -ForegroundColor Green
             } else {
@@ -1838,6 +1847,18 @@ $script:Modules = @(
             }
             Save-Rows -Name 'prefetch_index' -Rows ($files | Select-Object Name, Length, CreationTime, LastWriteTime)
             Write-CaseLog "    Copied $copied of $($files.Count) prefetch files" 'Gray'
+            $tDir = Get-ToolsDir
+            $peExe = $null
+            if ($tDir) { $peExe = Get-ChildItem -Path $tDir -Recurse -Filter 'PECmd*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1 }
+            if ($peExe -and $copied -gt 0) {
+                Write-CaseLog "    PECmd: parsing prefetch (run counts + times)..." 'Cyan'
+                $null = Invoke-NativeTool -ExePath $peExe.FullName -ToolArgs @('-d', $dest, '--csv', $CsvDir, '--csvf', 'prefetch_parsed.csv')
+                $pp = Join-Path $CsvDir 'prefetch_parsed.csv'
+                if (Test-Path -LiteralPath $pp) {
+                    $n = @(Get-Content -LiteralPath $pp | Select-Object -Skip 1).Count
+                    Write-CaseLog "    prefetch parsed: $n entries -> csv\prefetch_parsed.csv" 'Gray'
+                } else { Write-CaseLog "    PECmd produced no output" 'DarkYellow' }
+            }
         } }
     [pscustomobject]@{ Id = '5.2'; Cat = 'ARTIFACTS'; Name = 'Registry hives (SYSTEM/SOFTWARE/SAM/SECURITY/Amcache) + UserAssist'; Default = $true; Quick = $false;
         Run = {
@@ -1902,6 +1923,95 @@ $script:Modules = @(
                 if (-not (Test-Path $anDir)) { New-Item -ItemType Directory -Path $anDir -Force | Out-Null }
                 Write-CaseLog "    chainsaw: evtx gap detection (tamper check)..." 'Cyan'
                 $null = Invoke-NativeTool -ExePath $cs.FullName -ToolArgs @('analyse', 'gaps', $evtxDir, '-q', '-o', (Join-Path $anDir 'evtx_gaps.txt'))
+            }
+        } }
+    [pscustomobject]@{ Id = '5.5'; Cat = 'ARTIFACTS'; Name = 'NTFS forensics: MFT recent-file inventory + USN write bursts (needs tools\MFTECmd + admin)'; Default = $true; Quick = $false;
+        Run = {
+            $tDir = Get-ToolsDir
+            if (-not $tDir) { Write-CaseLog "    no tools\ - skipping" 'DarkGray'; return }
+            $mftExe = Get-ChildItem -Path $tDir -Recurse -Filter 'MFTECmd*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $mftExe) { Write-CaseLog "    MFTECmd not in tools\ - skipping (run Setup)" 'DarkGray'; return }
+            $tmp = Join-Path ([IO.Path]::GetTempPath()) ("ophira_ntfs_" + (Get-Date -Format 'HHmmss'))
+            New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+            try {
+                # ---- $MFT: keep only executable-ish files in user paths or created recently (full listing discarded - too big for the case ZIP) ----
+                Write-CaseLog "    MFTECmd: parsing live `$MFT..." 'Cyan'
+                $null = Invoke-NativeTool -ExePath $mftExe.FullName -ToolArgs @('-f', "$env:SystemDrive\`$MFT", '--csv', $tmp, '--csvf', 'mft_full.csv')
+                $mftFull = Join-Path $tmp 'mft_full.csv'
+                if (Test-Path -LiteralPath $mftFull) {
+                    $exeExt = @('.exe', '.dll', '.ps1', '.bat', '.cmd', '.vbs', '.js', '.jar', '.hta', '.scr', '.msi', '.py', '.wsf', '.lnk')
+                    $cutoff = (Get-Date).AddDays(-30)   # ponytail: fixed 30-day recency ($LogHours is not seeded into worker runspaces)
+                    $hdr = @((Get-Content -LiteralPath $mftFull -First 1) -split ',' | ForEach-Object { $_.Trim(' "') })
+                    $colOf = {
+                        param([string]$pattern)
+                        @($hdr | Where-Object { $_ -match $pattern } | Select-Object -First 1)[0]
+                    }
+                    $cName = & $colOf '^FileName$'; $cParent = & $colOf 'ParentPath'; $cExt = & $colOf '^Extension$'
+                    $cCreated = & $colOf 'Created'; $cMod = & $colOf 'LastModified'; $cSize = & $colOf 'FileSize'; $cEntry = & $colOf 'EntryNumber'
+                    $keep = New-Object System.Collections.Generic.List[object]
+                    $total = 0
+                    Import-Csv -LiteralPath $mftFull | ForEach-Object {
+                        $total++
+                        $name = "$($_.$cName)"
+                        if (-not $name) { return }
+                        $ext = ("$($_.$cExt)").ToLower()
+                        if ($exeExt -notcontains $ext) { return }
+                        $parent = "$($_.$cParent)"
+                        $path = if ($parent) { "$parent\$name" } else { $name }
+                        $userPath = Test-IsUserWritablePath $path
+                        $created = $null; try { $created = [datetime]"$($_.$cCreated)" } catch { }
+                        $recent = ($created -and $created -ge $cutoff)
+                        if (-not ($userPath -or $recent)) { return }
+                        $flags = @('exec'); if ($userPath) { $flags += 'user-path' }; if ($recent) { $flags += 'recent' }
+                        $keep.Add([pscustomobject]@{ Entry = "$($_.$cEntry)"; Created = "$($_.$cCreated)"; LastModified = "$($_.$cMod)"; Size = "$($_.$cSize)"; Name = $name; Path = $path; Flags = ($flags -join ';') })
+                    }
+                    $out5 = $keep.ToArray()
+                    if ($out5.Count -gt 5000) { $out5 = $out5[0..4999] }
+                    Save-Rows -Name 'mft_recent' -Rows $out5
+                    Write-CaseLog "    MFT: $total entries scanned, $($keep.Count) executable/user-path/recent kept -> csv\mft_recent.csv" 'Gray'
+                    Remove-Item -LiteralPath $mftFull -Force -ErrorAction SilentlyContinue
+                } else { Write-CaseLog "    MFT parse produced no output (not elevated? non-NTFS volume?) - skipped" 'DarkYellow' }
+
+                # ---- USN journal: per-minute write bursts = ransomware-style mass modification ----
+                Write-CaseLog "    MFTECmd: reading live USN journal..." 'Cyan'
+                $null = Invoke-NativeTool -ExePath $mftExe.FullName -ToolArgs @('-f', "$env:SystemDrive\`$Extend\`$J", '--csv', $tmp, '--csvf', 'usn_full.csv')
+                $usnFull = Join-Path $tmp 'usn_full.csv'
+                $bursts = @()
+                if (Test-Path -LiteralPath $usnFull) {
+                    $uHdr = @((Get-Content -LiteralPath $usnFull -First 1) -split ',' | ForEach-Object { $_.Trim(' "') })
+                    $uCol = {
+                        param([string]$pattern)
+                        @($uHdr | Where-Object { $_ -match $pattern } | Select-Object -First 1)[0]
+                    }
+                    $tCol = & $uCol 'time'; $rCol = & $uCol 'reason'; $nCol = & $uCol 'sourcefile|^file'
+                    if ($tCol -and $rCol) {
+                        # ponytail: >=1000 write-reason events/min across >=100 distinct files = burst window (heuristic; big installs/updates can trigger too)
+                        $min = @{}
+                        Import-Csv -LiteralPath $usnFull | ForEach-Object {
+                            $reason = "$($_.$rCol)"
+                            if ($reason -notmatch 'DataExtend|Truncate|BasicInfoChange') { return }
+                            $t = $null; try { $t = [datetime]"$($_.$tCol)" } catch { }
+                            if (-not $t) { return }
+                            $k = $t.ToString('yyyy-MM-dd HH:mm')
+                            if (-not $min.ContainsKey($k)) { $min[$k] = @{ Events = 0; Files = @{} } }
+                            $min[$k].Events++
+                            if ($nCol) { $f = "$($_.$nCol)"; if ($f -and -not $min[$k].Files.ContainsKey($f)) { $min[$k].Files[$f] = $true } }
+                        }
+                        foreach ($k in @($min.Keys | Sort-Object)) {
+                            if ($min[$k].Events -ge 1000 -and $min[$k].Files.Count -ge 100) {
+                                $bursts += [pscustomobject]@{ WindowStart = $k; WriteEvents = $min[$k].Events; DistinctFiles = $min[$k].Files.Count }
+                            }
+                        }
+                    }
+                    Remove-Item -LiteralPath $usnFull -Force -ErrorAction SilentlyContinue
+                }
+                Save-Rows -Name 'usn_write_bursts' -Rows $bursts
+                if (@($bursts).Count -gt 0) {
+                    Write-CaseLog "    USN: $(@($bursts).Count) mass-modification window(s) >=1000 writes/min - POSSIBLE RANSOMWARE -> csv\usn_write_bursts.csv" 'Red'
+                    foreach ($b in @($bursts | Select-Object -First 5)) { Write-CaseLog "      $($b.WindowStart): $($b.WriteEvents) writes over $($b.DistinctFiles) files" 'Red' }
+                } else { Write-CaseLog "    USN journal analyzed - no mass-modification windows" 'Gray' }
+            } finally {
+                Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
             }
         } }
     [pscustomobject]@{ Id = '6.1'; Cat = 'DEFENDER'; Name = 'Defender detections, exclusions, status'; Default = $true; Quick = $true;
@@ -2154,6 +2264,48 @@ $script:Modules = @(
                 $null = Invoke-NativeTool -ExePath $rbExe.FullName -ToolArgs @('-d', $rbSrc, '-q', '--csv', $CsvDir, '--csvf', 'recyclebin.csv')
             }
         } }
+    [pscustomobject]@{ Id = '8.5'; Cat = 'CONTEXT'; Name = 'LNK + Jump Lists (raw save + parse via tools\LECmd/JLECmd)'; Default = $true; Quick = $false;
+        Run = {
+            $recent = Join-Path $env:APPDATA 'Microsoft\Windows\Recent'
+            $recDst = Join-Path $RawDir 'recent'
+            New-Item -ItemType Directory -Path $recDst -Force | Out-Null
+            $nLnk = 0
+            if (Test-Path -LiteralPath $recent) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $recent -Filter '*.lnk' -File -ErrorAction SilentlyContinue)) {
+                    try { Copy-Item -LiteralPath $f.FullName -Destination $recDst -Force -ErrorAction Stop; $nLnk++ } catch { }
+                }
+            }
+            $jlDst = Join-Path $RawDir 'jumplists'
+            New-Item -ItemType Directory -Path $jlDst -Force | Out-Null
+            $nJl = 0
+            foreach ($sub in @('AutomaticDestinations', 'CustomDestinations')) {
+                $d = Join-Path $recent $sub
+                $subDst = Join-Path $jlDst $sub
+                New-Item -ItemType Directory -Path $subDst -Force | Out-Null
+                if (Test-Path -LiteralPath $d) {
+                    foreach ($f in @(Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue)) {
+                        try { Copy-Item -LiteralPath $f.FullName -Destination $subDst -Force -ErrorAction Stop; $nJl++ } catch { }
+                    }
+                }
+            }
+            Write-CaseLog "    saved $nLnk recent LNK + $nJl jump list files to raw\" 'Gray'
+            $tDir = Get-ToolsDir
+            if (-not $tDir) { return }
+            $leExe = Get-ChildItem -Path $tDir -Recurse -Filter 'LECmd*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            $jlExe = Get-ChildItem -Path $tDir -Recurse -Filter 'JLECmd*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($leExe -and $nLnk -gt 0) {
+                Write-CaseLog "    LECmd: parsing recent LNK files..." 'Cyan'
+                $null = Invoke-NativeTool -ExePath $leExe.FullName -ToolArgs @('-d', $recDst, '--csv', $CsvDir, '--csvf', 'lnk_parsed.csv')
+                $lp = Join-Path $CsvDir 'lnk_parsed.csv'
+                if (Test-Path -LiteralPath $lp) { Write-CaseLog "    LNK parsed -> csv\lnk_parsed.csv" 'Gray' } else { Write-CaseLog "    LECmd produced no output" 'DarkYellow' }
+            }
+            if ($jlExe -and $nJl -gt 0) {
+                Write-CaseLog "    JLECmd: parsing jump lists..." 'Cyan'
+                $null = Invoke-NativeTool -ExePath $jlExe.FullName -ToolArgs @('-d', $jlDst, '--csv', $CsvDir, '--csvf', 'jumplist_parsed.csv')
+                $jlCsv = Get-ChildItem -Path $CsvDir -Filter 'jumplist_parsed*.csv' -ErrorAction SilentlyContinue
+                if ($jlCsv) { Write-CaseLog "    jump lists parsed -> $(@($jlCsv | ForEach-Object { $_.Name }) -join ', ')" 'Gray' } else { Write-CaseLog "    JLECmd produced no output" 'DarkYellow' }
+            }
+        } }
 )
 
 function Get-FilteredEvents {
@@ -2268,7 +2420,7 @@ function Invoke-SelectedModules {
         param($m)
         if ($m.Cat -eq 'VOLATILE') { 'A' }
         elseif ($m.Id -in @('7.1', '4.7', '4.8')) { 'CI' }
-        elseif ($m.Id -in @('4.6', '5.4', '8.4')) { 'C' }
+        elseif ($m.Id -in @('4.6', '5.4', '5.5', '8.4')) { 'C' }
         else { 'B' }
     }
     $runInline = {
@@ -2384,6 +2536,9 @@ function New-HtmlReport {
     $amcHits = @(Import-CaseCsv 'ioc_hits_amcache.csv')
     $yaraHits = @(Import-CaseCsv 'yara_hits.csv')
     $beacons = @(Import-CaseCsv 'beacon_candidates.csv')
+    $usnBursts = @(Import-CaseCsv 'usn_write_bursts.csv')
+    $mftRecent = @(Import-CaseCsv 'mft_recent.csv')
+    $pfParsed = @(Import-CaseCsv 'prefetch_parsed.csv')
     $authSum = @(Import-CaseCsv 'security_auth_summary.csv')
     $authEv = @(Import-CaseCsv 'security_auth_events.csv')
     $runKeys = @(Import-CaseCsv 'autoruns_runkeys.csv')
@@ -2451,7 +2606,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
     $null = $sb.AppendLine("<h1>OPHIRA COMPROMISE ASSESSMENT REPORT</h1>")
     $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' }) &nbsp;|&nbsp; Elevated: $(if (Test-IsAdmin) { 'yes' } else { 'NO' })</div>")
-    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#recommendations'>Recommendations</a></div>")
+    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#recommendations'>Recommendations</a></div>")
 
     # ---------- verdict banner ----------
     $null = $sb.AppendLine("<a name='verdict'></a><h2>Verdict</h2>")
@@ -2748,6 +2903,45 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         $null = $sb.AppendLine("</table><div class='meta'>First $shown of $($execRows.Count) entries - full: csv\execution_timeline.csv</div>")
     }
 
+    # ---------- file system forensics ----------
+    $null = $sb.AppendLine("<a name='filesystem'></a><h2>File-system evidence (MFT / USN journal / prefetch)</h2>")
+    if ($usnBursts.Count -gt 0) {
+        $null = $sb.AppendLine("<div class='sig'><b>Ransomware-style mass file modification detected</b> - $($usnBursts.Count) window(s) with 1000+ write events per minute:</div>")
+        $null = $sb.AppendLine("<table><tr><th>Window start</th><th>Write events</th><th>Distinct files</th></tr>")
+        foreach ($u in ($usnBursts | Select-Object -First 15)) {
+            $null = $sb.AppendLine("<tr><td class='crit'><b>$(ConvertTo-HtmlEsc $u.WindowStart)</b></td><td>$($u.WriteEvents)</td><td>$($u.DistinctFiles)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Legitimate mass changes (system updates, builds, AV signature storms) also trigger this. Cross-check the window against process/Sigma findings. Source: csv\usn_write_bursts.csv</div>")
+    }
+    if ($pfParsed.Count -gt 0) {
+        $rcCol = @($pfParsed[0].PSObject.Properties.Name | Where-Object { $_ -match 'runcount|^run' } | Select-Object -First 1)[0]
+        $lrCol = @($pfParsed[0].PSObject.Properties.Name | Where-Object { $_ -match 'lastrun' } | Select-Object -First 1)[0]
+        $exCol = @($pfParsed[0].PSObject.Properties.Name | Where-Object { $_ -match 'executable|^name$' } | Select-Object -First 1)[0]
+        $null = $sb.AppendLine("<h3>Most-run programs (prefetch)</h3><table><tr><th>Executable</th><th>Run count</th><th>Last run</th></tr>")
+        $sorted = $pfParsed
+        if ($rcCol) { $sorted = @($pfParsed | Sort-Object @{e = { [int]"$($_.$rcCol)" } } -Descending) }
+        foreach ($p in ($sorted | Select-Object -First 25)) {
+            $null = $sb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $p.$exCol)</td><td>$(ConvertTo-HtmlEsc $p.$rcCol)</td><td>$(ConvertTo-HtmlEsc $p.$lrCol)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Prefetch run counts = program execution evidence (Win8+ cap 1024 files). Source: csv\prefetch_parsed.csv</div>")
+    }
+    if ($mftRecent.Count -gt 0) {
+        $null = $sb.AppendLine("<h3>Recently created / user-path executables (MFT)</h3><table><tr><th>Created</th><th>Path</th><th>Size</th><th>Flags</th></tr>")
+        $mftSorted = $mftRecent
+        try { $mftSorted = @($mftRecent | Sort-Object Created -Descending) } catch { }
+        $shownM = 0
+        foreach ($mr in $mftSorted) {
+            if ("$($mr.Flags)" -notmatch 'user-path') { continue }
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $mr.Created)</td><td class='path'>$(ConvertTo-HtmlEsc $mr.Path)</td><td>$(ConvertTo-HtmlEsc $mr.Size)</td><td>$(ConvertTo-HtmlEsc $mr.Flags)</td></tr>")
+            $shownM++
+            if ($shownM -ge 25) { break }
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>$($mftRecent.Count) executable/user-path/recent entries kept (user-path ones shown). Source: csv\mft_recent.csv</div>")
+    }
+    if ($usnBursts.Count -eq 0 -and $pfParsed.Count -eq 0 -and $mftRecent.Count -eq 0) {
+        $null = $sb.AppendLine("<div class='meta'>No NTFS forensics data (tools\MFTECmd missing, not elevated, or modules skipped).</div>")
+    }
+
     # ---------- C2 beaconing ----------
     $null = $sb.AppendLine("<a name='beacons'></a><h2>C2 beaconing candidates (periodic outbound patterns)</h2>")
     if ($beacons.Count -gt 0) {
@@ -2981,6 +3175,7 @@ function Get-CompromiseVerdict {
     $gaps = Import-CaseCsv 'logging_gaps'
     $brute = Import-CaseCsv 'security_bruteforce_candidates'
     $beacons = Import-CaseCsv 'beacon_candidates'
+    $usnBursts = Import-CaseCsv 'usn_write_bursts'
 
     $levelNames = @{ 4 = 'COMPROMISED'; 3 = 'LIKELY COMPROMISED'; 2 = 'SUSPICIOUS'; 1 = 'NO EVIDENCE OF COMPROMISE'; 0 = 'INCONCLUSIVE' }
 
@@ -2999,10 +3194,12 @@ function Get-CompromiseVerdict {
     $gapTamper = @($gaps | Where-Object { "$($_.EventId)" -match '^(1102|104)$' -or "$($_.Meaning)" -match 'clear|stop' }).Count
     $beaconHi = @($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' }).Count
     $beaconMed = @($beacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
+    $usnBurstN = @($usnBursts).Count
 
     Add-Signal 'IOC hit - historical execution (amcache SHA1)' 4 @($iocAmc).Count "near-certain true positive evidence"
     Add-Signal 'YARA hit - high/critical rule' 4 $yaraHi (($yara | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'C2 beaconing - highly regular callbacks' 3 $beaconHi (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp):$($_.Port) every ~$($_.MedianIntervalSec)s" }) -join '; ')
+    Add-Signal 'Ransomware-like mass file modification (USN journal)' 3 $usnBurstN (($usnBursts | Select-Object -First 3 | ForEach-Object { "$($_.WindowStart): $($_.WriteEvents) writes / $($_.DistinctFiles) files" }) -join '; ')
     Add-Signal 'IOC hit - live system' 3 @($iocLive).Count (($iocLive | Select-Object -First 3 | ForEach-Object { $_.Indicator }) -join '; ')
     Add-Signal 'Sigma detection - critical' 3 $hayCrit (($hay | Where-Object { "$($_.Level)" -match 'crit' } | Select-Object -First 3 | ForEach-Object { $_.RuleTitle }) -join '; ')
     Add-Signal 'YARA hit - medium rule' 2 $yaraMed (($yara | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
@@ -3028,6 +3225,8 @@ function Get-CompromiseVerdict {
     Add-Cov 'Sigma detection timeline' (Test-Path (Join-Path $CsvDir 'hayabusa_timeline.csv')) 10
     Add-Cov 'Historical execution (amcache)' (Test-Path (Join-Path $CsvDir 'amcache.csv')) 12
     Add-Cov 'Prefetch execution history' (Test-Path (Join-Path $CsvDir 'prefetch_index.csv')) 8
+    Add-Cov 'USN journal (file modification history)' (Test-Path (Join-Path $CsvDir 'usn_write_bursts.csv')) 10
+    Add-Cov 'MFT file timeline (filtered)' (Test-Path (Join-Path $CsvDir 'mft_recent.csv')) 8
     Add-Cov 'Defender status' (Test-Path (Join-Path $CsvDir 'defender_status.csv')) 5
     Add-Cov 'YARA binary scan' (Test-Path (Join-Path $CsvDir 'yara_scanned.csv')) 5
     Add-Cov 'Sysmon telemetry (bonus)' ([bool]$Sysmon) 5
@@ -3299,7 +3498,7 @@ function Invoke-SetupWizard {
     Write-Host ""
     Write-Host "=== Setup companion tools ===" -ForegroundColor Cyan
     Write-Host "Tools live in tools\ subfolders. Available:" -ForegroundColor Gray
-    Write-Host "  winpmem  hayabusa  volatility3  chainsaw  AmcacheParser  RBCmd  yara" -ForegroundColor White
+    Write-Host "  winpmem  hayabusa  volatility3  chainsaw  AmcacheParser  RBCmd  MFTECmd  PECmd  LECmd  JLECmd  yara" -ForegroundColor White
     Write-Host "ENTER = walk through all tools (confirm each download)," 
     Write-Host "or give a comma-separated list (e.g. hayabusa,winpmem)."
     $inp = (Read-Host "Tools [all]").Trim()

@@ -64,8 +64,8 @@ Wizard answers are remembered only when you answer **y** to "Remember these answ
    - PERSISTENCE — Run keys, startup folders, services, scheduled tasks, WMI subscriptions
    - NETWORK MAP — interfaces, reachable subnets, SMB, saved creds, Kerberos, proxy/WPAD, opt-in active probes
    - LOGS — Security (4625 brute-force candidates), PowerShell 4104, Sysmon (auto-detected), RDP, System 7045, raw evtx export, **detection pack** (hayabusa Sigma timeline with MITRE ATT&CK tags + HTML + logon summary), **YARA scan of flagged/user-path binaries** (bundled rule pack, drop your own `*.yar` into `tools\yara\rules\`), **C2 beaconing analysis** (periodicity/jitter/regularity on Sysmon network events → `beacon_candidates.csv`, feeds verdict + report)
-   - ARTIFACTS — Prefetch, registry hives (SYSTEM/SOFTWARE/SAM/SECURITY, Amcache.hve), UserAssist, SRUM, **chainsaw execution timeline + SRUM + evtx gap detection**
-   - CONTEXT — **attacker activity** (PowerShell console history, RDP client targets, recycle bin), **user registry saves** (NTUSER.DAT/UsrClass.dat all profiles), **coverage & context** (Sysmon config, task XML, BITS jobs, domain info), **EZ parsers** (AmcacheParser execution inventory with SHA1×IOC cross-check, RBCmd)
+   - ARTIFACTS — Prefetch (copied **+ parsed run counts via PECmd**), registry hives (SYSTEM/SOFTWARE/SAM/SECURITY, Amcache.hve), UserAssist, SRUM, **chainsaw execution timeline + SRUM + evtx gap detection**, **NTFS forensics** (live `$MFT` filtered executable inventory + **USN journal ransomware-burst detection** via MFTECmd)
+   - CONTEXT — **attacker activity** (PowerShell console history, RDP client targets, recycle bin), **LNK + Jump Lists** (raw save + parse via LECmd/JLECmd), **user registry saves** (NTUSER.DAT/UsrClass.dat all profiles), **coverage & context** (Sysmon config, task XML, BITS jobs, domain info), **EZ parsers** (AmcacheParser execution inventory with SHA1×IOC cross-check, RBCmd)
    - DEFENDER — detections, exclusions, status, operational log
    - MEMORY — optional RAM capture (winpmem), optional Volatility 3 quick pass
 3. **Packaging** — SHA256 manifest (per file + package + script self-hash + tool inventory), `case.json`, **compromise verdict** (`verdict.json`: 5-level verdict + coverage-weighted confidence + signals + caveats), `report.html`, **supertimeline.csv** (all events merged chronologically), **delta_new.csv** (new findings vs previous collection), **siem_export.ndjson** (Splunk/Elastic-ready records), **logging_gaps.csv** (log cleared/stopped + evtx gap tamper check), ZIP
@@ -75,8 +75,8 @@ Wizard answers are remembered only when you answer **y** to "Remember these answ
 Every collection ends with `Get-CompromiseVerdict` correlating all findings into one call:
 
 - **5 levels**: `COMPROMISED` → `LIKELY COMPROMISED` → `SUSPICIOUS` → `NO EVIDENCE OF COMPROMISE` → `INCONCLUSIVE`
-- **Signal floors** — amcache IOC hit or high/critical YARA hit forces COMPROMISED; live IOC hit forces ≥ LIKELY COMPROMISED; critical Sigma / HIGH process verdict / Defender history / log-tamper events force ≥ SUSPICIOUS; two independent strong signals escalate to LIKELY COMPROMISED
-- **Confidence %** = weighted coverage of evidence sources actually collected (volatile, persistence, evtx, Sigma, amcache, prefetch, YARA, Sysmon, RAM; −15 if not elevated)
+- **Signal floors** — amcache IOC hit or high/critical YARA hit forces COMPROMISED; live IOC hit, critical Sigma, **C2 beaconing (high)** or **USN ransomware-style mass file modification** force ≥ LIKELY COMPROMISED; critical Sigma / HIGH process verdict / Defender history / log-tamper events force ≥ SUSPICIOUS; two independent strong signals escalate to LIKELY COMPROMISED
+- **Confidence %** = weighted coverage of evidence sources actually collected (volatile, persistence, evtx, Sigma, amcache, prefetch, USN journal, MFT timeline, YARA, Sysmon, RAM; −15 if not elevated)
 - **Caveats** state what could *not* be ruled out (no Sysmon, short log window, no RAM capture...) — i.e., what would change the verdict
 - Surfaced in: console summary, `verdict.json`, `case.json`, and a plain-language RESULT line on the owner screen
 
@@ -91,7 +91,7 @@ Run Ophira again on the same box days later: it auto-finds the previous case, co
 - **Correlation score** — evidence stacks per binary: user-path (+1), unsigned (+2), binary deleted (+3), public connection (+2), persistence refs (+2 each), IOC hash hit (+4) → verdict
 - **Trusted publishers** — validly-signed binaries from known publishers (or your `tools\trusted.txt`) cap at LOW; IOC hits always override
 - **Amcache SHA1 × IOC** — historical execution matched against your IOC list = near-certain TP with a timestamp
-- **report.html** — **compromise assessment report v2** (v2.7): verdict banner with confidence bar + contributing signals + "what would change this verdict" caveats, evidence coverage table, **MITRE ATT&CK grid** (tactic chips + technique table from hayabusa tags, with cannot-rule-out telemetry notes), findings grouped by tactic, defanged copy-ready IOC list, YARA findings, logon/account analysis, persistence inventory, recommendations, VT deep links
+- **report.html** — **compromise assessment report v2** (v2.7): verdict banner with confidence bar + contributing signals + "what would change this verdict" caveats, evidence coverage table, **MITRE ATT&CK grid** (tactic chips + technique table from hayabusa tags, with cannot-rule-out telemetry notes), findings grouped by tactic, defanged copy-ready IOC list, YARA findings, logon/account analysis, persistence inventory, **file-system evidence section** (USN mass-modification windows, most-run prefetch, MFT user-path executables), **C2 beaconing candidates**, recommendations, VT deep links
 - **Raw evidence** — every flag is backed by raw CSV/evtx/hive so any verdict can be verified
 
 ## Analyze mode
@@ -112,6 +112,9 @@ Bundled in `tools\` in this repo (self-contained kit). Refresh via `-Mode Setup`
 | chainsaw | execution timeline, SRUM, evtx gaps (5.4) + offline Sigma | https://github.com/WithSecureOpenSource/chainsaw/releases |
 | AmcacheParser (EZ) | execution inventory + SHA1×IOC (8.4) | https://github.com/EricZimmerman/AmcacheParser/releases |
 | RBCmd (EZ) | recycle bin parse (8.4) | https://github.com/EricZimmerman/RBCmd/releases |
+| MFTECmd (EZ) | live $MFT + USN journal forensics (5.5) | https://download.ericzimmermanstools.com/MFTECmd.zip |
+| PECmd (EZ) | prefetch run counts (5.1) | https://download.ericzimmermanstools.com/PECmd.zip |
+| LECmd / JLECmd (EZ) | LNK + Jump List parse (8.5) | https://download.ericzimmermanstools.com/LECmd.zip |
 | yara-x | YARA scan of flagged binaries (4.7), MIT rule pack bundled | https://github.com/VirusTotal/yara-x/releases |
 
 Analyst-side quick wins on a collected case:
@@ -133,6 +136,11 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 ## Roadmap
 
 - [x] YARA scan of flagged binaries (module 4.7 + bundled `ophira-pack.yar`)
+- [x] C2 beaconing detection (module 4.8, v2.9)
+- [x] NTFS forensics: $MFT + USN ransomware bursts + prefetch/LNK parsing (v2.10)
+- [ ] Real-host pilot run (validate hayabusa timing + MFTECmd on live volume)
+- [ ] Persistence sweep expansion (IFEO, AppInit, COM hijacks, netsh helpers)
+- [ ] Report completeness: evidence index of all CSV artifacts
 - [ ] Role-based presets (WebServer / DC / Workstation)
 
 ## License
