@@ -19,7 +19,7 @@ function Check([string]$label, [bool]$ok) {
 function Write-CaseLog { param([string]$Message, [string]$Color = 'Gray') Write-Host "  log: $Message" -ForegroundColor DarkGray }
 
 # ---------- part 1: module 8.9 posture live ----------
-$m89 = [regex]::Match($src, "(?s)Id = '8\.9';.*?Run = \{(.*?)\r?\n        \} \}\r?\n\)")
+$m89 = [regex]::Match($src, "(?s)Id = '8\.9';.*?Run = \{(.*?)\r?\n        \} \}\r?\n    \[pscustomobject\]@\{ Id = '8\.10'")
 if (-not $m89.Success) { throw 'module 8.9 extract failed' }
 $saved = @{}
 function Save-Rows { param([string]$Name, $Rows) $script:saved[$Name] = $Rows }

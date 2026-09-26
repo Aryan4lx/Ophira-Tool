@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.14
+- **DNS beaconing** (module 4.8 + 4.3): Sysmon EID 22 DNS queries parsed → `sysmon_dns.csv`; same periodicity engine applied per process+domain → `dns_beacon_candidates.csv`; verdict signals (high=floor 3, medium=floor 2), report section, domains+resolved IPs in IOC block, SIEM kind `dns_beacon`
+- **`-Mode Tune`** (new mode + menu item 6): shows top-hit Sigma rules from the newest case, exclude (`exclude_rules.txt`) or demote (`level_tuning.txt`) — hayabusa-native formats that travel with Deploy `-PushTools`
+- **LOLDrivers hash check** (module 8.10): all drivers SHA256-hashed and cross-checked against keyless LOLDrivers datasets (`tools\loldrivers\`, bundled) → `loldrivers_hits.csv`; malicious driver = verdict signal floor 2; Setup catalog entry (raw GitHub download); report "Driver check" section; SIEM kind `loldriver`
+- **hayabusa 4.1 wins**: `extract-base64` over exported evtx → `ps_decoded_commands.csv` (decoded attacker PowerShell commands, report section); `logon-summary` now aggregates RDP sessions (4778/4779/1149/25); `sort-csv` dedupe applied to the supertimeline and the fleet Analyze timeline (overlapping/backup evtx no longer double-count)
+- Fixed: `Import-CaseCsv` was missing from the worker function whitelist — module 8.7's browser IOC cross-check silently did nothing in parallel (Phase B) runs
+- Fixed: driver `PathName` normalization handles both `\??\` and `\\??\` NT path prefixes
+
 ## v2.13
 - **Security posture audit** (module 8.9): LSA Protection, NTLM level, SMBv1, RDP+NLA, PowerShell script-block logging, UAC, Defender exclusions/real-time/service, BitLocker, WinRM TrustedHosts → `posture.csv`; BAD findings become hardening actions in the report recommendations
 - **ShellBags** (module 8.8): folder-browsing history via SBECmd → `shellbags.csv` (attacker folder traversal incl. deleted/USB locations)

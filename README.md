@@ -25,10 +25,11 @@
 # ANALYZE - merge any number of OPHIRA_*.zip into one fleet view (+ Sigma timeline):
 .\Ophira.ps1 -Mode Analyze -AnalyzePath .\collections
 
-# SETUP / LINKS / UPDATERULES:
-.\Ophira.ps1 -Mode Setup -SetupTools hayabusa,AmcacheParser,RBCmd
+# SETUP / LINKS / UPDATERULES / TUNE:
+.\Ophira.ps1 -Mode Setup -SetupTools hayabusa,AmcacheParser,RBCmd,loldrivers
 .\Ophira.ps1 -Mode Links
 .\Ophira.ps1 -Mode UpdateRules       # refresh hayabusa Sigma rules
+.\Ophira.ps1 -Mode Tune              # pick noisy Sigma rules -> exclude/demote (travels with -PushTools)
 ```
 
 **Owner handoff:** send the whole folder. They double-click `RUN-OPHIRA.bat`, accept UAC, wait 3-5 minutes. A folder window opens with the result file selected and its path is copied to the clipboard — they paste it into an email. If you pre-fill `ophira.config.txt` (SHARE=/CASE=/ANALYST=), results upload to your share automatically and there's literally nothing to send.
@@ -37,7 +38,7 @@
 
 Running `.\Ophira.ps1` bare (no flags) first asks **who is using the tool**:
 
-- `[1] Security / IR team` → **task menu**: collect this PC · push & run on remote PCs · analyze collected results · setup tools · update rules · tool links. Deploy and Analyze are guided wizards (targets, credentials, depth, share — plain questions with `[defaults]`, confirm summary, then the existing parallel engine runs). Deploy has an **advanced options** prompt (Full depth, log analysis window, host parallelism). After each task you return to the menu.
+- `[1] Security / IR team` → **task menu**: collect this PC · push & run on remote PCs · analyze collected results · setup tools · update rules · **tune Sigma rules** · tool links. Deploy and Analyze are guided wizards (targets, credentials, depth, share — plain questions with `[defaults]`, confirm summary, then the existing parallel engine runs). Deploy has an **advanced options** prompt (Full depth, log analysis window, host parallelism). After each task you return to the menu.
 - `[2] The security team asked me to run this` → the guided automatic owner flow (same as the .bat).
 
 Flags always win: `-SimpleUI`, `-NoMenu`, or any explicit `-Mode` skips the gate entirely, so automation and `RUN-OPHIRA.bat` behave exactly as before. Non-interactive sessions never see the gate.
@@ -63,9 +64,9 @@ Wizard answers are remembered only when you answer **y** to "Remember these answ
    - VOLATILE — processes, full hashing, connections, DNS+ARP, sessions, drivers
    - PERSISTENCE — Run keys, startup folders, services, scheduled tasks, WMI subscriptions, **ASEP deep sweep** (IFEO debuggers incl. sticky-keys, AppInit_DLLs, Winlogon Shell/Userinit/Notify, HKCU COM hijack suspects, netsh helpers, LSA packages, StartupApproved stamps → `asep_sweep.csv` with flags)
    - NETWORK MAP — interfaces, reachable subnets, SMB, saved creds, Kerberos, proxy/WPAD, opt-in active probes, **firewall profiles + `pfirewall.log` copy**
-   - LOGS — Security (4625 brute-force candidates), PowerShell 4104, Sysmon (auto-detected), RDP, System 7045, raw evtx export, **detection pack** (hayabusa Sigma timeline with MITRE ATT&CK tags + HTML + logon summary), **YARA scan of flagged/user-path binaries** (bundled rule pack, drop your own `*.yar` into `tools\yara\rules\`), **C2 beaconing analysis** (periodicity/jitter/regularity on Sysmon network events → `beacon_candidates.csv`, feeds verdict + report)
+   - LOGS — Security (4625 brute-force candidates), PowerShell 4104, Sysmon (auto-detected, **EID 3 network + EID 22 DNS**), RDP, System 7045, raw evtx export, **detection pack** (hayabusa Sigma timeline with MITRE ATT&CK tags + HTML + logon summary with RDP sessions + **base64/obfuscated PowerShell command recovery**), **YARA scan of flagged/user-path binaries** (bundled rule pack, drop your own `*.yar` into `tools\yara\rules\`), **C2 beaconing analysis** (periodicity/jitter/regularity on Sysmon network **and DNS** events → `beacon_candidates.csv` + `dns_beacon_candidates.csv`, feeds verdict + report)
    - ARTIFACTS — Prefetch (copied **+ parsed run counts via PECmd**), registry hives (SYSTEM/SOFTWARE/SAM/SECURITY, Amcache.hve), UserAssist, SRUM, **chainsaw execution timeline + SRUM + evtx gap detection**, **NTFS forensics** (live `$MFT` filtered executable inventory + **USN journal ransomware-burst detection** with suspicious-extension matching via MFTECmd, **all fixed NTFS drives**)
-   - CONTEXT — **attacker activity** (PowerShell console history, RDP client targets, recycle bin), **LNK + Jump Lists** (raw save + parse via LECmd/JLECmd), **ShellBags** (folder-browsing history via SBECmd), **browser artifacts** (Chrome/Edge raw save **+ SQLECmd parse**: history/downloads/searches + **IOC domain cross-check**), **certificate store inventory** (T1553: recent/self-signed root CAs flagged), **security posture audit** (LSA protection, SMBv1, RDP+NLA, PowerShell logging, UAC, Defender exclusions, BitLocker, WinRM → `posture.csv`), **user registry saves** (NTUSER.DAT/UsrClass.dat all profiles), **coverage & context** (Sysmon config, task XML, BITS jobs, domain info), **EZ parsers** (AmcacheParser execution inventory with SHA1×IOC cross-check, RBCmd)
+   - CONTEXT — **attacker activity** (PowerShell console history, RDP client targets, recycle bin), **LNK + Jump Lists** (raw save + parse via LECmd/JLECmd), **ShellBags** (folder-browsing history via SBECmd), **browser artifacts** (Chrome/Edge raw save **+ SQLECmd parse**: history/downloads/searches + **IOC domain cross-check**), **certificate store inventory** (T1553: recent/self-signed root CAs flagged), **security posture audit** (LSA protection, SMBv1, RDP+NLA, PowerShell logging, UAC, Defender exclusions, BitLocker, WinRM → `posture.csv`), **LOLDrivers hash check** (all drivers SHA256-hashed × malicious/vulnerable datasets → `loldrivers_hits.csv`, malicious = verdict signal), **user registry saves** (NTUSER.DAT/UsrClass.dat all profiles), **coverage & context** (Sysmon config, task XML, BITS jobs, domain info), **EZ parsers** (AmcacheParser execution inventory with SHA1×IOC cross-check, RBCmd)
    - DEFENDER — detections, exclusions, status, operational log
    - MEMORY — optional RAM capture (winpmem), optional Volatility 3 quick pass (pslist/cmdline/svcscan + **malfind** → verdict signal + netscan on hits)
 3. **Packaging** — SHA256 manifest (per file + package + script self-hash + tool inventory), `case.json`, **compromise verdict** (`verdict.json`: 5-level verdict + coverage-weighted confidence + signals + caveats), `report.html`, **supertimeline.csv** (all events merged chronologically), **delta_new.csv** (new findings vs previous collection), **siem_export.ndjson** (Splunk/Elastic-ready records incl. verdict/beacon/mass-modification), **attack_layer.json** (MITRE ATT&CK Navigator layer — load at navigator.mitre.org), **logging_gaps.csv** (log cleared/stopped + evtx gap tamper check), ZIP
@@ -90,13 +91,14 @@ Run Ophira again on the same box days later: it auto-finds the previous case, co
 
 - **Correlation score** — evidence stacks per binary: user-path (+1), unsigned (+2), binary deleted (+3), public connection (+2), persistence refs (+2 each), IOC hash hit (+4) → verdict
 - **Trusted publishers** — validly-signed binaries from known publishers (or your `tools\trusted.txt`) cap at LOW; IOC hits always override
+- **`-Mode Tune`** — the FP feedback loop: shows your top-hit Sigma rules with counts, pick offenders, exclude them entirely or demote to informational. Written into hayabusa's native `exclude_rules.txt` / `level_tuning.txt`, so the tuning travels with Deploy `-PushTools` to every host you push to
 - **Amcache SHA1 × IOC** — historical execution matched against your IOC list = near-certain TP with a timestamp
-- **report.html** — **compromise assessment report v2**: verdict banner with confidence bar + contributing signals + "what would change this verdict" caveats, evidence coverage table, **MITRE ATT&CK grid** (tactic chips + technique table from hayabusa tags, with cannot-rule-out telemetry notes), findings grouped by tactic, defanged copy-ready IOC list, YARA findings, logon/account analysis, persistence inventory, **file-system evidence section** (USN mass-modification windows + ransomware extensions, most-run prefetch, MFT user-path executables), **C2 beaconing candidates**, **host snapshot** (AV state + detections, stored credentials, outbound RDP, BITS, malfind, browser IOCs, **security posture audit**), recommendations incl. **hardening actions from BAD posture findings**, **evidence index** (every CSV with row counts + what to look for — the map into all collected artifacts), VT deep links
+- **report.html** — **compromise assessment report v2**: verdict banner with confidence bar + contributing signals + "what would change this verdict" caveats, evidence coverage table, **MITRE ATT&CK grid** (tactic chips + technique table from hayabusa tags, with cannot-rule-out telemetry notes), findings grouped by tactic, defanged copy-ready IOC list, YARA findings, logon/account analysis, **recovered attacker commands** (decoded base64/obfuscated PowerShell), persistence inventory, **file-system evidence section** (USN mass-modification windows + ransomware extensions, most-run prefetch, MFT user-path executables), **C2 beaconing candidates (connections + DNS)**, **driver check (LOLDrivers)**, **host snapshot** (AV state + detections, stored credentials, outbound RDP, BITS, malfind, browser IOCs, **security posture audit**), recommendations incl. **hardening actions from BAD posture findings**, **evidence index** (every CSV with row counts + what to look for — the map into all collected artifacts), VT deep links
 - **Raw evidence** — every flag is backed by raw CSV/evtx/hive so any verdict can be verified
 
 ## Analyze mode
 
-Merges N case zips → `fleet_report.csv` + **`fleet_report.html`** (**per-host verdicts inherited from each case's `verdict.json`**: verdict chips, worst-first host matrix, ATTENTION FIRST list, **fleet ATT&CK roll-up** with `attack_layer_fleet.json`) + **`fleet_hosts.csv`** (host/verdict/confidence for SIEM), high-priority findings, cross-host indicator + hash dedup, top fleet Sigma detections, **baselining proposals** + one merged hayabusa timeline. Accepts legacy `IRCASE_*` packages too (shown as "no verdict").
+Merges N case zips → `fleet_report.csv` + **`fleet_report.html`** (**per-host verdicts inherited from each case's `verdict.json`**: verdict chips, worst-first host matrix, ATTENTION FIRST list, **fleet ATT&CK roll-up** with `attack_layer_fleet.json`) + **`fleet_hosts.csv`** (host/verdict/confidence for SIEM), high-priority findings, cross-host indicator + hash dedup, top fleet Sigma detections, **baselining proposals** + one merged hayabusa timeline (**deduped via `sort-csv`** - overlapping/backup evtx no longer double-count). Accepts legacy `IRCASE_*` packages too (shown as "no verdict").
 
 **Fleet baselining:** publishers present on ≥60% of hosts with zero HIGH verdicts are written to `proposed_trusted.txt` — review once, merge into `tools\trusted.txt`, and your false-positive rate drops with every host you scan.
 
@@ -117,6 +119,7 @@ Bundled in `tools\` in this repo (self-contained kit). Refresh via `-Mode Setup`
 | LECmd / JLECmd (EZ) | LNK + Jump List parse (8.5) | https://download.ericzimmermanstools.com/LECmd.zip |
 | SBECmd (EZ) | ShellBags folder-browsing history (8.8) | https://download.ericzimmermanstools.com/SBECmd.zip |
 | SQLECmd (EZ, .NET 9) | browser History/Downloads SQLite parse (8.7) | https://download.ericzimmermanstools.com/net9/SQLECmd.zip |
+| LOLDrivers datasets | malicious/vulnerable driver hash xref (8.10) | https://github.com/magicsword-io/LOLDrivers |
 | yara-x | YARA scan of flagged binaries (4.7), MIT rule pack bundled | https://github.com/VirusTotal/yara-x/releases |
 
 Analyst-side quick wins on a collected case:
@@ -143,6 +146,7 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 - [x] Persistence sweep + quick wins: ASEP, cert store, firewall log, browser copy (v2.11)
 - [x] Report completeness: evidence index + snapshots; ATT&CK Navigator layers; SIEM verdict/beacon/USN records (v2.12)
 - [x] Research-driven Phase F: posture audit w/ hardening recs, ShellBags, browser parse + IOC xref, ransomware extensions, multi-drive NTFS, malfind quick-pass (v2.13)
+- [x] Detection depth: DNS beaconing (EID 22), `-Mode Tune` Sigma FP feedback, LOLDrivers hash xref, hayabusa 4.1 wins (extract-base64 command recovery, RDP logon summary, sort-csv dedupe) (v2.14)
 - [ ] Real-host pilot run (validate hayabusa timing + MFTECmd on live volume)
 - [ ] Role-based presets (WebServer / DC / Workstation)
 

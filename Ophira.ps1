@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.13  -  Windows Incident Response Triage Toolkit
+Ophira v2.14  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -7,7 +7,7 @@ by a responder during early triage / threat hunting.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links', 'UpdateRules')]
+    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links', 'UpdateRules', 'Tune')]
     [string]$Mode = 'Collect',
     [string]$CaseID = "",
     [string]$Analyst = "",
@@ -32,7 +32,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.13"
+$ScriptVersion = "2.14"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -357,6 +357,12 @@ function Get-ToolsDir {
     return $null
 }
 
+function Get-HayabusaExe {
+    $tDir = Get-ToolsDir
+    if (-not $tDir) { return $null }
+    return Get-ChildItem -Path $tDir -Recurse -Filter 'hayabusa*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch 'live-response' } | Select-Object -First 1
+}
+
 function Get-LogStart {
     if ($script:LogHours -gt 0) { return (Get-Date).AddHours(-1 * $script:LogHours) }
     return $null
@@ -414,6 +420,7 @@ function Show-ToolLinks {
         [pscustomobject]@{ Tool = 'JLECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.5 Jump List parse' }
         [pscustomobject]@{ Tool = 'SBECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.8 ShellBags (folder browsing history)' }
         [pscustomobject]@{ Tool = 'SQLECmd (EZ, .NET 9)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.7 browser SQLite parse (History/Downloads)' }
+        [pscustomobject]@{ Tool = 'LOLDrivers datasets'; Url = 'https://github.com/magicsword-io/LOLDrivers'; Use = 'module 8.10 malicious/vulnerable driver hash lists into tools\loldrivers' }
         [pscustomobject]@{ Tool = 'velociraptor (enterprise)'; Url = 'https://github.com/Velocidex/velociraptor/releases'; Use = 'if you move to always-on agent-based DFIR' }
     )
     $rows | Format-Table Tool, Url, Use -AutoSize | Out-String -Width 200 | Write-Host
@@ -438,6 +445,7 @@ function Invoke-SetupMode {
         [pscustomobject]@{ Name = 'JLECmd';      Direct = 'https://download.ericzimmermanstools.com/JLECmd.zip'; Zip = $true }
         [pscustomobject]@{ Name = 'SBECmd';      Direct = 'https://download.ericzimmermanstools.com/SBECmd.zip'; Zip = $true }
         [pscustomobject]@{ Name = 'SQLECmd';     Direct = 'https://download.ericzimmermanstools.com/net9/SQLECmd.zip'; Zip = $true }
+        [pscustomobject]@{ Name = 'loldrivers';  Raw = @('https://raw.githubusercontent.com/magicsword-io/LOLDrivers/main/detections/hashes/samples_malicious.sha256', 'https://raw.githubusercontent.com/magicsword-io/LOLDrivers/main/detections/hashes/samples_vulnerable.sha256'); Zip = $false }
         [pscustomobject]@{ Name = 'yara';        Repo = 'VirusTotal/yara-x';                 Pattern = '^yara-x-v[\d\.]+-x86_64-pc-windows-msvc\.zip$'; Zip = $true }
     )
     $installed = @()
@@ -446,6 +454,19 @@ function Invoke-SetupMode {
         Write-Host ""
         Write-Host "=== $($t.Name) ===" -ForegroundColor Cyan
         try {
+            if ($t.PSObject.Properties['Raw'] -and $t.Raw) {
+                $confirm = Read-Host "  download to tools\$($t.Name)\? [Y/n]"
+                if ($confirm -match '^[Nn]') { continue }
+                $dest = Join-Path $toolsDir $t.Name
+                New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                foreach ($u in @($t.Raw)) {
+                    $fn = ($u -split '/')[-1]
+                    Invoke-WebRequest -Uri $u -OutFile (Join-Path $dest $fn) -UseBasicParsing -ErrorAction Stop
+                }
+                Write-Host "  saved -> tools\$($t.Name)\" -ForegroundColor Green
+                $installed += $t.Name
+                continue
+            }
             $assetUrl = $null
             $assetName = $null
             if ($t.PSObject.Properties['Direct' ] -and $t.Direct) {
@@ -737,6 +758,8 @@ function Invoke-AnalyzeMode {
                 'defender_threats.csv'               = 'AVDetection'
                 'system_new_services.csv'            = 'NewService'
                 'process_hashes.csv'                 = 'FileHash'
+                'loldrivers_hits.csv'                = 'LolDriver'
+                'dns_beacon_candidates.csv'          = 'DnsBeacon'
             }
             foreach ($k in $map.Keys) {
                 $f = Join-Path $csvDir $k
@@ -840,8 +863,9 @@ function Invoke-AnalyzeMode {
         Write-Host "    hayabusa fleet timeline running..." -ForegroundColor Cyan
         $null = Invoke-NativeTool -ExePath $HayabusaExe -ToolArgs @('dfir-timeline', '-p', 'verbose', '-d', $merged, '-o', $hayOut, '-H', $hayHtml, '-q', '-w', '-U', '-C', '-K', '-m', 'low', '-E') -WorkingDirectory (Split-Path $HayabusaExe -Parent) -QuietLog
         if (Test-Path $hayOut) {
+            $null = Invoke-NativeTool -ExePath $HayabusaExe -ToolArgs @('sort-csv', '-f', $hayOut, '-o', $hayOut, '-C', '-q', '-K') -WorkingDirectory (Split-Path $HayabusaExe -Parent) -QuietLog
             $n = @(Get-Content $hayOut | Select-Object -Skip 1).Count
-            Write-Host "    hayabusa: $n detections -> $hayOut" -ForegroundColor Yellow
+            Write-Host "    hayabusa: $n detections (deduped) -> $hayOut" -ForegroundColor Yellow
         }
         Remove-Item $merged -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -1262,7 +1286,8 @@ $script:SharedFunctions = @(
     'Get-KitRoot', 'Get-ToolsDir', 'Get-LogStart', 'Get-IocList', 'Test-TrustedPublisher',
     'Save-Rows', 'Out-RawText', 'Invoke-ExeCapture', 'Invoke-NativeTool', 'Get-WmiOrCim', 'Convert-WmiDate',
     'Test-IsPublicIp', 'Test-IsUserWritablePath', 'Get-SignatureInfo', 'Get-SysmonState',
-    'Get-UserProfileList', 'Get-UserAssistRows', 'ConvertTo-Rot13', 'Get-FilteredEvents', 'Export-Evtx'
+    'Get-UserProfileList', 'Get-UserAssistRows', 'ConvertTo-Rot13', 'Get-FilteredEvents', 'Export-Evtx',
+    'Import-CaseCsv'
 )
 
 $script:ModuleWorkerText = @'
@@ -1830,6 +1855,22 @@ $script:Modules = @(
                 }
             } catch { }
             Save-Rows -Name 'sysmon_network' -Rows $net
+            $dns = @()
+            try {
+                $filter = @{ LogName = 'Microsoft-Windows-Sysmon/Operational'; Id = 22 }
+                if ($start) { $filter.StartTime = $start }
+                $rawD = Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue
+                foreach ($e in $rawD) {
+                    $x = [xml]$e.ToXml()
+                    $d = @{}
+                    $x.Event.EventData.Data | ForEach-Object { $d[$_.Name] = $_.'#text' }
+                    $dns += [pscustomobject]@{
+                        Time = $e.TimeCreated; Image = $d['Image']; QueryName = $d['QueryName']
+                        QueryResults = $d['QueryResults']; ProcessId = $d['ProcessId']
+                    }
+                }
+            } catch { }
+            Save-Rows -Name 'sysmon_dns' -Rows $dns
             Export-Evtx -LogName 'Microsoft-Windows-Sysmon/Operational' -FileName 'Sysmon_Operational.evtx'
         } }
     [pscustomobject]@{ Id = '4.4'; Cat = 'LOGS'; Name = 'RDP logs (LocalSessionManager + ConnectionManager)'; Default = $true; Quick = $false;
@@ -1877,6 +1918,13 @@ $script:Modules = @(
             Write-CaseLog "    hayabusa logon-summary..." 'Cyan'
             $lsPrefix = Join-Path $CsvDir 'logon_summary'
             $null = Invoke-NativeTool -ExePath $h.FullName -ToolArgs @('logon-summary', '-d', "$evtxDir", '-o', "$lsPrefix", '-q', '-C', '-K') -WorkingDirectory $h.DirectoryName
+            $ps64 = Join-Path $CsvDir 'ps_decoded_commands.csv'
+            $null = Invoke-NativeTool -ExePath $h.FullName -ToolArgs @('extract-base64', '-d', "$evtxDir", '-o', "$ps64", '-q', '-C', '-K', '-U') -WorkingDirectory $h.DirectoryName
+            if (Test-Path $ps64) {
+                $n64 = @(Get-Content -LiteralPath $ps64 | Select-Object -Skip 1).Count
+                if ($n64 -gt 0) { Write-CaseLog "    extract-base64: $n64 encoded/obfuscated command(s) recovered -> csv\ps_decoded_commands.csv" 'Yellow' }
+                else { Remove-Item -LiteralPath $ps64 -Force -ErrorAction SilentlyContinue }
+            }
         } }
     [pscustomobject]@{ Id = '4.7'; Cat = 'LOGS'; Name = 'YARA scan of flagged/user-path binaries (needs tools\yara)'; Default = $true; Quick = $false;
         Run = {
@@ -1962,22 +2010,37 @@ $script:Modules = @(
     [pscustomobject]@{ Id = '4.8'; Cat = 'LOGS'; Name = 'C2 beaconing analysis (needs Sysmon network events)'; Default = $true; Quick = $false;
         Run = {
             $f = Join-Path $CsvDir 'sysmon_network.csv'
-            if (-not (Test-Path -LiteralPath $f)) { Write-CaseLog "    no sysmon_network.csv (no Sysmon / module 3.4 skipped) - beaconing not analyzable" 'DarkGray'; return }
-            try { $rows = @(Import-Csv -LiteralPath $f -ErrorAction Stop) } catch { Write-CaseLog "    cannot read sysmon_network.csv" 'DarkYellow'; return }
-            if ($rows.Count -lt 15) { Write-CaseLog "    too few Sysmon network events ($($rows.Count)) for beaconing analysis" 'Gray'; Save-Rows -Name 'beacon_candidates' -Rows @(); return }
-            $parsed = @()
-            foreach ($r in $rows) {
-                $t = $null
-                try { $t = [datetime]"$($r.Time)" } catch { }
-                if ($t) { $parsed += [pscustomobject]@{ T = $t; Image = "$($r.Image)"; Ip = "$($r.DestIp)"; Port = "$($r.DestPort)" } }
-            }
+            $fd = Join-Path $CsvDir 'sysmon_dns.csv'
+            if (-not (Test-Path -LiteralPath $f) -and -not (Test-Path -LiteralPath $fd)) { Write-CaseLog "    no sysmon_network.csv / sysmon_dns.csv (no Sysmon / module 4.3 skipped) - beaconing not analyzable" 'DarkGray'; return }
+            $all = @()
+            try {
+                foreach ($r in @(Import-Csv -LiteralPath $f -ErrorAction Stop)) {
+                    $t = $null
+                    try { $t = [datetime]"$($r.Time)" } catch { }
+                    if ($t) { $all += [pscustomobject]@{ T = $t; Kind = 'net'; Key = "net|$($r.Image)|$($r.DestIp)|$($r.DestPort)"; Image = "$($r.Image)"; Ip = "$($r.DestIp)"; Port = "$($r.DestPort)"; Domain = '' } }
+                }
+            } catch { }
+            try {
+                foreach ($r in @(Import-Csv -LiteralPath $fd -ErrorAction Stop)) {
+                    $t = $null
+                    try { $t = [datetime]"$($r.Time)" } catch { }
+                    if ($t) {
+                        $dom = ("$($r.QueryName)" -replace '\.$', '').ToLower()
+                        $rip = ''
+                        foreach ($m in [regex]::Matches("$($r.QueryResults)", '\b\d{1,3}(\.\d{1,3}){3}\b')) { if (Test-IsPublicIp $m.Value) { $rip = $m.Value; break } }
+                        $all += [pscustomobject]@{ T = $t; Kind = 'dns'; Key = "dns|$($r.Image)|$dom"; Image = "$($r.Image)"; Ip = $rip; Port = ''; Domain = $dom }
+                    }
+                }
+            } catch { }
+            if ($all.Count -lt 15) { Write-CaseLog "    too few Sysmon network/DNS events ($($all.Count)) for beaconing analysis" 'Gray'; Save-Rows -Name 'beacon_candidates' -Rows @(); Save-Rows -Name 'dns_beacon_candidates' -Rows @(); return }
             $flagged = @{}
             $fps = Join-Path $CsvDir 'flash_process_scored.csv'
             if (Test-Path -LiteralPath $fps) {
                 try { foreach ($fr in @(Import-Csv -LiteralPath $fps)) { if ("$($fr.Verdict)" -match '^(HIGH|MEDIUM)$' -and "$($fr.Path)") { $flagged["$($fr.Path)".ToLower()] = $true } } } catch { }
             }
             $out = @()
-            foreach ($g in ($parsed | Group-Object Image, Ip, Port)) {
+            $outDns = @()
+            foreach ($g in ($all | Group-Object Key)) {
                 if ($g.Count -lt 15) { continue }
                 $ev = @($g.Group | Sort-Object T)
                 $span = ($ev[-1].T - $ev[0].T).TotalMinutes
@@ -2005,23 +2068,38 @@ $script:Modules = @(
                 $sev = 'low'; $rk = 1
                 if ($reg -ge 0.7 -and ($isPub -or ($flags -contains 'user-path'))) { $sev = 'medium'; $rk = 2 }
                 if ($reg -ge 0.85 -and $g.Count -ge 30 -and $isPub) { $sev = 'high'; $rk = 3 }
-                $out += [pscustomobject]@{
-                    Severity = $sev; Rank = $rk; Process = $img; RemoteIp = $ip; Port = "$($ev[0].Port)"
-                    Events = $g.Count; SpanMin = [math]::Round($span, 0); MedianIntervalSec = [math]::Round($median, 0)
-                    Jitter = $jitter; Regularity = $reg; Flags = ($flags -join ';')
+                if ($ev[0].Kind -eq 'dns') {
+                    $outDns += [pscustomobject]@{
+                        Severity = $sev; Rank = $rk; Process = $img; Domain = $ev[0].Domain; ResolvedIp = $ip
+                        Events = $g.Count; SpanMin = [math]::Round($span, 0); MedianIntervalSec = [math]::Round($median, 0)
+                        Jitter = $jitter; Regularity = $reg; Flags = ($flags -join ';')
+                    }
+                } else {
+                    $out += [pscustomobject]@{
+                        Severity = $sev; Rank = $rk; Process = $img; RemoteIp = $ip; Port = "$($ev[0].Port)"
+                        Events = $g.Count; SpanMin = [math]::Round($span, 0); MedianIntervalSec = [math]::Round($median, 0)
+                        Jitter = $jitter; Regularity = $reg; Flags = ($flags -join ';')
+                    }
                 }
             }
             $out2 = @($out | Sort-Object Rank, Regularity -Descending)
             Save-Rows -Name 'beacon_candidates' -Rows $out2
+            $outD2 = @($outDns | Sort-Object Rank, Regularity -Descending)
+            Save-Rows -Name 'dns_beacon_candidates' -Rows $outD2
             $bh = @($out2 | Where-Object { "$($_.Severity)" -eq 'high' }).Count
             $bm = @($out2 | Where-Object { "$($_.Severity)" -eq 'medium' }).Count
-            if ($out2.Count -gt 0) {
-                Write-CaseLog "    beaconing: $($out2.Count) periodic pattern(s) ($bh high, $bm medium) -> csv\beacon_candidates.csv" $(if ($bh -gt 0) { 'Red' } else { 'Yellow' })
-                foreach ($b in ($out2 | Select-Object -First 5)) {
+            $dh = @($outD2 | Where-Object { "$($_.Severity)" -eq 'high' }).Count
+            $dm = @($outD2 | Where-Object { "$($_.Severity)" -eq 'medium' }).Count
+            if ($out2.Count -gt 0 -or $outD2.Count -gt 0) {
+                Write-CaseLog "    beaconing: $($out2.Count) connection pattern(s) ($bh high, $bm medium), $($outD2.Count) DNS pattern(s) ($dh high, $dm medium)" $(if ($bh + $dh -gt 0) { 'Red' } else { 'Yellow' })
+                foreach ($b in ($out2 | Select-Object -First 4)) {
                     Write-CaseLog ("      [{0}] {1} -> {2}:{3} every ~{4}s x{5} (reg {6}, jitter {7}) {8}" -f $b.Severity, (Split-Path $b.Process -Leaf), $b.RemoteIp, $b.Port, $b.MedianIntervalSec, $b.Events, $b.Regularity, $b.Jitter, $b.Flags) $(if ("$($b.Severity)" -eq 'high') { 'Red' } else { 'Yellow' })
                 }
+                foreach ($b in ($outD2 | Select-Object -First 4)) {
+                    Write-CaseLog ("      [{0}] {1} -> DNS {2} every ~{3}s x{4} (reg {5}) {6}" -f $b.Severity, (Split-Path $b.Process -Leaf), $b.Domain, $b.MedianIntervalSec, $b.Events, $b.Regularity, $b.Flags) $(if ("$($b.Severity)" -eq 'high') { 'Red' } else { 'Yellow' })
+                }
             } else {
-                Write-CaseLog "    beaconing: no periodic outbound patterns detected in $($parsed.Count) Sysmon network events" 'Gray'
+                Write-CaseLog "    beaconing: no periodic outbound patterns detected in Sysmon network/DNS events" 'Gray'
             }
         } }
     [pscustomobject]@{ Id = '5.1'; Cat = 'ARTIFACTS'; Name = 'Prefetch files'; Default = $true; Quick = $false;
@@ -2730,6 +2808,41 @@ $script:Modules = @(
             if ($bad -gt 0) { Write-CaseLog "    posture: $($rows.Count) checks - $bad BAD, $warn WARN -> csv\posture.csv (see report hardening recommendations)" 'Yellow' }
             else { Write-CaseLog "    posture: $($rows.Count) checks - no critical findings, $warn warn -> csv\posture.csv" 'Gray' }
         } }
+    [pscustomobject]@{ Id = '8.10'; Cat = 'CONTEXT'; Name = 'LOLDrivers hash check - malicious/vulnerable driver xref (needs tools\loldrivers)'; Default = $true; Quick = $false;
+        Run = {
+            $lolDir = Join-Path (Get-ToolsDir) 'loldrivers'
+            $malFile = Join-Path $lolDir 'samples_malicious.sha256'
+            $vulFile = Join-Path $lolDir 'samples_vulnerable.sha256'
+            if (-not (Test-Path $malFile) -and -not (Test-Path $vulFile)) { Write-CaseLog "    tools\loldrivers datasets missing - skipping (run: -Mode Setup)" 'DarkGray'; return }
+            $malSet = @{}
+            if (Test-Path $malFile) { foreach ($h in (Get-Content $malFile -ErrorAction SilentlyContinue)) { $hl = "$h".Trim().ToLower(); if ($hl) { $malSet[$hl] = $true } } }
+            $vulSet = @{}
+            if (Test-Path $vulFile) { foreach ($h in (Get-Content $vulFile -ErrorAction SilentlyContinue)) { $hl = "$h".Trim().ToLower(); if ($hl) { $vulSet[$hl] = $true } } }
+            $drvRows = @(Import-CaseCsv 'drivers')
+            if ($drvRows.Count -eq 0) { Write-CaseLog "    no drivers.csv (module 1.6 skipped) - nothing to check" 'DarkGray'; return }
+            $hits = @()
+            $checked = 0
+            foreach ($dr in $drvRows) {
+                if ($checked -ge 600) { break }
+                $p = "$($dr.PathName)" -replace '^\\{1,2}\?\?\\', ''
+                if (-not $p -or -not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
+                $hash = $null
+                try { $hash = (Get-FileHash -LiteralPath $p -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() } catch { continue }
+                $checked++
+                $status = ''
+                if ($malSet.ContainsKey($hash)) { $status = 'malicious' }
+                elseif ($vulSet.ContainsKey($hash)) { $status = 'vulnerable' }
+                if ($status) { $hits += [pscustomobject]@{ Status = $status; Name = "$($dr.Name)"; DisplayName = "$($dr.DisplayName)"; Path = $p; SHA256 = $hash } }
+            }
+            Save-Rows -Name 'loldrivers_hits' -Rows $hits
+            $mal = @($hits | Where-Object { $_.Status -eq 'malicious' }).Count
+            $vul = @($hits | Where-Object { $_.Status -eq 'vulnerable' }).Count
+            if ($hits.Count -gt 0) {
+                Write-CaseLog "    LOLDrivers: $mal MALICIOUS, $vul vulnerable driver(s) on disk ($checked hashed) -> csv\loldrivers_hits.csv" $(if ($mal -gt 0) { 'Red' } else { 'Yellow' })
+            } else {
+                Write-CaseLog "    LOLDrivers: $checked drivers hashed - no malicious/vulnerable matches" 'Gray'
+            }
+        } }
 )
 
 function Get-FilteredEvents {
@@ -2960,6 +3073,9 @@ function New-HtmlReport {
     $amcHits = @(Import-CaseCsv 'ioc_hits_amcache.csv')
     $yaraHits = @(Import-CaseCsv 'yara_hits.csv')
     $beacons = @(Import-CaseCsv 'beacon_candidates.csv')
+    $dnsBeacons = @(Import-CaseCsv 'dns_beacon_candidates.csv')
+    $lolHits = @(Import-CaseCsv 'loldrivers_hits.csv')
+    $psCmds = @(Import-CaseCsv 'ps_decoded_commands.csv')
     $usnBursts = @(Import-CaseCsv 'usn_write_bursts.csv')
     $mftRecent = @(Import-CaseCsv 'mft_recent.csv')
     $pfParsed = @(Import-CaseCsv 'prefetch_parsed.csv')
@@ -3042,7 +3158,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
     $null = $sb.AppendLine("<h1>OPHIRA COMPROMISE ASSESSMENT REPORT</h1>")
     $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' }) &nbsp;|&nbsp; Elevated: $(if (Test-IsAdmin) { 'yes' } else { 'NO' })</div>")
-    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#snapshot'>Snapshot</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
+    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#snapshot'>Snapshot</a><a href='#drivers'>Drivers</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
 
     # ---------- verdict banner ----------
     $null = $sb.AppendLine("<a name='verdict'></a><h2>Verdict</h2>")
@@ -3178,6 +3294,10 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     foreach ($h in $amcHits) { if ("$($h.Indicator)") { $iocBlock.Add("sha1  $($h.Indicator)") } }
     foreach ($b in $brute) { if ("$($b.SourceIp)") { $iocBlock.Add("ip  $($b.SourceIp)") } }
     foreach ($b in ($beacons | Where-Object { "$($_.Severity)" -match '^(?i)(high|medium)$' -and "$($_.RemoteIp)" })) { $iocBlock.Add("ip  $($b.RemoteIp)") }
+    foreach ($b in ($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)(high|medium)$' -and "$($_.Domain)" })) {
+        $iocBlock.Add("domain  $($b.Domain)")
+        if ("$($b.ResolvedIp)") { $iocBlock.Add("ip  $($b.ResolvedIp)") }
+    }
     $yaraScanned = @(Import-CaseCsv 'yara_scanned.csv')
     foreach ($y in ($yaraScanned | Where-Object { "$($_.Hits)" -match '^\d+$' -and [int]$_.Hits -gt 0 -and "$($_.SHA256)" })) { $iocBlock.Add("sha256  $($y.SHA256)") }
     $iocUnique = @($iocBlock.ToArray() | Sort-Object -Unique)
@@ -3260,6 +3380,24 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
             $null = $sb.AppendLine("</table>")
         }
         $null = $sb.AppendLine("<div class='meta'>Full timeline: csv\hayabusa_timeline.csv &nbsp;|&nbsp; hayabusa's own summary: csv\hayabusa_report.html</div>")
+    }
+
+    # ---------- recovered attacker commands ----------
+    if ($psCmds.Count -gt 0) {
+        $null = $sb.AppendLine("<a name='pscmds'></a><h2>Recovered attacker commands (base64/obfuscated PowerShell)</h2>")
+        $null = $sb.AppendLine("<table><tr><th>Time</th><th>Source event</th><th>Decoded content</th></tr>")
+        foreach ($c in ($psCmds | Select-Object -First 30)) {
+            $t = if ($c.PSObject.Properties['Timestamp']) { $c.Timestamp } else { '' }
+            $src = if ($c.PSObject.Properties['Channel']) { "$($c.Channel) / $($c.EventID)" } else { '' }
+            $txt = ''
+            foreach ($p in @('DecodedText', 'Payload', 'Details', 'Message')) {
+                if ($c.PSObject.Properties[$p] -and "$($c.$p)") { $txt = "$($c.$p)"; break }
+            }
+            if (-not $txt) { $txt = ($c.PSObject.Properties | ForEach-Object { "$($_.Value)" }) -join ' ' }
+            if ($txt.Length -gt 400) { $txt = $txt.Substring(0, 400) + '...' }
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $t)</td><td>$(ConvertTo-HtmlEsc $src)</td><td class='path'>$(ConvertTo-HtmlEsc $txt)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>First $($psCmds.Count) recovered commands (hayabusa extract-base64 over the exported PowerShell event logs). Source: csv\ps_decoded_commands.csv</div>")
     }
 
     # ---------- logon & account analysis ----------
@@ -3409,7 +3547,16 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         }
         $null = $sb.AppendLine("</table><div class='meta'>Regularity = share of inter-arrival times within 0.5x-1.5x of the median. Legitimate updaters/telemetry also beacon - weigh process path, signer and destination. Source: csv\beacon_candidates.csv</div>")
     } else {
-        $null = $sb.AppendLine("<div class='meta'>No periodic outbound patterns detected (or no Sysmon network events available - beaconing analysis requires Sysmon event ID 3).</div>")
+        $null = $sb.AppendLine("<div class='meta'>No periodic outbound connection patterns detected (or no Sysmon network events available - requires Sysmon event ID 3).</div>")
+    }
+    if ($dnsBeacons.Count -gt 0) {
+        $null = $sb.AppendLine("<h3>DNS beaconing (periodic domain queries)</h3><table><tr><th>Severity</th><th>Process</th><th>Domain</th><th>Resolved (public)</th><th>Queries</th><th>Span</th><th>Interval</th><th>Regularity</th><th>Flags</th></tr>")
+        foreach ($b in ($dnsBeacons | Select-Object -First 30)) {
+            $sevCls = switch -Regex ("$($b.Severity)") { '^high$' { 'crit'; break } '^medium$' { 'med'; break } default { 'info' } }
+            $ripCell = if ("$($b.ResolvedIp)") { New-VtLink $b.ResolvedIp } else { '-' }
+            $null = $sb.AppendLine("<tr><td class='$sevCls'><b>$(ConvertTo-HtmlEsc $b.Severity)</b></td><td class='path'>$(ConvertTo-HtmlEsc $b.Process)</td><td>$(ConvertTo-HtmlEsc $b.Domain)</td><td>$ripCell</td><td>$($b.Events)</td><td>$($b.SpanMin)min</td><td>~$(ConvertTo-HtmlEsc $b.MedianIntervalSec)s</td><td>$(ConvertTo-HtmlEsc $b.Regularity)</td><td>$(ConvertTo-HtmlEsc $b.Flags)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Same periodicity math applied to Sysmon DNS queries (event ID 22) - catches C2 that hides behind domains instead of raw IPs. Source: csv\dns_beacon_candidates.csv</div>")
     }
 
     # ---------- network ----------
@@ -3422,6 +3569,19 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         $null = $sb.AppendLine("</table>")
     } else {
         $null = $sb.AppendLine("<div class='meta'>No public IP connections at collection time.</div>")
+    }
+
+    # ---------- driver check ----------
+    $null = $sb.AppendLine("<a name='drivers'></a><h2>Driver check (LOLDrivers)</h2>")
+    if ($lolHits.Count -gt 0) {
+        $null = $sb.AppendLine("<table><tr><th>Status</th><th>Driver</th><th>Display name</th><th>Path</th><th>SHA256</th></tr>")
+        foreach ($l in ($lolHits | Sort-Object { "$($_.Status)" -eq 'malicious' } -Descending | Select-Object -First 25)) {
+            $stCls = if ("$($l.Status)" -eq 'malicious') { 'crit' } else { 'med' }
+            $null = $sb.AppendLine("<tr><td class='$stCls'><b>$(ConvertTo-HtmlEsc $l.Status)</b></td><td>$(ConvertTo-HtmlEsc $l.Name)</td><td>$(ConvertTo-HtmlEsc $l.DisplayName)</td><td class='path'>$(ConvertTo-HtmlEsc $l.Path)</td><td class='path'>$(ConvertTo-HtmlEsc $l.SHA256)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'><b>malicious</b> = hash matches a driver known to be used in attacks (BYOVD / kernel exploits). <b>vulnerable</b> = known-exploitable driver that attackers can abuse for privilege escalation - replace it. Source: csv\loldrivers_hits.csv (datasets: loldrivers.io)</div>")
+    } else {
+        $null = $sb.AppendLine("<div class='meta'>No malicious/vulnerable driver matches (or tools\loldrivers datasets missing - run -Mode Setup, needs admin + module 1.6).</div>")
     }
 
     # ---------- host snapshot ----------
@@ -3587,6 +3747,10 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'yara_hits'                       = 'YARA rule matches on collected binaries'
         'yara_scanned'                    = 'Which files were YARA-scanned'
         'beacon_candidates'               = 'Periodic outbound patterns (C2 beaconing)'
+        'dns_beacon_candidates'           = 'Periodic DNS domain queries (DNS C2 beaconing)'
+        'sysmon_dns'                      = 'Sysmon DNS queries (EID 22) - domains each process resolved'
+        'loldrivers_hits'                 = 'Driver hashes x LOLDrivers dataset (malicious/vulnerable drivers on disk)'
+        'ps_decoded_commands'             = 'Base64/obfuscated PowerShell commands recovered from event logs'
         'execution_timeline'              = 'Shimcache/amcache program execution history'
         'amcache'                         = 'Amcache full parse (installed/executed programs + SHA1)'
         'ioc_hits_amcache'                = 'Amcache SHA1 x IOC list hits (historical execution)'
@@ -3660,7 +3824,11 @@ function New-SuperTimeline {
     $sorted = $rows | Sort-Object { try { [datetime]::Parse($_.Timestamp, [System.Globalization.CultureInfo]::InvariantCulture) } catch { [datetime]::MinValue } }
     $out = Join-Path $CsvDir 'supertimeline.csv'
     $sorted | Export-Csv -LiteralPath $out -NoTypeInformation -Encoding UTF8
-    Write-CaseLog "    supertimeline: $($rows.Count) events -> csv\supertimeline.csv" 'DarkGray'
+    # hayabusa sort-csv: dedupe same-event rows coming from overlapping/backup evtx (PS sort above already orders by time)
+    $hS = Get-HayabusaExe
+    if ($hS) { $null = Invoke-NativeTool -ExePath $hS.FullName -ToolArgs @('sort-csv', '-f', $out, '-o', $out, '-C', '-q', '-K') -WorkingDirectory $hS.DirectoryName -QuietLog }
+    $nFinal = @(Get-Content -LiteralPath $out | Select-Object -Skip 1).Count
+    Write-CaseLog "    supertimeline: $($rows.Count) events merged, $nFinal after dedupe -> csv\supertimeline.csv" 'DarkGray'
 }
 
 function New-LoggingGaps {
@@ -3710,6 +3878,14 @@ function New-SiemExport {
     }
     foreach ($b in (Import-CaseCsv 'beacon_candidates')) {
         $o = [ordered]@{}; $o['ts'] = "$($StartTime.ToString('o'))"; $o['kind'] = 'beacon'; $o['host'] = $base.host; $o['severity'] = $b.Severity; $o['process'] = $b.Process; $o['dest_ip'] = $b.RemoteIp; $o['dest_port'] = $b.Port; $o['interval_sec'] = $b.MedianIntervalSec; $o['regularity'] = $b.Regularity; $o['caseid'] = $base.caseid
+        $lines.Add(($o | ConvertTo-Json -Compress))
+    }
+    foreach ($b in (Import-CaseCsv 'dns_beacon_candidates')) {
+        $o = [ordered]@{}; $o['ts'] = "$($StartTime.ToString('o'))"; $o['kind'] = 'dns_beacon'; $o['host'] = $base.host; $o['severity'] = $b.Severity; $o['process'] = $b.Process; $o['domain'] = $b.Domain; $o['resolved_ip'] = $b.ResolvedIp; $o['interval_sec'] = $b.MedianIntervalSec; $o['regularity'] = $b.Regularity; $o['caseid'] = $base.caseid
+        $lines.Add(($o | ConvertTo-Json -Compress))
+    }
+    foreach ($l in (Import-CaseCsv 'loldrivers_hits')) {
+        $o = [ordered]@{}; $o['ts'] = "$($StartTime.ToString('o'))"; $o['kind'] = 'loldriver'; $o['host'] = $base.host; $o['status'] = $l.Status; $o['driver'] = $l.Name; $o['path'] = $l.Path; $o['sha256'] = $l.SHA256; $o['caseid'] = $base.caseid
         $lines.Add(($o | ConvertTo-Json -Compress))
     }
     foreach ($u in (Import-CaseCsv 'usn_write_bursts')) {
@@ -3847,6 +4023,8 @@ function Get-CompromiseVerdict {
     $gaps = Import-CaseCsv 'logging_gaps'
     $brute = Import-CaseCsv 'security_bruteforce_candidates'
     $beacons = Import-CaseCsv 'beacon_candidates'
+    $dnsBeacons = Import-CaseCsv 'dns_beacon_candidates'
+    $lol = Import-CaseCsv 'loldrivers_hits'
     $usnBursts = Import-CaseCsv 'usn_write_bursts'
     $asep = Import-CaseCsv 'asep_sweep'
     $memMf = Import-CaseCsv 'memory_malfind'
@@ -3869,6 +4047,9 @@ function Get-CompromiseVerdict {
     $gapTamper = @($gaps | Where-Object { "$($_.EventId)" -match '^(1102|104)$' -or "$($_.Meaning)" -match 'clear|stop' }).Count
     $beaconHi = @($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' }).Count
     $beaconMed = @($beacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
+    $dnsHi = @($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' }).Count
+    $dnsMed = @($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
+    $lolMal = @($lol | Where-Object { $_.Status -eq 'malicious' }).Count
     $usnBurstN = @($usnBursts).Count
     $rExt = ((@($usnBursts) | Where-Object { "$($_.RansomExt)" } | ForEach-Object { "$($_.RansomExt)" } | Sort-Object -Unique) -join ',')
     # ponytail: COM hijacks + StartupApproved excluded from the signal (per-user COM has many legit users, e.g. Teams/OneDrive); they stay report-visible
@@ -3877,6 +4058,8 @@ function Get-CompromiseVerdict {
     Add-Signal 'IOC hit - historical execution (amcache SHA1)' 4 @($iocAmc).Count "near-certain true positive evidence"
     Add-Signal 'YARA hit - high/critical rule' 4 $yaraHi (($yara | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'C2 beaconing - highly regular callbacks' 3 $beaconHi (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp):$($_.Port) every ~$($_.MedianIntervalSec)s" }) -join '; ')
+    Add-Signal 'C2 DNS beaconing - highly regular domain queries' 3 $dnsHi (($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.Domain) every ~$($_.MedianIntervalSec)s" }) -join '; ')
+    Add-Signal 'Known-malicious driver on disk (LOLDrivers)' 2 $lolMal (($lol | Where-Object { $_.Status -eq 'malicious' } | Select-Object -First 3 | ForEach-Object { "$($_.Name): $($_.Path)" }) -join '; ')
     Add-Signal 'Ransomware-like mass file modification (USN journal)' 3 $usnBurstN ((($usnBursts | Select-Object -First 3 | ForEach-Object { "$($_.WindowStart): $($_.WriteEvents) writes / $($_.DistinctFiles) files" }) -join '; ') + $(if ($rExt) { " - RANSOM EXTENSIONS: $rExt" }))
     Add-Signal 'Uncommon persistence mechanism (IFEO/AppInit/Winlogon/netsh/LSA)' 2 $asepHotN (($asep | Where-Object { $_.Flags -match 'user-path|nondefault' -and "$($_.Category)" -notmatch 'ComHijack|StartupApproved' } | Select-Object -First 3 | ForEach-Object { "$($_.Category): $($_.Name) = $($_.Value)" }) -join '; ')
     Add-Signal 'Memory malfind indicators (injected code regions)' 2 @($memMf).Count (($memMf | Select-Object -First 3 | ForEach-Object { "$($_.Process)($($_.PID))" }) -join '; ')
@@ -3885,6 +4068,7 @@ function Get-CompromiseVerdict {
     Add-Signal 'Sigma detection - critical' 3 $hayCrit (($hay | Where-Object { "$($_.Level)" -match 'crit' } | Select-Object -First 3 | ForEach-Object { $_.RuleTitle }) -join '; ')
     Add-Signal 'YARA hit - medium rule' 2 $yaraMed (($yara | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'C2 beaconing - periodic callbacks' 2 $beaconMed (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp) every ~$($_.MedianIntervalSec)s" }) -join '; ')
+    Add-Signal 'C2 DNS beaconing - periodic domain queries' 2 $dnsMed (($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.Domain) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'Sigma detection - high' 2 $hayHigh "$hayHigh events from $hayHighRules distinct rules"
     Add-Signal 'Process anomaly verdict HIGH' 2 $procHigh (($proc | Where-Object { "$($_.Verdict)" -eq 'HIGH' } | Select-Object -First 3 | ForEach-Object { $_.Name }) -join '; ')
     Add-Signal 'Defender detection history' 2 @($def).Count "antivirus detected something during retention window"
@@ -3912,6 +4096,8 @@ function Get-CompromiseVerdict {
     Add-Cov 'Browser history artifacts' (Test-Path (Join-Path $CsvDir 'browser_files.csv')) 4
     Add-Cov 'Defender status' (Test-Path (Join-Path $CsvDir 'defender_status.csv')) 5
     Add-Cov 'YARA binary scan' (Test-Path (Join-Path $CsvDir 'yara_scanned.csv')) 5
+    Add-Cov 'DNS query telemetry (Sysmon EID 22)' (Test-Path (Join-Path $CsvDir 'sysmon_dns.csv')) 4
+    Add-Cov 'LOLDrivers driver hash check' (Test-Path (Join-Path $CsvDir 'loldrivers_hits.csv')) 3
     Add-Cov 'Sysmon telemetry (bonus)' ([bool]$Sysmon) 5
     Add-Cov 'RAM capture (bonus)' (Test-Path $MemDir) 3
     $coverageRaw = 0
@@ -3954,6 +4140,7 @@ function Get-CompromiseVerdict {
         SigmaCritical = $hayCrit; SigmaHigh = $hayHigh; ProcessHigh = $procHigh; ProcessMedium = $procMed
         DefenderDetections = @($def).Count; TamperEvents = $gapTamper; BruteForceSources = @($brute).Count
         BeaconHigh = $beaconHi; BeaconMedium = $beaconMed
+        DnsBeaconHigh = $dnsHi; DnsBeaconMedium = $dnsMed; LolDriversMalicious = $lolMal
     }
 
     return [pscustomobject]@{
@@ -4160,7 +4347,8 @@ function Show-TaskMenu {
         Write-Host "   [3]  Analyze collected results (fleet report)" -ForegroundColor Yellow
         Write-Host "   [4]  Setup / download companion tools" -ForegroundColor Yellow
         Write-Host "   [5]  Update detection rules (hayabusa)" -ForegroundColor Yellow
-        Write-Host "   [6]  Tool links" -ForegroundColor Yellow
+        Write-Host "   [6]  Tune Sigma rules (reduce false positives)" -ForegroundColor Yellow
+        Write-Host "   [7]  Tool links" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "   [Q]  Quit" -ForegroundColor DarkGray
         Write-Host ""
@@ -4172,7 +4360,8 @@ function Show-TaskMenu {
             '^(?i)3$' { return 'Analyze' }
             '^(?i)4$' { return 'Setup' }
             '^(?i)5$' { return 'UpdateRules' }
-            '^(?i)6$' { return 'Links' }
+            '^(?i)6$' { return 'Tune' }
+            '^(?i)7$' { return 'Links' }
             '^(?i)q$' { return $null }
             default { }
         }
@@ -4183,7 +4372,7 @@ function Invoke-SetupWizard {
     Write-Host ""
     Write-Host "=== Setup companion tools ===" -ForegroundColor Cyan
     Write-Host "Tools live in tools\ subfolders. Available:" -ForegroundColor Gray
-    Write-Host "  winpmem  hayabusa  volatility3  chainsaw  AmcacheParser  RBCmd  MFTECmd  PECmd  LECmd  JLECmd  SBECmd  SQLECmd  yara" -ForegroundColor White
+    Write-Host "  winpmem  hayabusa  volatility3  chainsaw  AmcacheParser  RBCmd  MFTECmd  PECmd  LECmd  JLECmd  SBECmd  SQLECmd  loldrivers  yara" -ForegroundColor White
     Write-Host "ENTER = walk through all tools (confirm each download)," 
     Write-Host "or give a comma-separated list (e.g. hayabusa,winpmem)."
     $inp = (Read-Host "Tools [all]").Trim()
@@ -4227,6 +4416,71 @@ function Invoke-UpdateRulesMode {
         Write-Host "Rules update FAILED ($($_.Exception.Message)) - previous rules restored." -ForegroundColor Red
         return $false
     }
+}
+
+function Invoke-TuneMode {
+    # Sigma FP feedback loop: shows top-hit rules from the most recent case timeline,
+    # writes picks into hayabusa's native exclude_rules.txt / level_tuning.txt.
+    $h = Get-HayabusaExe
+    if (-not $h) { Write-Host "hayabusa not found in tools\ - run Setup first" -ForegroundColor Red; return $false }
+    $cfgDir = Join-Path $h.DirectoryName 'rules\config'
+    if (-not (Test-Path $cfgDir)) { Write-Host "hayabusa rule config not found: $cfgDir" -ForegroundColor Red; return $false }
+    $kit = Get-KitRoot
+    $cand = @(Get-ChildItem -Path $kit -Recurse -Filter 'hayabusa_timeline.csv' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    $tl = $null
+    if ($cand.Count -eq 1) { $tl = $cand[0].FullName }
+    elseif ($cand.Count -gt 1) {
+        Write-Host ""
+        Write-Host "  Found $($cand.Count) hayabusa timelines (newest first):" -ForegroundColor White
+        for ($i = 0; $i -lt [Math]::Min(9, $cand.Count); $i++) { Write-Host ("   [{0}] {1}" -f ($i + 1), $cand[$i].FullName) }
+        $sel = (Read-Host "  Which case? [1]").Trim()
+        if (-not $sel) { $sel = '1' }
+        if ($sel -match '^\d+$' -and [int]$sel -ge 1 -and [int]$sel -le [Math]::Min(9, $cand.Count)) { $tl = $cand[[int]$sel - 1].FullName }
+    }
+    if (-not $tl) { $tl = (Read-Host "  Path to hayabusa_timeline.csv").Trim(' " ') }
+    if (-not $tl -or -not (Test-Path -LiteralPath $tl)) { Write-Host "No timeline available - run a collection first (or enter a path)." -ForegroundColor Red; return $false }
+    Write-Host "  Loading $([IO.Path]::GetFileName($tl)) ..." -ForegroundColor Gray
+    $rows = @(Import-Csv -LiteralPath $tl)
+    if ($rows.Count -eq 0) { Write-Host "Timeline is empty - nothing to tune." -ForegroundColor Yellow; return $true }
+    $groups = @($rows | Group-Object RuleID, RuleTitle, Level | Sort-Object Count -Descending | Select-Object -First 25)
+    Write-Host ""
+    Write-Host "  Top noisy rules (by hit count):" -ForegroundColor White
+    for ($i = 0; $i -lt $groups.Count; $i++) {
+        $g = $groups[$i]
+        Write-Host ("   [{0,2}] x{1,-7} {2,-14} {3}" -f ($i + 1), $g.Count, "$($g.Group[0].Level)", "$($g.Group[0].RuleTitle)")
+    }
+    Write-Host ""
+    Write-Host "  E = exclude (rule never fires again)   D = demote to informational (stays visible, loses verdict weight)" -ForegroundColor DarkGray
+    $pick = (Read-Host "  Rule numbers to tune (comma-separated), A = all shown, ENTER = cancel").Trim()
+    if (-not $pick) { Write-Host "Cancelled." -ForegroundColor Gray; return $true }
+    $idx = @()
+    if ($pick -match '^(?i)a$') { $idx = @(1..$groups.Count) }
+    else { foreach ($p in ($pick -split ',')) { $pt = $p.Trim(); if ($pt -match '^\d+$' -and [int]$pt -ge 1 -and [int]$pt -le $groups.Count) { $idx += [int]$pt } } }
+    if ($idx.Count -eq 0) { Write-Host "No valid selection." -ForegroundColor Yellow; return $true }
+    $exPath = Join-Path $cfgDir 'exclude_rules.txt'
+    $lvPath = Join-Path $cfgDir 'level_tuning.txt'
+    $nEx = 0
+    $nLv = 0
+    foreach ($i in $idx) {
+        $g = $groups[$i - 1]
+        $rid = "$($g.Group[0].RuleID)"
+        $title = "$($g.Group[0].RuleTitle)"
+        $lvl = "$($g.Group[0].Level)"
+        $act = (Read-Host "  [$title - $lvl] E / D / S=kip").Trim()
+        if (-not $rid) { continue }
+        if ($act -match '^(?i)e$') {
+            Add-Content -LiteralPath $exPath -Value ("{0} # `"{1}`" (Ophira Tune {2})" -f $rid, $title, (Get-Date -Format 'yyyy-MM-dd')) -Encoding UTF8
+            $nEx++
+        } elseif ($act -match '^(?i)d$') {
+            if (-not (Test-Path $lvPath)) { Set-Content -LiteralPath $lvPath -Value 'id,new_level' -Encoding UTF8 }
+            Add-Content -LiteralPath $lvPath -Value ("{0},informational # `"{1}`" - Originally {2} (Ophira Tune {3})" -f $rid, $title, $lvl, (Get-Date -Format 'yyyy-MM-dd')) -Encoding UTF8
+            $nLv++
+        }
+    }
+    Write-Host ""
+    Write-Host "Tune done: $nEx excluded, $nLv demoted (written into tools\hayabusa rules\config)." -ForegroundColor $(if ($nEx + $nLv -gt 0) { 'Green' } else { 'Gray' })
+    Write-Host "These settings travel with Deploy (-PushTools) to every host. Re-run a collection to see the effect." -ForegroundColor Gray
+    return $true
 }
 
 function Invoke-DeployWizard {
@@ -4379,6 +4633,7 @@ if ($bareLaunch -and [Environment]::UserInteractive) {
                 'Analyze' { Invoke-AnalyzeWizard }
                 'Setup' { Invoke-SetupWizard }
         'UpdateRules' { if (-not (Invoke-UpdateRulesMode)) { exit 1 } }
+                'Tune' { Invoke-TuneMode | Out-Null }
                 'Links' { Show-ToolLinks }
             }
             Write-Host ""
@@ -4401,6 +4656,7 @@ if ($Mode -ne 'Collect') {
             Invoke-DeployMode -Targets $ComputerName -DeployPreset $Preset -Cred $Credential -DeployCaseID $CaseID -DeploySharePath $SharePath -Threads $MaxThreads -PushBin ([bool]$PushTools) -DeployLogHours $LogHours
         }
         'UpdateRules' { Invoke-UpdateRulesMode }
+        'Tune' { Invoke-TuneMode | Out-Null }
     }
     exit 0
 }
