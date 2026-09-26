@@ -68,7 +68,7 @@ Wizard answers are remembered only when you answer **y** to "Remember these answ
    - CONTEXT — **attacker activity** (PowerShell console history, RDP client targets, recycle bin), **LNK + Jump Lists** (raw save + parse via LECmd/JLECmd), **user registry saves** (NTUSER.DAT/UsrClass.dat all profiles), **coverage & context** (Sysmon config, task XML, BITS jobs, domain info), **EZ parsers** (AmcacheParser execution inventory with SHA1×IOC cross-check, RBCmd), **certificate store inventory** (T1553: recent/self-signed root CAs flagged in `certificates.csv`), **browser artifacts raw save** (Chrome/Edge History+Downloads per profile, `esentutl /vss` fallback for locked files)
    - DEFENDER — detections, exclusions, status, operational log
    - MEMORY — optional RAM capture (winpmem), optional Volatility 3 quick pass
-3. **Packaging** — SHA256 manifest (per file + package + script self-hash + tool inventory), `case.json`, **compromise verdict** (`verdict.json`: 5-level verdict + coverage-weighted confidence + signals + caveats), `report.html`, **supertimeline.csv** (all events merged chronologically), **delta_new.csv** (new findings vs previous collection), **siem_export.ndjson** (Splunk/Elastic-ready records), **logging_gaps.csv** (log cleared/stopped + evtx gap tamper check), ZIP
+3. **Packaging** — SHA256 manifest (per file + package + script self-hash + tool inventory), `case.json`, **compromise verdict** (`verdict.json`: 5-level verdict + coverage-weighted confidence + signals + caveats), `report.html`, **supertimeline.csv** (all events merged chronologically), **delta_new.csv** (new findings vs previous collection), **siem_export.ndjson** (Splunk/Elastic-ready records incl. verdict/beacon/mass-modification), **attack_layer.json** (MITRE ATT&CK Navigator layer — load at navigator.mitre.org), **logging_gaps.csv** (log cleared/stopped + evtx gap tamper check), ZIP
 
 ## Compromise verdict (v2.6)
 
@@ -91,12 +91,12 @@ Run Ophira again on the same box days later: it auto-finds the previous case, co
 - **Correlation score** — evidence stacks per binary: user-path (+1), unsigned (+2), binary deleted (+3), public connection (+2), persistence refs (+2 each), IOC hash hit (+4) → verdict
 - **Trusted publishers** — validly-signed binaries from known publishers (or your `tools\trusted.txt`) cap at LOW; IOC hits always override
 - **Amcache SHA1 × IOC** — historical execution matched against your IOC list = near-certain TP with a timestamp
-- **report.html** — **compromise assessment report v2** (v2.7): verdict banner with confidence bar + contributing signals + "what would change this verdict" caveats, evidence coverage table, **MITRE ATT&CK grid** (tactic chips + technique table from hayabusa tags, with cannot-rule-out telemetry notes), findings grouped by tactic, defanged copy-ready IOC list, YARA findings, logon/account analysis, persistence inventory, **file-system evidence section** (USN mass-modification windows, most-run prefetch, MFT user-path executables), **C2 beaconing candidates**, recommendations, VT deep links
+- **report.html** — **compromise assessment report v2**: verdict banner with confidence bar + contributing signals + "what would change this verdict" caveats, evidence coverage table, **MITRE ATT&CK grid** (tactic chips + technique table from hayabusa tags, with cannot-rule-out telemetry notes), findings grouped by tactic, defanged copy-ready IOC list, YARA findings, logon/account analysis, persistence inventory, **file-system evidence section** (USN mass-modification windows, most-run prefetch, MFT user-path executables), **C2 beaconing candidates**, **host snapshot** (AV state + detections, stored credentials, outbound RDP, BITS), recommendations, **evidence index** (every CSV with row counts + what to look for — the map into all collected artifacts), VT deep links
 - **Raw evidence** — every flag is backed by raw CSV/evtx/hive so any verdict can be verified
 
 ## Analyze mode
 
-Merges N case zips → `fleet_report.csv` + **`fleet_report.html`** (**per-host verdicts inherited from each case's `verdict.json`**: verdict chips, worst-first host matrix, ATTENTION FIRST list) + **`fleet_hosts.csv`** (host/verdict/confidence for SIEM), high-priority findings, cross-host indicator + hash dedup, top fleet Sigma detections, **baselining proposals** + one merged hayabusa timeline. Accepts legacy `IRCASE_*` packages too (shown as "no verdict").
+Merges N case zips → `fleet_report.csv` + **`fleet_report.html`** (**per-host verdicts inherited from each case's `verdict.json`**: verdict chips, worst-first host matrix, ATTENTION FIRST list, **fleet ATT&CK roll-up** with `attack_layer_fleet.json`) + **`fleet_hosts.csv`** (host/verdict/confidence for SIEM), high-priority findings, cross-host indicator + hash dedup, top fleet Sigma detections, **baselining proposals** + one merged hayabusa timeline. Accepts legacy `IRCASE_*` packages too (shown as "no verdict").
 
 **Fleet baselining:** publishers present on ≥60% of hosts with zero HIGH verdicts are written to `proposed_trusted.txt` — review once, merge into `tools\trusted.txt`, and your false-positive rate drops with every host you scan.
 
@@ -139,8 +139,8 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 - [x] C2 beaconing detection (module 4.8, v2.9)
 - [x] NTFS forensics: $MFT + USN ransomware bursts + prefetch/LNK parsing (v2.10)
 - [x] Persistence sweep + quick wins: ASEP, cert store, firewall log, browser copy (v2.11)
+- [x] Report completeness: evidence index + snapshots; ATT&CK Navigator layers; SIEM verdict/beacon/USN records (v2.12)
 - [ ] Real-host pilot run (validate hayabusa timing + MFTECmd on live volume)
-- [ ] Report completeness: evidence index of all CSV artifacts
 - [ ] Role-based presets (WebServer / DC / Workstation)
 
 ## License

@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.12
+- Report completeness: **evidence index** — every CSV with row counts + "what to look for" guidance + pointers to supertimeline/SIEM/verdict/layer files
+- Host snapshot section: Defender state + detection history, stored credentials, outbound RDP targets, BITS jobs
+- **MITRE ATT&CK Navigator layer export** (`attack_layer.json`, per case; `attack_layer_fleet.json` in Analyze mode) + fleet ATT&CK roll-up table in `fleet_report.html`
+- SIEM export: new record kinds `beacon`, `mass_modification`, `verdict`; export now runs after the verdict is computed
+- Codified test suite (`tests/run-tests.ps1`), GitHub Actions CI, CHANGELOG, AGENTS.md
+
 ## v2.11
 - ASEP persistence deep sweep (module 2.6): IFEO debuggers (incl. sticky-keys), AppInit_DLLs, Winlogon Shell/Userinit/Notify, HKCU COM hijack suspects, netsh helpers, LSA packages, StartupApproved stamps → `asep_sweep.csv` + verdict signal (floor 2)
 - Certificate store inventory (T1553): LocalMachine/CurrentUser Root + CA + TrustedPublisher, recent/self-signed flags → `certificates.csv`

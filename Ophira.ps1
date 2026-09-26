@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.11  -  Windows Incident Response Triage Toolkit
+Ophira v2.12  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -32,7 +32,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.11"
+$ScriptVersion = "2.12"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -891,6 +891,39 @@ a{color:#8ab4f8}.foot{margin-top:40px;color:#565e6b;font-size:11px}
             $null = $fsb.AppendLine("<tr><td class='IOC'>$(ConvertTo-HtmlEsc $f.Host)</td><td>$(ConvertTo-HtmlEsc $f.Type)</td><td class='path'>$(ConvertTo-HtmlEsc $f.Detail)</td></tr>")
         }
         $null = $fsb.AppendLine("</table>")
+    }
+    if ($hayOut -and (Test-Path $hayOut)) {
+        $ftech = @{}
+        try {
+            foreach ($r in (Import-Csv -LiteralPath $hayOut)) {
+                $comp = "$($r.Computer)"
+                foreach ($m in [regex]::Matches("$($r.MitreTags)", 'T\d{4}(?:\.\d{3})?')) {
+                    $k = $m.Value
+                    if (-not $ftech.ContainsKey($k)) { $ftech[$k] = @{ N = 0; Hosts = @{} } }
+                    $ftech[$k].N++
+                    if ($comp) { $ftech[$k].Hosts[$comp] = $true }
+                }
+            }
+        } catch { }
+        if ($ftech.Count -gt 0) {
+            $null = $fsb.AppendLine("<h2>Fleet ATT&CK roll-up (Sigma-tagged detections across hosts)</h2><table><tr><th>Technique</th><th>Detections</th><th>Hosts</th></tr>")
+            foreach ($k in @($ftech.Keys | Sort-Object { $ftech[$_].N } -Descending | Select-Object -First 40)) {
+                $href = 'https://attack.mitre.org/techniques/' + ($k -replace '\.', '/')
+                $null = $fsb.AppendLine("<tr><td><a target='_blank' href='$href'>$k</a></td><td>$($ftech[$k].N)</td><td>$($ftech[$k].Hosts.Count)</td></tr>")
+            }
+            $null = $fsb.AppendLine("</table><div class='meta'>Load attack_layer_fleet.json at navigator.mitre.org for the full heat map.</div>")
+            try {
+                $layerTech = @($ftech.Keys | Sort-Object | ForEach-Object { [pscustomobject]@{ techniqueID = $_; score = $ftech[$_].N } })
+                $flayer = [pscustomobject]@{
+                    name = "Ophira Fleet - $(Split-Path $Path -Leaf)"
+                    domain = 'enterprise-attack'
+                    description = "Ophira v$ScriptVersion fleet Sigma detections"
+                    versions = @{ navigator = '4.9'; layer = '4.5' }
+                    techniques = $layerTech
+                }
+                $flayer | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutFolder 'attack_layer_fleet.json') -Encoding UTF8
+            } catch { }
+        }
     }
     if ($crossHost.Count -gt 0) {
         $null = $fsb.AppendLine("<h2>Cross-host indicators (outbreak signal)</h2><table><tr><th>Indicator</th><th>Hosts</th><th>Count</th></tr>")
@@ -2771,6 +2804,11 @@ function New-HtmlReport {
     $asepRows = @(Import-CaseCsv 'asep_sweep.csv')
     $certs = @(Import-CaseCsv 'certificates.csv')
     $asepHot = @($asepRows | Where-Object { $_.Flags -match 'user-path|nondefault' })
+    $defStatus = @(Import-CaseCsv 'defender_status.csv')
+    $defThreats = @(Import-CaseCsv 'defender_threats.csv')
+    $savedCreds = @(Import-CaseCsv 'saved_credentials.csv')
+    $rdpTgt = @(Import-CaseCsv 'rdp_client_targets.csv')
+    $bitsJobs = @(Import-CaseCsv 'bits_jobs.csv')
 
     function Get-LvlRank([string]$l) {
         switch -Regex ("$l") { 'crit' { 5; break } 'high' { 4; break } 'med' { 3; break } 'low' { 2; break } default { 1 } }
@@ -2830,7 +2868,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
     $null = $sb.AppendLine("<h1>OPHIRA COMPROMISE ASSESSMENT REPORT</h1>")
     $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' }) &nbsp;|&nbsp; Elevated: $(if (Test-IsAdmin) { 'yes' } else { 'NO' })</div>")
-    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#recommendations'>Recommendations</a></div>")
+    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#snapshot'>Snapshot</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
 
     # ---------- verdict banner ----------
     $null = $sb.AppendLine("<a name='verdict'></a><h2>Verdict</h2>")
@@ -3212,6 +3250,50 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         $null = $sb.AppendLine("<div class='meta'>No public IP connections at collection time.</div>")
     }
 
+    # ---------- host snapshot ----------
+    $null = $sb.AppendLine("<a name='snapshot'></a><h2>Host snapshot (AV state, stored credentials, outbound RDP)</h2>")
+    $snapAny = $false
+    if ($defStatus.Count -gt 0) {
+        $snapAny = $true
+        $d = $defStatus[0]
+        $null = $sb.AppendLine("<div>Defender: RealTimeProtection <b>$(ConvertTo-HtmlEsc $d.RealTimeProtection)</b>, AMService <b>$(ConvertTo-HtmlEsc $d.AMServiceEnabled)</b>, signature age <b>$(ConvertTo-HtmlEsc $d.AntivirusSigAgeDays)</b> day(s)</div>")
+    }
+    if ($defThreats.Count -gt 0) {
+        $snapAny = $true
+        $null = $sb.AppendLine("<h3>Defender detection history</h3><table><tr><th>Threat</th><th>Active</th><th>Resource</th></tr>")
+        foreach ($t in ($defThreats | Select-Object -First 15)) {
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $t.ThreatName)</td><td>$(ConvertTo-HtmlEsc $t.IsActive)</td><td class='path'>$(ConvertTo-HtmlEsc "$($t.Resources)")</td></tr>")
+        }
+        $null = $sb.AppendLine("</table>")
+    }
+    if ($savedCreds.Count -gt 0) {
+        $snapAny = $true
+        $null = $sb.AppendLine("<h3>Stored credentials on this host (lateral movement risk)</h3><table><tr><th>Entry</th></tr>")
+        foreach ($c in ($savedCreds | Select-Object -First 15)) {
+            $line = ($c.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' | '
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $line)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Source: csv\saved_credentials.csv</div>")
+    }
+    if ($rdpTgt.Count -gt 0) {
+        $snapAny = $true
+        $null = $sb.AppendLine("<h3>Outbound RDP targets (where users RDP'd to)</h3><table><tr><th>Entry</th></tr>")
+        foreach ($r in ($rdpTgt | Select-Object -First 15)) {
+            $line = ($r.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' | '
+            $null = $sb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $line)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Source: csv\rdp_client_targets.csv - attacker RDP outbound shows lateral movement destinations.</div>")
+    }
+    if ($bitsJobs.Count -gt 0) {
+        $snapAny = $true
+        $null = $sb.AppendLine("<h3>BITS transfer jobs</h3><table><tr><th>Name</th><th>Owner</th><th>State</th><th>Files</th></tr>")
+        foreach ($b in ($bitsJobs | Select-Object -First 15)) {
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $b.DisplayName)</td><td>$(ConvertTo-HtmlEsc $b.OwnerAccount)</td><td>$(ConvertTo-HtmlEsc $b.JobState)</td><td class='path'>$(ConvertTo-HtmlEsc $b.Files)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>BITS is abused for stealthy persistence/download. Source: csv\bits_jobs.csv</div>")
+    }
+    if (-not $snapAny) { $null = $sb.AppendLine("<div class='meta'>No snapshot data captured (relevant modules skipped).</div>") }
+
     # ---------- recommendations ----------
     $null = $sb.AppendLine("<a name='recommendations'></a><h2>Recommendations</h2>")
     $recs = New-Object System.Collections.Generic.List[string]
@@ -3241,6 +3323,96 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     }
     if ($recs.Count -eq 0) { $recs.Add('No specific hardening actions indicated by this collection - keep collecting baselines (delta mode) at a regular cadence.') }
     foreach ($r in $recs.ToArray()) { $null = $sb.AppendLine("<div class='rec'>$(ConvertTo-HtmlEsc $r)</div>") }
+
+    # ---------- evidence index ----------
+    $null = $sb.AppendLine("<a name='evidence'></a><h2>Evidence index (everything this case contains)</h2>")
+    $desc = @{
+        'flash_process_scored'            = 'Live processes with anomaly scores - review HIGH verdicts and user-path binaries'
+        'flash_ioc_hits'                  = 'Live processes/files matching your IOC list (tools\iocs.txt)'
+        'flash_public_connections'        = 'Established connections to public IPs at collection time - map to processes'
+        'processes'                       = 'Full live process inventory (parent/PID/command line)'
+        'processes_flagged'               = 'Process inventory subset with anomaly flags'
+        'process_hashes'                  = 'SHA256 hashes of live process binaries'
+        'connections'                     = 'Full connection table (netstat) at collection time'
+        'connections_public_established'  = 'ESTABLISHED public-IP connections - C2 candidates'
+        'dns_cache'                       = 'DNS resolver cache - look up domains malware resolved recently'
+        'arp_table'                       = 'ARP cache - hosts on the local segment'
+        'logon_sessions'                  = 'Active logon sessions (who is on the box right now)'
+        'drivers'                          = 'Kernel drivers + paths'
+        'drivers_flagged'                  = 'Drivers with user-writable binary paths'
+        'autoruns_runkeys'                = 'Run/RunOnce/Winlogon autostart commands (all hives)'
+        'autoruns_startup_folders'        = 'Startup folder items with signature status'
+        'services'                        = 'All services + binary paths'
+        'services_flagged'                = 'Services with user-writable or missing binaries'
+        'scheduled_tasks'                 = 'All scheduled tasks with actions'
+        'scheduled_tasks_flagged'         = 'Tasks with non-Microsoft authors or odd actions'
+        'wmi_event_filters'               = 'WMI event filters (rare on clean hosts)'
+        'wmi_event_consumers'             = 'WMI event consumers (command/script payloads)'
+        'wmi_bindings'                    = 'WMI filter-to-consumer bindings = active WMI persistence'
+        'asep_sweep'                      = 'Deep persistence sweep: IFEO/AppInit/Winlogon/COM/netsh/LSA/StartupApproved'
+        'certificates'                    = 'Certificate store inventory - check recent self-signed roots (T1553)'
+        'firewall_profiles'               = 'Firewall profile state + logging config'
+        'net_interfaces'                  = 'Network interfaces + IPs'
+        'net_reachable_subnets'           = 'Routes/reachable subnets'
+        'smb_hosted_shares'               = 'Shares this host exposes'
+        'smb_mounted_shares'              = 'Shares this host has mapped'
+        'smb_active_connections'          = 'Live SMB sessions (both directions)'
+        'saved_credentials'               = 'Stored credentials (cmdkey) - lateral movement risk'
+        'proxy_settings'                  = 'WinHTTP/WinINET proxy + WPAD'
+        'net_active_probes'               = 'Opt-in connectivity probes (module 3.2)'
+        'security_events'                 = 'Security log events in window (raw)'
+        'security_auth_events'            = 'Authentication events (4624/4625/4648...)'
+        'security_bruteforce_candidates'  = 'Sources with 5+ failed logons'
+        'security_auth_summary'           = 'Logon summary by account/type'
+        'powershell_events'               = 'PowerShell 4104 script block logs'
+        'sysmon_events'                   = 'Sysmon events in window (raw)'
+        'sysmon_network'                  = 'Sysmon EID 3 network events - source for beaconing'
+        'rdp_localsession'                = 'Local RDP session events'
+        'rdp_connections'                 = 'Inbound RDP connection events'
+        'rdp_client_targets'              = 'Outbound RDP destinations (registry MRU)'
+        'system_events'                   = 'System log events in window'
+        'system_new_services'             = 'EID 7045 service installs - malware installs itself as services'
+        'defender_status'                 = 'AV state at collection'
+        'defender_threats'                = 'AV detections history'
+        'defender_preferences'            = 'AV exclusions - attackers add exclusions'
+        'defender_events'                 = 'Defender operational log'
+        'powershell_console_history'      = 'Console history files per user - attacker commands'
+        'recyclebin_index'                = 'Recycle bin $I files (what was deleted, by whom, when)'
+        'bits_jobs'                       = 'BITS transfer jobs (stealth downloads)'
+        'domain_info'                     = 'Domain role + logged user'
+        'hayabusa_timeline'               = 'Sigma detection timeline with ATT&CK tags'
+        'yara_hits'                       = 'YARA rule matches on collected binaries'
+        'yara_scanned'                    = 'Which files were YARA-scanned'
+        'beacon_candidates'               = 'Periodic outbound patterns (C2 beaconing)'
+        'execution_timeline'              = 'Shimcache/amcache program execution history'
+        'amcache'                         = 'Amcache full parse (installed/executed programs + SHA1)'
+        'ioc_hits_amcache'                = 'Amcache SHA1 x IOC list hits (historical execution)'
+        'prefetch_index'                  = 'Prefetch files copied (index)'
+        'prefetch_parsed'                 = 'Prefetch parse: run counts + last run times'
+        'userassist'                      = 'UserAssist GUI programs executed per user'
+        'mft_recent'                      = 'MFT: recently created / user-path executables'
+        'usn_write_bursts'                = 'USN journal: mass file-modification windows (ransomware)'
+        'lnk_parsed'                      = 'LNK parse (Recent docs - what files were opened)'
+        'jumplist_parsed*'                = 'Jump List parse (per-app recent files)'
+        'recyclebin'                      = 'RBCmd recycle bin parse (original paths + delete times)'
+        'srum_usage'                      = 'SRUM: per-app resource/network usage over weeks'
+        'logging_gaps'                    = 'Log clear/stop events + evtx coverage gaps'
+        'delta_new'                       = 'Findings NEW since the previous collection'
+        'supertimeline'                   = 'All event sources merged chronologically - the master timeline'
+    }
+    $null = $sb.AppendLine("<table><tr><th>Artifact</th><th>Rows</th><th>What it is / what to look for</th></tr>")
+    foreach ($f in @(Get-ChildItem -Path $CsvDir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        $rows = 0
+        try {
+            $first = Get-Content -LiteralPath $f.FullName -First 1
+            if ($first -and $first -notmatch '^#') { $rows = @(Get-Content -LiteralPath $f.FullName | Select-Object -Skip 1).Count }
+        } catch { }
+        $base = $f.BaseName
+        $d = if ($desc.ContainsKey($base)) { $desc[$base] } elseif ($base -match '^jumplist_parsed') { $desc['jumplist_parsed*'] } else { '' }
+        $null = $sb.AppendLine("<tr><td>csv\$(ConvertTo-HtmlEsc $f.Name)</td><td>$rows</td><td>$(ConvertTo-HtmlEsc $d)</td></tr>")
+    }
+    $null = $sb.AppendLine("</table>")
+    $null = $sb.AppendLine("<div class='meta'>Also in the case: <b>supertimeline.csv</b> (master chronology), <b>siem_export.ndjson</b> (Splunk/Elastic-ready records), <b>verdict.json</b>, <b>attack_layer.json</b> (MITRE ATT&CK Navigator layer - load at navigator.mitre.org), <b>case.json</b> (run metadata + module timings), raw evidence under <b>raw\</b> (evtx, registry hives, prefetch, recent/jumplists, browser DBs, firewall log), collection.log</div>")
 
     $null = $sb.AppendLine("<div class='foot'>Generated $(Get-Date -Format u) by Ophira v$ScriptVersion - all verdicts are correlation heuristics; verify against raw CSV/evtx evidence before acting.</div>")
     $null = $sb.AppendLine("</body></html>")
@@ -3325,10 +3497,46 @@ function New-SiemExport {
         $o = [ordered]@{}; $o['ts'] = "$($StartTime.ToString('o'))"; $o['kind'] = 'delta_new'; $o['host'] = $base.host; $o['type'] = $d.Type; $o['item'] = $d.Item; $o['detail'] = $d.Detail; $o['caseid'] = $base.caseid
         $lines.Add(($o | ConvertTo-Json -Compress))
     }
+    foreach ($b in (Import-CaseCsv 'beacon_candidates')) {
+        $o = [ordered]@{}; $o['ts'] = "$($StartTime.ToString('o'))"; $o['kind'] = 'beacon'; $o['host'] = $base.host; $o['severity'] = $b.Severity; $o['process'] = $b.Process; $o['dest_ip'] = $b.RemoteIp; $o['dest_port'] = $b.Port; $o['interval_sec'] = $b.MedianIntervalSec; $o['regularity'] = $b.Regularity; $o['caseid'] = $base.caseid
+        $lines.Add(($o | ConvertTo-Json -Compress))
+    }
+    foreach ($u in (Import-CaseCsv 'usn_write_bursts')) {
+        $o = [ordered]@{}; $o['ts'] = "$($u.WindowStart)"; $o['kind'] = 'mass_modification'; $o['host'] = $base.host; $o['write_events'] = [int]"$($u.WriteEvents)"; $o['distinct_files'] = [int]"$($u.DistinctFiles)"; $o['caseid'] = $base.caseid
+        $lines.Add(($o | ConvertTo-Json -Compress))
+    }
+    if ($script:Verdict) {
+        $o = [ordered]@{}; $o['ts'] = "$($StartTime.ToString('o'))"; $o['kind'] = 'verdict'; $o['host'] = $base.host; $o['level'] = $script:Verdict.Level; $o['rank'] = $script:Verdict.LevelRank; $o['confidence'] = $script:Verdict.ConfidencePercent; $o['signals'] = @($script:Verdict.Signals).Count; $o['caseid'] = $base.caseid
+        $lines.Add(($o | ConvertTo-Json -Compress))
+    }
     if ($lines.Count -eq 0) { return }
     $out = Join-Path $CaseDir 'siem_export.ndjson'
     $lines | Set-Content -LiteralPath $out -Encoding UTF8
     Write-CaseLog "    siem export: $($lines.Count) records -> siem_export.ndjson" 'DarkGray'
+}
+
+function New-AttackLayer {
+    # MITRE ATT&CK Navigator layer (https://navigator.mitre.org) from hayabusa MitreTags
+    $tech = @{}
+    foreach ($r in (Import-CaseCsv 'hayabusa_timeline')) {
+        foreach ($m in [regex]::Matches("$($r.MitreTags)", 'T\d{4}(?:\.\d{3})?')) {
+            $k = $m.Value
+            if (-not $tech.ContainsKey($k)) { $tech[$k] = 0 }
+            $tech[$k]++
+        }
+    }
+    if ($tech.Count -eq 0) { return }
+    $techniques = @($tech.Keys | Sort-Object | ForEach-Object { [pscustomobject]@{ techniqueID = $_; score = $tech[$_]; comment = "$($tech[$_]) Sigma detection(s)" } })
+    $layer = [pscustomobject]@{
+        name        = "Ophira - $Computer$(if ($script:CurrentCaseID) { " ($($script:CurrentCaseID))" })"
+        domain      = 'enterprise-attack'
+        description = "Ophira v$ScriptVersion Sigma detections (hayabusa MitreTags)"
+        versions    = @{ navigator = '4.9'; layer = '4.5' }
+        techniques  = $techniques
+        layout      = @{ layout = 'side'; aggregateFunction = 'sum' }
+    }
+    $layer | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $CaseDir 'attack_layer.json') -Encoding UTF8
+    Write-CaseLog "    ATT&CK Navigator layer: $($tech.Count) techniques -> attack_layer.json" 'DarkGray'
 }
 
 function Invoke-DeltaCompare {
@@ -3565,7 +3773,6 @@ function New-Package {
     try { Invoke-DeltaCompare -Path $DeltaPath } catch { Write-CaseLog "    delta failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-SuperTimeline } catch { Write-CaseLog "    supertimeline failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-LoggingGaps } catch { Write-CaseLog "    logging gaps failed: $($_.Exception.Message)" 'DarkYellow' }
-    try { New-SiemExport } catch { Write-CaseLog "    siem export failed: $($_.Exception.Message)" 'DarkYellow' }
 
     $script:Verdict = $null
     try {
@@ -3583,6 +3790,9 @@ function New-Package {
             Write-CaseLog "    VERDICT: $($script:Verdict.Level) (confidence $($script:Verdict.ConfidencePercent)%) - $($script:Verdict.Signals.Count) signal(s), $($script:Verdict.Caveats.Count) caveat(s) -> verdict.json" $vColor
         }
     } catch { Write-CaseLog "    verdict engine failed: $($_.Exception.Message)" 'DarkYellow' }
+
+    try { New-SiemExport } catch { Write-CaseLog "    siem export failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-AttackLayer } catch { Write-CaseLog "    ATT&CK layer failed: $($_.Exception.Message)" 'DarkYellow' }
 
     try { New-HtmlReport | Out-Null } catch { Write-CaseLog "    report generation failed: $($_.Exception.Message)" 'DarkYellow' }
 
