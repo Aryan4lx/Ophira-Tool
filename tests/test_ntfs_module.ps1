@@ -29,9 +29,8 @@ function Save-Rows { param([string]$Name, $Rows) $script:saved[$Name] = $Rows }
 $script:callNo = 0
 function Invoke-NativeTool {
     param($ExePath, $ToolArgs)
-    $script:callNo++
     $outDir = $ToolArgs[([array]::IndexOf($ToolArgs, '--csv')) + 1]
-    if ($script:callNo -eq 1) {
+    if ("$($ToolArgs[1])" -match 'MFT$') {
         # MFTECmd $MFT output fixture (standard CSV columns)
         @'
 "EntryNumber","FileName","Extension","FileSize","ParentPath","IsDirectory","Created","LastModified"
@@ -67,17 +66,17 @@ function Check([string]$label, [bool]$ok) {
     else { $script:fail++; Write-Host "  [FAIL] $label" -ForegroundColor Red }
 }
 $mftKept = @($saved['mft_recent'])
-Check "mft_recent kept user-path exe (evil.exe)" (@($mftKept | Where-Object { $_.Name -eq 'evil.exe' }).Count -eq 1)
-Check "mft_recent kept recent system exe (svchost.exe)" (@($mftKept | Where-Object { $_.Name -eq 'svchost.exe' }).Count -eq 1)
-Check "mft_recent kept recent dropped.ps1" (@($mftKept | Where-Object { $_.Name -eq 'dropped.ps1' }).Count -eq 1)
+Check "mft_recent kept user-path exe (evil.exe, per drive)" (@($mftKept | Where-Object { $_.Name -eq 'evil.exe' }).Count -ge 1)
+Check "mft_recent kept recent system exe (svchost.exe)" (@($mftKept | Where-Object { $_.Name -eq 'svchost.exe' }).Count -ge 1)
+Check "mft_recent kept recent dropped.ps1" (@($mftKept | Where-Object { $_.Name -eq 'dropped.ps1' }).Count -ge 1)
 Check "mft_recent EXCLUDED .txt" (@($mftKept | Where-Object { $_.Name -eq 'notes.txt' }).Count -eq 0)
 Check "mft_recent EXCLUDED old non-user dll" (@($mftKept | Where-Object { $_.Name -eq 'old_thing.dll' }).Count -eq 0)
 Check "mft flags: evil.exe has user-path+exec" ("$(@($mftKept | Where-Object { $_.Name -eq 'evil.exe' })[0].Flags)" -match 'user-path' -and "$(@($mftKept | Where-Object { $_.Name -eq 'evil.exe' })[0].Flags)" -match 'exec')
 $bursts = @($saved['usn_write_bursts'])
-Check "exactly 1 burst window" ($bursts.Count -eq 1)
-Check "burst window = 2026-09-25 08:30" ($bursts.Count -eq 1 -and "$($bursts[0].WindowStart)" -eq '2026-09-25 08:30')
-Check "burst events = 1200" ($bursts.Count -eq 1 -and "$($bursts[0].WriteEvents)" -eq '1200')
-Check "burst distinct files = 150" ($bursts.Count -eq 1 -and "$($bursts[0].DistinctFiles)" -eq '150')
+Check "burst windows: 1 per NTFS drive" ($bursts.Count -ge 1 -and $bursts.Count -eq (@($bursts | Select-Object -ExpandProperty Drive -Unique)).Count)
+Check "burst window = 2026-09-25 08:30 (all drives)" (@($bursts | Where-Object { "$($_.WindowStart)" -eq '2026-09-25 08:30' }).Count -eq $bursts.Count)
+Check "burst events = 1200 (all drives)" (@($bursts | Where-Object { "$($_.WriteEvents)" -eq '1200' }).Count -eq $bursts.Count)
+Check "burst distinct files = 150 (all drives)" (@($bursts | Where-Object { "$($_.DistinctFiles)" -eq '150' }).Count -eq $bursts.Count)
 
 Write-Host ""
 Write-Host "RESULT: $pass passed, $fail failed" -ForegroundColor $(if ($fail -eq 0) { 'Green' } else { 'Red' })

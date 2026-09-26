@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.12  -  Windows Incident Response Triage Toolkit
+Ophira v2.13  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -32,7 +32,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.12"
+$ScriptVersion = "2.13"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -412,6 +412,8 @@ function Show-ToolLinks {
         [pscustomobject]@{ Tool = 'PECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 5.1 prefetch parse (run counts)' }
         [pscustomobject]@{ Tool = 'LECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.5 LNK parse (Recent docs)' }
         [pscustomobject]@{ Tool = 'JLECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.5 Jump List parse' }
+        [pscustomobject]@{ Tool = 'SBECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.8 ShellBags (folder browsing history)' }
+        [pscustomobject]@{ Tool = 'SQLECmd (EZ, .NET 9)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.7 browser SQLite parse (History/Downloads)' }
         [pscustomobject]@{ Tool = 'velociraptor (enterprise)'; Url = 'https://github.com/Velocidex/velociraptor/releases'; Use = 'if you move to always-on agent-based DFIR' }
     )
     $rows | Format-Table Tool, Url, Use -AutoSize | Out-String -Width 200 | Write-Host
@@ -434,6 +436,8 @@ function Invoke-SetupMode {
         [pscustomobject]@{ Name = 'PECmd';       Direct = 'https://download.ericzimmermanstools.com/PECmd.zip'; Zip = $true }
         [pscustomobject]@{ Name = 'LECmd';       Direct = 'https://download.ericzimmermanstools.com/LECmd.zip'; Zip = $true }
         [pscustomobject]@{ Name = 'JLECmd';      Direct = 'https://download.ericzimmermanstools.com/JLECmd.zip'; Zip = $true }
+        [pscustomobject]@{ Name = 'SBECmd';      Direct = 'https://download.ericzimmermanstools.com/SBECmd.zip'; Zip = $true }
+        [pscustomobject]@{ Name = 'SQLECmd';     Direct = 'https://download.ericzimmermanstools.com/net9/SQLECmd.zip'; Zip = $true }
         [pscustomobject]@{ Name = 'yara';        Repo = 'VirusTotal/yara-x';                 Pattern = '^yara-x-v[\d\.]+-x86_64-pc-windows-msvc\.zip$'; Zip = $true }
     )
     $installed = @()
@@ -2120,81 +2124,102 @@ $script:Modules = @(
             $tmp = Join-Path ([IO.Path]::GetTempPath()) ("ophira_ntfs_" + (Get-Date -Format 'HHmmss'))
             New-Item -ItemType Directory -Path $tmp -Force | Out-Null
             try {
-                # ---- $MFT: keep only executable-ish files in user paths or created recently (full listing discarded - too big for the case ZIP) ----
-                Write-CaseLog "    MFTECmd: parsing live `$MFT..." 'Cyan'
-                $null = Invoke-NativeTool -ExePath $mftExe.FullName -ToolArgs @('-f', "$env:SystemDrive\`$MFT", '--csv', $tmp, '--csvf', 'mft_full.csv')
-                $mftFull = Join-Path $tmp 'mft_full.csv'
-                if (Test-Path -LiteralPath $mftFull) {
-                    $exeExt = @('.exe', '.dll', '.ps1', '.bat', '.cmd', '.vbs', '.js', '.jar', '.hta', '.scr', '.msi', '.py', '.wsf', '.lnk')
-                    $cutoff = (Get-Date).AddDays(-30)   # ponytail: fixed 30-day recency ($LogHours is not seeded into worker runspaces)
-                    $hdr = @((Get-Content -LiteralPath $mftFull -First 1) -split ',' | ForEach-Object { $_.Trim(' "') })
-                    $colOf = {
-                        param([string]$pattern)
-                        @($hdr | Where-Object { $_ -match $pattern } | Select-Object -First 1)[0]
-                    }
-                    $cName = & $colOf '^FileName$'; $cParent = & $colOf 'ParentPath'; $cExt = & $colOf '^Extension$'
-                    $cCreated = & $colOf 'Created'; $cMod = & $colOf 'LastModified'; $cSize = & $colOf 'FileSize'; $cEntry = & $colOf 'EntryNumber'
-                    $keep = New-Object System.Collections.Generic.List[object]
-                    $total = 0
-                    Import-Csv -LiteralPath $mftFull | ForEach-Object {
-                        $total++
-                        $name = "$($_.$cName)"
-                        if (-not $name) { return }
-                        $ext = ("$($_.$cExt)").ToLower()
-                        if ($exeExt -notcontains $ext) { return }
-                        $parent = "$($_.$cParent)"
-                        $path = if ($parent) { "$parent\$name" } else { $name }
-                        $userPath = Test-IsUserWritablePath $path
-                        $created = $null; try { $created = [datetime]"$($_.$cCreated)" } catch { }
-                        $recent = ($created -and $created -ge $cutoff)
-                        if (-not ($userPath -or $recent)) { return }
-                        $flags = @('exec'); if ($userPath) { $flags += 'user-path' }; if ($recent) { $flags += 'recent' }
-                        $keep.Add([pscustomobject]@{ Entry = "$($_.$cEntry)"; Created = "$($_.$cCreated)"; LastModified = "$($_.$cMod)"; Size = "$($_.$cSize)"; Name = $name; Path = $path; Flags = ($flags -join ';') })
-                    }
-                    $out5 = $keep.ToArray()
-                    if ($out5.Count -gt 5000) { $out5 = $out5[0..4999] }
-                    Save-Rows -Name 'mft_recent' -Rows $out5
-                    Write-CaseLog "    MFT: $total entries scanned, $($keep.Count) executable/user-path/recent kept -> csv\mft_recent.csv" 'Gray'
-                    Remove-Item -LiteralPath $mftFull -Force -ErrorAction SilentlyContinue
-                } else { Write-CaseLog "    MFT parse produced no output (not elevated? non-NTFS volume?) - skipped" 'DarkYellow' }
-
-                # ---- USN journal: per-minute write bursts = ransomware-style mass modification ----
-                Write-CaseLog "    MFTECmd: reading live USN journal..." 'Cyan'
-                $null = Invoke-NativeTool -ExePath $mftExe.FullName -ToolArgs @('-f', "$env:SystemDrive\`$Extend\`$J", '--csv', $tmp, '--csvf', 'usn_full.csv')
-                $usnFull = Join-Path $tmp 'usn_full.csv'
+                $exeExt = @('.exe', '.dll', '.ps1', '.bat', '.cmd', '.vbs', '.js', '.jar', '.hta', '.scr', '.msi', '.py', '.wsf', '.lnk')
+                $cutoff = (Get-Date).AddDays(-30)   # ponytail: fixed 30-day recency ($LogHours is not seeded into worker runspaces)
+                $ransomExt = @('.locked', '.locky', '.crypt', '.crypto', '.enc', '.encrypted', '.enc1', '.cry', '.cerber', '.wallet', '.onion', '.aes', '.rsa', '.mallox', '.pha', '.devos', '.mkp', '.faust', '.elh', '.ransom', '.payform', '.locked1')
+                $keep = New-Object System.Collections.Generic.List[object]
+                $mftTotal = 0
                 $bursts = @()
-                if (Test-Path -LiteralPath $usnFull) {
-                    $uHdr = @((Get-Content -LiteralPath $usnFull -First 1) -split ',' | ForEach-Object { $_.Trim(' "') })
-                    $uCol = {
-                        param([string]$pattern)
-                        @($uHdr | Where-Object { $_ -match $pattern } | Select-Object -First 1)[0]
-                    }
-                    $tCol = & $uCol 'time'; $rCol = & $uCol 'reason'; $nCol = & $uCol 'sourcefile|^file'
-                    if ($tCol -and $rCol) {
-                        # ponytail: >=1000 write-reason events/min across >=100 distinct files = burst window (heuristic; big installs/updates can trigger too)
-                        $min = @{}
-                        Import-Csv -LiteralPath $usnFull | ForEach-Object {
-                            $reason = "$($_.$rCol)"
-                            if ($reason -notmatch 'DataExtend|Truncate|BasicInfoChange') { return }
-                            $t = $null; try { $t = [datetime]"$($_.$tCol)" } catch { }
-                            if (-not $t) { return }
-                            $k = $t.ToString('yyyy-MM-dd HH:mm')
-                            if (-not $min.ContainsKey($k)) { $min[$k] = @{ Events = 0; Files = @{} } }
-                            $min[$k].Events++
-                            if ($nCol) { $f = "$($_.$nCol)"; if ($f -and -not $min[$k].Files.ContainsKey($f)) { $min[$k].Files[$f] = $true } }
+                $drives = @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | Where-Object { $_.Free -ne $null })
+                foreach ($d in $drives) {
+                    $dl = "$($d.Name):"
+                    $isNtfs = $true
+                    try { $v = Get-Volume -DriveLetter $d.Name -ErrorAction Stop; if ("$($v.FileSystem)" -and "$($v.FileSystem)" -ne 'NTFS') { $isNtfs = $false } } catch { }
+                    if (-not $isNtfs) { Write-CaseLog "    drive $dl not NTFS - skipped" 'DarkGray'; continue }
+                    $dlLower = $d.Name.ToLower()
+
+                    # ---- $MFT per drive: keep only executable-ish files in user paths or created recently ----
+                    Write-CaseLog "    MFTECmd: parsing live `$MFT on $dl..." 'Cyan'
+                    $null = Invoke-NativeTool -ExePath $mftExe.FullName -ToolArgs @('-f', "$($d.Root)`$MFT", '--csv', $tmp, '--csvf', "mft_full.csv")
+                    $mftFull = Join-Path $tmp 'mft_full.csv'
+                    if (Test-Path -LiteralPath $mftFull) {
+                        $hdr = @((Get-Content -LiteralPath $mftFull -First 1) -split ',' | ForEach-Object { $_.Trim(' "') })
+                        $colOf = {
+                            param([string]$pattern)
+                            @($hdr | Where-Object { $_ -match $pattern } | Select-Object -First 1)[0]
                         }
-                        foreach ($k in @($min.Keys | Sort-Object)) {
-                            if ($min[$k].Events -ge 1000 -and $min[$k].Files.Count -ge 100) {
-                                $bursts += [pscustomobject]@{ WindowStart = $k; WriteEvents = $min[$k].Events; DistinctFiles = $min[$k].Files.Count }
+                        $cName = & $colOf '^FileName$'; $cParent = & $colOf 'ParentPath'; $cExt = & $colOf '^Extension$'
+                        $cCreated = & $colOf 'Created'; $cMod = & $colOf 'LastModified'; $cSize = & $colOf 'FileSize'; $cEntry = & $colOf 'EntryNumber'
+                        Import-Csv -LiteralPath $mftFull | ForEach-Object {
+                            $mftTotal++
+                            $name = "$($_.$cName)"
+                            if (-not $name) { return }
+                            $ext = ("$($_.$cExt)").ToLower()
+                            if ($exeExt -notcontains $ext) { return }
+                            $parent = "$($_.$cParent)"
+                            $path = if ($parent) { "$parent\$name" } else { $name }
+                            $userPath = Test-IsUserWritablePath $path
+                            $created = $null; try { $created = [datetime]"$($_.$cCreated)" } catch { }
+                            $recent = ($created -and $created -ge $cutoff)
+                            if (-not ($userPath -or $recent)) { return }
+                            $flags = @('exec'); if ($userPath) { $flags += 'user-path' }; if ($recent) { $flags += 'recent' }
+                            $keep.Add([pscustomobject]@{ Drive = $dl; Entry = "$($_.$cEntry)"; Created = "$($_.$cCreated)"; LastModified = "$($_.$cMod)"; Size = "$($_.$cSize)"; Name = $name; Path = $path; Flags = ($flags -join ';') })
+                        }
+                        Remove-Item -LiteralPath $mftFull -Force -ErrorAction SilentlyContinue
+                    } else { Write-CaseLog "    MFT parse on $dl produced no output (not elevated?)" 'DarkYellow' }
+
+                    # ---- USN journal per drive: per-minute write bursts + ransomware-extension check ----
+                    Write-CaseLog "    MFTECmd: reading live USN journal on $dl..." 'Cyan'
+                    $null = Invoke-NativeTool -ExePath $mftExe.FullName -ToolArgs @('-f', "$($d.Root)`$Extend\`$J", '--csv', $tmp, '--csvf', 'usn_full.csv')
+                    $usnFull = Join-Path $tmp 'usn_full.csv'
+                    if (Test-Path -LiteralPath $usnFull) {
+                        $uHdr = @((Get-Content -LiteralPath $usnFull -First 1) -split ',' | ForEach-Object { $_.Trim(' "') })
+                        $uCol = {
+                            param([string]$pattern)
+                            @($uHdr | Where-Object { $_ -match $pattern } | Select-Object -First 1)[0]
+                        }
+                        $tCol = & $uCol 'time'; $rCol = & $uCol 'reason'; $nCol = & $uCol 'sourcefile|^file'
+                        if ($tCol -and $rCol) {
+                            # ponytail: >=1000 write-reason events/min across >=100 distinct files = burst window (heuristic; big installs/updates can trigger too)
+                            $min = @{}
+                            Import-Csv -LiteralPath $usnFull | ForEach-Object {
+                                $reason = "$($_.$rCol)"
+                                $isWrite = ($reason -match 'DataExtend|Truncate|BasicInfoChange')
+                                $isNew = ($reason -match 'FileCreate|RenameNewName')
+                                if (-not $isWrite -and -not $isNew) { return }
+                                $t = $null; try { $t = [datetime]"$($_.$tCol)" } catch { }
+                                if (-not $t) { return }
+                                $k = $t.ToString('yyyy-MM-dd HH:mm')
+                                if (-not $min.ContainsKey($k)) { $min[$k] = @{ Events = 0; Files = @{}; Ext = @{} } }
+                                if ($isWrite) { $min[$k].Events++ }
+                                if ($nCol) {
+                                    $f = "$($_.$nCol)"
+                                    if ($f) {
+                                        if (-not $min[$k].Files.ContainsKey($f)) { $min[$k].Files[$f] = $true }
+                                        if ($isNew) {
+                                            $fe = [IO.Path]::GetExtension($f).ToLower()
+                                            if ($fe -and $ransomExt -contains $fe) { $min[$k].Ext[$fe] = $true }
+                                        }
+                                    }
+                                }
+                            }
+                            foreach ($k in @($min.Keys | Sort-Object)) {
+                                if ($min[$k].Events -ge 1000 -and $min[$k].Files.Count -ge 100) {
+                                    $bursts += [pscustomobject]@{ WindowStart = $k; Drive = $dl; WriteEvents = $min[$k].Events; DistinctFiles = $min[$k].Files.Count; RansomExt = (($min[$k].Ext.Keys | Sort-Object) -join ';') }
+                                }
                             }
                         }
+                        Remove-Item -LiteralPath $usnFull -Force -ErrorAction SilentlyContinue
                     }
-                    Remove-Item -LiteralPath $usnFull -Force -ErrorAction SilentlyContinue
                 }
+                $out5 = $keep.ToArray()
+                if ($out5.Count -gt 5000) { $out5 = $out5[0..4999] }
+                Save-Rows -Name 'mft_recent' -Rows $out5
+                Write-CaseLog "    MFT: $mftTotal entries scanned across $($drives.Count) drive(s), $($keep.Count) executable/user-path/recent kept -> csv\mft_recent.csv" 'Gray'
                 Save-Rows -Name 'usn_write_bursts' -Rows $bursts
                 if (@($bursts).Count -gt 0) {
                     Write-CaseLog "    USN: $(@($bursts).Count) mass-modification window(s) >=1000 writes/min - POSSIBLE RANSOMWARE -> csv\usn_write_bursts.csv" 'Red'
-                    foreach ($b in @($bursts | Select-Object -First 5)) { Write-CaseLog "      $($b.WindowStart): $($b.WriteEvents) writes over $($b.DistinctFiles) files" 'Red' }
+                    foreach ($b in @($bursts | Select-Object -First 5)) { Write-CaseLog "      $($b.WindowStart) [$($b.Drive)]: $($b.WriteEvents) writes over $($b.DistinctFiles) files$(if ("$($b.RansomExt)") { " RANSOM-EXT: $($b.RansomExt)" })" 'Red' }
                 } else { Write-CaseLog "    USN journal analyzed - no mass-modification windows" 'Gray' }
             } finally {
                 Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -2278,6 +2303,19 @@ $script:Modules = @(
                         $pn = ($plugin -split '\.')[-1]
                         Write-CaseLog "    vol3 quick pass: $pn" 'Cyan'
                         & $vol.FullName -f $dump -r json $plugin 2>$null | Set-Content -LiteralPath (Join-Path $anDir "$pn.json") -Encoding UTF8
+                    }
+                    Write-CaseLog "    vol3: malfind (injected-code regions)..." 'Cyan'
+                    $mfCsv = Join-Path $CsvDir 'memory_malfind.csv'
+                    & $vol.FullName -f $dump -r csv windows.malfind.Malfind 2>$null | Set-Content -LiteralPath $mfCsv -Encoding UTF8
+                    $mfN = 0
+                    try { $mfN = @(Import-Csv -LiteralPath $mfCsv -ErrorAction Stop).Count } catch { $mfN = 0 }
+                    if ($mfN -gt 0) {
+                        Write-CaseLog "    MALFIND: $mfN suspicious memory region(s) -> csv\memory_malfind.csv" 'Red'
+                        & $vol.FullName -f $dump -r csv windows.netscan.NetScan 2>$null | Set-Content -LiteralPath (Join-Path $CsvDir 'memory_netscan.csv') -Encoding UTF8
+                    } else {
+                        Write-CaseLog "    vol3 malfind: no suspicious regions" 'Gray'
+                        Remove-Item -LiteralPath $mfCsv -Force -ErrorAction SilentlyContinue
+                        "# no entries" | Set-Content -LiteralPath $mfCsv -Encoding UTF8
                     }
                 }
             } else {
@@ -2559,6 +2597,138 @@ $script:Modules = @(
             Save-Rows -Name 'browser_files' -Rows $inv
             $mb = [math]::Round((($inv | Measure-Object Bytes -Sum).Sum) / 1MB, 1)
             Write-CaseLog "    browser: $($inv.Count) file(s) ($mb MB) saved to raw\browser\ (SQLite parsed offline)" 'Gray'
+            # ---- parse the copied SQLite DBs (SQLECmd; .NET 9 on target needed - degrades gracefully) ----
+            $tDir = Get-ToolsDir
+            $sqlExe = $null
+            if ($tDir) { $sqlExe = Get-ChildItem -Path $tDir -Recurse -Filter 'SQLECmd*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1 }
+            if ($sqlExe -and @($inv | Where-Object { $_.File -eq 'History' }).Count -gt 0) {
+                Write-CaseLog "    SQLECmd: parsing browser history/downloads..." 'Cyan'
+                $null = Invoke-NativeTool -ExePath $sqlExe.FullName -ToolArgs @('-d', $dst, '--csv', $CsvDir)
+                $merge = {
+                    param([string]$glob, [string]$name)
+                    $files = @(Get-ChildItem -Path $CsvDir -Filter $glob -File -ErrorAction SilentlyContinue)
+                    $all = @()
+                    foreach ($f2 in $files) {
+                        try { $all += @(Import-Csv -LiteralPath $f2.FullName -ErrorAction Stop) } catch { }
+                    }
+                    if ($all.Count -gt 0) { Save-Rows -Name $name -Rows $all }
+                    foreach ($f2 in $files) { Remove-Item -LiteralPath $f2.FullName -Force -ErrorAction SilentlyContinue }
+                    return $all.Count
+                }
+                $nH = & $merge '*ChromiumBrowser_HistoryVisits_*.csv' 'browser_history'
+                $nD = & $merge '*ChromiumBrowser_Downloads_*.csv' 'browser_downloads'
+                $nK = & $merge '*ChromiumBrowser_KeywordSearches_*.csv' 'browser_searches'
+                Get-ChildItem -Path $CsvDir -Filter 'SQLite.Interop.dll' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                Write-CaseLog "    browser parsed: $nH visits, $nD downloads, $nK searches -> csv\browser_*.csv" 'Gray'
+                # IOC domain cross-check
+                $iocs = Get-IocList
+                if ($iocs -and $iocs.Domains.Count -gt 0) {
+                    $hist = Import-CaseCsv 'browser_history'
+                    $hits = @()
+                    foreach ($r in $hist) {
+                        $u = "$($r.URL)"
+                        if (-not $u) { continue }
+                        $hm = [regex]::Match($u, '^(?i)https?://([^/:]+)')
+                        if (-not $hm.Success) { continue }
+                        $host2 = $hm.Groups[1].Value.ToLower()
+                        foreach ($k in $iocs.Domains.Keys) {
+                            if ($host2 -eq $k -or $host2.EndsWith(".$k")) {
+                                $hits += [pscustomobject]@{ Indicator = $k; Host = $host2; URL = $u; Title = "$($r.URLTitle)"; Match = 'browser-history' }
+                                break
+                            }
+                        }
+                    }
+                    Save-Rows -Name 'ioc_hits_browser' -Rows $hits
+                    if (@($hits).Count -gt 0) { Write-CaseLog "    BROWSER IOC HITS: $(@($hits).Count) domain(s) from your IOC list in browser history -> csv\ioc_hits_browser.csv" 'Red' }
+                }
+            } elseif (-not $sqlExe) {
+                Write-CaseLog "    SQLECmd not in tools\ - browser DBs left as raw copies (parse at HQ or run Setup)" 'DarkGray'
+            }
+        } }
+    [pscustomobject]@{ Id = '8.8'; Cat = 'CONTEXT'; Name = 'ShellBags - folder browsing history (needs tools\SBECmd, admin)'; Default = $true; Quick = $false;
+        Run = {
+            $tDir = Get-ToolsDir
+            if (-not $tDir) { Write-CaseLog "    no tools\ - skipping" 'DarkGray'; return }
+            $sbe = Get-ChildItem -Path $tDir -Recurse -Filter 'SBECmd*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $sbe) { Write-CaseLog "    SBECmd not in tools\ - skipping (run Setup)" 'DarkGray'; return }
+            Write-CaseLog "    SBECmd: parsing ShellBags for all user profiles..." 'Cyan'
+            $null = Invoke-NativeTool -ExePath $sbe.FullName -ToolArgs @('-d', "$env:SystemDrive\Users", '--csv', $CsvDir)
+            $f = Get-ChildItem -Path $CsvDir -Filter 'shellbags*.csv' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($f) {
+                $rows = @(Import-Csv -LiteralPath $f.FullName -ErrorAction SilentlyContinue)
+                Save-Rows -Name 'shellbags' -Rows $rows
+                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+                Write-CaseLog "    shellbags: $($rows.Count) folder-access entries -> csv\shellbags.csv" 'Gray'
+            } else { Write-CaseLog "    SBECmd produced no output (not elevated? no profiles?)" 'DarkYellow' }
+        } }
+    [pscustomobject]@{ Id = '8.9'; Cat = 'CONTEXT'; Name = 'Security posture audit (LSA, SMBv1, RDP, PS logging, UAC, Defender, BitLocker)'; Default = $true; Quick = $true;
+        Run = {
+            $rows = New-Object System.Collections.Generic.List[object]
+            function Add-Posture([string]$Check, [string]$Status, [string]$Detail) {
+                $rows.Add([pscustomobject]@{ Check = $Check; Status = $Status; Detail = $Detail })
+            }
+            $rp = {
+                param([string]$path, [string]$prop)
+                try { $v = (Get-ItemProperty -Path $path -ErrorAction Stop).$prop; if ($null -ne $v) { return "$v" } } catch { }
+                return $null
+            }
+            # LSA Protection (credential theft / mimikatz resistance)
+            $ppl = & $rp 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RunAsPPL'
+            if ($ppl -eq '1') { Add-Posture 'LSA Protection (RunAsPPL)' 'GOOD' 'Credential guard for LSASS enabled' }
+            else { Add-Posture 'LSA Protection (RunAsPPL)' 'BAD' 'LSASS runs unprotected - credential dumping (mimikatz) is easier; set RunAsPPL=1' }
+            # NTLM LAN Manager auth level
+            $lm = & $rp 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LmCompatibilityLevel'
+            if ($null -eq $lm) { Add-Posture 'NTLM compatibility level' 'WARN' 'Default level in place - verify NTLMv1 is rejected (level 5)' }
+            elseif ([int]$lm -ge 5) { Add-Posture 'NTLM compatibility level' 'GOOD' "Level $lm - NTLMv1 refused" }
+            else { Add-Posture 'NTLM compatibility level' 'BAD' "Level $lm - weak NTLMv1/LM responses allowed" }
+            # SMBv1
+            $smb1 = & $rp 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'SMB1'
+            $mrx = & $rp 'HKLM:\SYSTEM\CurrentControlSet\Services\MrxSmb10' 'Start'
+            if ($smb1 -eq '1' -or $mrx -eq '0') { Add-Posture 'SMBv1 protocol' 'BAD' 'SMBv1 enabled - EternalBlue/WannaCry-class exposure; disable it' }
+            else { Add-Posture 'SMBv1 protocol' 'GOOD' 'SMBv1 disabled/absent' }
+            # RDP + NLA
+            $rdp = & $rp 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections'
+            if ($rdp -eq '0') {
+                $nla = & $rp 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 'UserAuthentication'
+                if ($nla -eq '0') { Add-Posture 'RDP' 'BAD' 'RDP enabled WITHOUT Network Level Authentication - brute-force friendly' }
+                else { Add-Posture 'RDP' 'WARN' "RDP enabled with NLA - verify firewall scope + account lockout" }
+            } else { Add-Posture 'RDP' 'GOOD' 'RDP disabled' }
+            # PowerShell script-block logging
+            $sbl = & $rp 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' 'EnableScriptBlockLogging'
+            if ($sbl -eq '1') { Add-Posture 'PowerShell script-block logging' 'GOOD' 'EID 4104 capture enabled' }
+            else { Add-Posture 'PowerShell script-block logging' 'BAD' 'Script-block logging off - PowerShell attacks leave little evidence; enable via GPO' }
+            # UAC
+            $lua = & $rp 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'EnableLUA'
+            $cpb = & $rp 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'ConsentPromptBehaviorAdmin'
+            if ($lua -eq '0') { Add-Posture 'UAC' 'BAD' 'UAC disabled entirely' }
+            elseif ($cpb -eq '0') { Add-Posture 'UAC' 'WARN' 'UAC elevation without prompt (silent admin)' }
+            else { Add-Posture 'UAC' 'GOOD' 'UAC enabled with prompts' }
+            # Defender posture
+            try {
+                if (Get-Command Get-MpPreference -ErrorAction SilentlyContinue) {
+                    $mp = Get-MpPreference -ErrorAction Stop
+                    $exs = @(@($mp.ExclusionPath) + @($mp.ExclusionProcess) + @($mp.ExclusionExtension) | Where-Object { $_ })
+                    if (@($exs).Count -gt 0) { Add-Posture 'Defender exclusions' 'WARN' "$(@($exs).Count) exclusion(s) configured - attackers add these; review: $(@($exs | Select-Object -First 3) -join ', ')" }
+                    else { Add-Posture 'Defender exclusions' 'GOOD' 'No exclusions' }
+                    if ($mp.DisableRealtimeMonitoring) { Add-Posture 'Defender real-time protection' 'BAD' 'Real-time protection DISABLED' }
+                }
+            } catch { }
+            $wd = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
+            if ($wd -and $wd.StartType -eq 'Disabled') { Add-Posture 'Defender service' 'BAD' 'WinDefend service is Disabled' }
+            # BitLocker (OS volume)
+            try {
+                $bl = & manage-bde.exe -status C: 2>$null | Where-Object { $_ -match 'Protection Status' } | Select-Object -First 1
+                if ("$bl" -match 'On') { Add-Posture 'BitLocker (OS volume)' 'GOOD' 'Protection on' }
+                elseif ("$bl" -match 'Off') { Add-Posture 'BitLocker (OS volume)' 'WARN' 'Disk not encrypted - offline tampering/theft exposure' }
+            } catch { }
+            # WinRM trusted hosts
+            $th = & $rp 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN' 'TrustedHosts'
+            if ("$th" -match '\*' -or "$th" -match '[^0-9a-fA-F:\.].*,.*') { Add-Posture 'WinRM TrustedHosts' 'WARN' "Broad trust list: $th" }
+            Save-Rows -Name 'posture' -Rows $rows.ToArray()
+            $bad = @($rows.ToArray() | Where-Object { $_.Status -eq 'BAD' }).Count
+            $warn = @($rows.ToArray() | Where-Object { $_.Status -eq 'WARN' }).Count
+            if ($bad -gt 0) { Write-CaseLog "    posture: $($rows.Count) checks - $bad BAD, $warn WARN -> csv\posture.csv (see report hardening recommendations)" 'Yellow' }
+            else { Write-CaseLog "    posture: $($rows.Count) checks - no critical findings, $warn warn -> csv\posture.csv" 'Gray' }
         } }
 )
 
@@ -2809,6 +2979,10 @@ function New-HtmlReport {
     $savedCreds = @(Import-CaseCsv 'saved_credentials.csv')
     $rdpTgt = @(Import-CaseCsv 'rdp_client_targets.csv')
     $bitsJobs = @(Import-CaseCsv 'bits_jobs.csv')
+    $posture = @(Import-CaseCsv 'posture.csv')
+    $memMfR = @(Import-CaseCsv 'memory_malfind.csv')
+    $browserIocR = @(Import-CaseCsv 'ioc_hits_browser.csv')
+    $postureBad = @($posture | Where-Object { $_.Status -eq 'BAD' })
 
     function Get-LvlRank([string]$l) {
         switch -Regex ("$l") { 'crit' { 5; break } 'high' { 4; break } 'med' { 3; break } 'low' { 2; break } default { 1 } }
@@ -3292,6 +3466,32 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         }
         $null = $sb.AppendLine("</table><div class='meta'>BITS is abused for stealthy persistence/download. Source: csv\bits_jobs.csv</div>")
     }
+    if ($memMfR.Count -gt 0) {
+        $snapAny = $true
+        $null = $sb.AppendLine("<h3>Memory analysis: malfind (possible code injection)</h3><table><tr><th>Process</th><th>PID</th><th>Protection</th></tr>")
+        foreach ($m in ($memMfR | Select-Object -First 20)) {
+            $null = $sb.AppendLine("<tr><td class='crit'>$(ConvertTo-HtmlEsc $m.Process)</td><td>$(ConvertTo-HtmlEsc $m.PID)</td><td>$(ConvertTo-HtmlEsc $m.Protection)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Malfind flags VAD regions with RWX attributes - verify with a full memory workup (false positives possible for legit packed software). Source: csv\memory_malfind.csv</div>")
+    }
+    if ($browserIocR.Count -gt 0) {
+        $snapAny = $true
+        $null = $sb.AppendLine("<h3>Browser history IOC hits (visited IOC-listed domains)</h3><table><tr><th>Domain</th><th>URL</th><th>Title</th></tr>")
+        foreach ($b2 in ($browserIocR | Select-Object -First 20)) {
+            $null = $sb.AppendLine("<tr><td class='crit'>$(ConvertTo-HtmlEsc $b2.Indicator)</td><td class='path'>$(ConvertTo-HtmlEsc $b2.URL)</td><td>$(ConvertTo-HtmlEsc $b2.Title)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>A visit is not proof of compromise - but phishing/initial-access often starts here. Source: csv\ioc_hits_browser.csv</div>")
+    }
+    if ($posture.Count -gt 0) {
+        $snapAny = $true
+        $null = $sb.AppendLine("<h3>Security posture (hardening audit)</h3><table><tr><th>Status</th><th>Check</th><th>Detail</th></tr>")
+        $postureSorted = @($posture | Sort-Object @{e = { switch -Regex ("$($_.Status)") { 'BAD' { 0 } 'WARN' { 1 } default { 2 } } } })
+        foreach ($p2 in $postureSorted) {
+            $stCls = switch ("$($p2.Status)") { 'BAD' { 'crit' } 'WARN' { 'med' } default { 'info' } }
+            $null = $sb.AppendLine("<tr><td class='$stCls'><b>$(ConvertTo-HtmlEsc $p2.Status)</b></td><td>$(ConvertTo-HtmlEsc $p2.Check)</td><td>$(ConvertTo-HtmlEsc $p2.Detail)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Weak posture = attack path. BAD findings are listed in the recommendations below. Source: csv\posture.csv</div>")
+    }
     if (-not $snapAny) { $null = $sb.AppendLine("<div class='meta'>No snapshot data captured (relevant modules skipped).</div>") }
 
     # ---------- recommendations ----------
@@ -3305,6 +3505,9 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     }
     if ($brute.Count -gt 0) {
         $recs.Add('Brute-force sources observed - check whether any 4625 failure was followed by a 4624 success from the same IP (csv\security_auth_events.csv), and enforce account lockout policy.')
+    }
+    foreach ($pb in $postureBad) {
+        $recs.Add("Hardening: $($pb.Check) - $($pb.Detail)")
     }
     if (-not $Sysmon) {
         $recs.Add('Deploy Sysmon with a community configuration (e.g. SwiftOnSecurity) to gain process/network/image-load telemetry needed for ATT&CK-level detection.')
@@ -3394,6 +3597,14 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'usn_write_bursts'                = 'USN journal: mass file-modification windows (ransomware)'
         'lnk_parsed'                      = 'LNK parse (Recent docs - what files were opened)'
         'jumplist_parsed*'                = 'Jump List parse (per-app recent files)'
+        'shellbags'                       = 'ShellBags folder-browsing history - folder access incl. deleted/network/USB locations'
+        'browser_history'                 = 'Parsed browser history (URLs, titles, visit times)'
+        'browser_downloads'               = 'Parsed browser downloads (files, sources, times)'
+        'browser_searches'                = 'Browser search keywords'
+        'ioc_hits_browser'                = 'IOC-listed domains observed in browser data'
+        'posture'                         = 'Security hardening audit (LSA/SMBv1/RDP/PS logging/UAC/Defender/BitLocker)'
+        'memory_malfind'                  = 'Volatility malfind - hidden/injected memory regions'
+        'memory_netscan'                  = 'Volatility netscan - network artifacts found in RAM'
         'recyclebin'                      = 'RBCmd recycle bin parse (original paths + delete times)'
         'srum_usage'                      = 'SRUM: per-app resource/network usage over weeks'
         'logging_gaps'                    = 'Log clear/stop events + evtx coverage gaps'
@@ -3503,6 +3714,14 @@ function New-SiemExport {
     }
     foreach ($u in (Import-CaseCsv 'usn_write_bursts')) {
         $o = [ordered]@{}; $o['ts'] = "$($u.WindowStart)"; $o['kind'] = 'mass_modification'; $o['host'] = $base.host; $o['write_events'] = [int]"$($u.WriteEvents)"; $o['distinct_files'] = [int]"$($u.DistinctFiles)"; $o['caseid'] = $base.caseid
+        $lines.Add(($o | ConvertTo-Json -Compress))
+    }
+    foreach ($m in (Import-CaseCsv 'memory_malfind')) {
+        $o = [ordered]@{}; $o['ts'] = "$($StartTime.ToString('o'))"; $o['kind'] = 'malfind'; $o['host'] = $base.host; $o['process'] = $m.Process; $o['pid'] = $m.PID; $o['caseid'] = $base.caseid
+        $lines.Add(($o | ConvertTo-Json -Compress))
+    }
+    foreach ($b in (Import-CaseCsv 'ioc_hits_browser')) {
+        $o = [ordered]@{}; $o['ts'] = "$($StartTime.ToString('o'))"; $o['kind'] = 'browser_ioc'; $o['host'] = $base.host; $o['indicator'] = $b.Indicator; $o['url'] = $b.URL; $o['caseid'] = $base.caseid
         $lines.Add(($o | ConvertTo-Json -Compress))
     }
     if ($script:Verdict) {
@@ -3630,6 +3849,8 @@ function Get-CompromiseVerdict {
     $beacons = Import-CaseCsv 'beacon_candidates'
     $usnBursts = Import-CaseCsv 'usn_write_bursts'
     $asep = Import-CaseCsv 'asep_sweep'
+    $memMf = Import-CaseCsv 'memory_malfind'
+    $browserIoc = Import-CaseCsv 'ioc_hits_browser'
 
     $levelNames = @{ 4 = 'COMPROMISED'; 3 = 'LIKELY COMPROMISED'; 2 = 'SUSPICIOUS'; 1 = 'NO EVIDENCE OF COMPROMISE'; 0 = 'INCONCLUSIVE' }
 
@@ -3649,14 +3870,17 @@ function Get-CompromiseVerdict {
     $beaconHi = @($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' }).Count
     $beaconMed = @($beacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
     $usnBurstN = @($usnBursts).Count
+    $rExt = ((@($usnBursts) | Where-Object { "$($_.RansomExt)" } | ForEach-Object { "$($_.RansomExt)" } | Sort-Object -Unique) -join ',')
     # ponytail: COM hijacks + StartupApproved excluded from the signal (per-user COM has many legit users, e.g. Teams/OneDrive); they stay report-visible
     $asepHotN = @($asep | Where-Object { $_.Flags -match 'user-path|nondefault' -and "$($_.Category)" -notmatch 'ComHijack|StartupApproved' }).Count
 
     Add-Signal 'IOC hit - historical execution (amcache SHA1)' 4 @($iocAmc).Count "near-certain true positive evidence"
     Add-Signal 'YARA hit - high/critical rule' 4 $yaraHi (($yara | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'C2 beaconing - highly regular callbacks' 3 $beaconHi (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp):$($_.Port) every ~$($_.MedianIntervalSec)s" }) -join '; ')
-    Add-Signal 'Ransomware-like mass file modification (USN journal)' 3 $usnBurstN (($usnBursts | Select-Object -First 3 | ForEach-Object { "$($_.WindowStart): $($_.WriteEvents) writes / $($_.DistinctFiles) files" }) -join '; ')
+    Add-Signal 'Ransomware-like mass file modification (USN journal)' 3 $usnBurstN ((($usnBursts | Select-Object -First 3 | ForEach-Object { "$($_.WindowStart): $($_.WriteEvents) writes / $($_.DistinctFiles) files" }) -join '; ') + $(if ($rExt) { " - RANSOM EXTENSIONS: $rExt" }))
     Add-Signal 'Uncommon persistence mechanism (IFEO/AppInit/Winlogon/netsh/LSA)' 2 $asepHotN (($asep | Where-Object { $_.Flags -match 'user-path|nondefault' -and "$($_.Category)" -notmatch 'ComHijack|StartupApproved' } | Select-Object -First 3 | ForEach-Object { "$($_.Category): $($_.Name) = $($_.Value)" }) -join '; ')
+    Add-Signal 'Memory malfind indicators (injected code regions)' 2 @($memMf).Count (($memMf | Select-Object -First 3 | ForEach-Object { "$($_.Process)($($_.PID))" }) -join '; ')
+    Add-Signal 'IOC domain observed in browser history' 2 @($browserIoc).Count (($browserIoc | Select-Object -First 3 | ForEach-Object { $_.Indicator }) -join '; ')
     Add-Signal 'IOC hit - live system' 3 @($iocLive).Count (($iocLive | Select-Object -First 3 | ForEach-Object { $_.Indicator }) -join '; ')
     Add-Signal 'Sigma detection - critical' 3 $hayCrit (($hay | Where-Object { "$($_.Level)" -match 'crit' } | Select-Object -First 3 | ForEach-Object { $_.RuleTitle }) -join '; ')
     Add-Signal 'YARA hit - medium rule' 2 $yaraMed (($yara | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
@@ -3959,7 +4183,7 @@ function Invoke-SetupWizard {
     Write-Host ""
     Write-Host "=== Setup companion tools ===" -ForegroundColor Cyan
     Write-Host "Tools live in tools\ subfolders. Available:" -ForegroundColor Gray
-    Write-Host "  winpmem  hayabusa  volatility3  chainsaw  AmcacheParser  RBCmd  MFTECmd  PECmd  LECmd  JLECmd  yara" -ForegroundColor White
+    Write-Host "  winpmem  hayabusa  volatility3  chainsaw  AmcacheParser  RBCmd  MFTECmd  PECmd  LECmd  JLECmd  SBECmd  SQLECmd  yara" -ForegroundColor White
     Write-Host "ENTER = walk through all tools (confirm each download)," 
     Write-Host "or give a comma-separated list (e.g. hayabusa,winpmem)."
     $inp = (Read-Host "Tools [all]").Trim()

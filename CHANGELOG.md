@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.13
+- **Security posture audit** (module 8.9): LSA Protection, NTLM level, SMBv1, RDP+NLA, PowerShell script-block logging, UAC, Defender exclusions/real-time/service, BitLocker, WinRM TrustedHosts → `posture.csv`; BAD findings become hardening actions in the report recommendations
+- **ShellBags** (module 8.8): folder-browsing history via SBECmd → `shellbags.csv` (attacker folder traversal incl. deleted/USB locations)
+- **Browser parse** (module 8.7): SQLECmd on raw-copied Chrome/Edge DBs → `browser_history.csv` / `browser_downloads.csv` / `browser_searches.csv` + **IOC domain cross-check** → `ioc_hits_browser.csv` (verdict signal floor 2)
+- **USN ransomware extensions** (module 5.5): suspicious new extensions (`.locked`, `.enc`, `.crypt*`, …) during mass-modification bursts enrich the Impact signal
+- **Multi-drive NTFS forensics** (module 5.5): $MFT + USN now parsed on every fixed NTFS volume (Drive column added)
+- **Memory quick-pass** (module 7.1): volatility malfind → `memory_malfind.csv` (verdict signal floor 2) + netscan on hits
+- Tools bundled: SBECmd, SQLECmd (.NET 9 required for SQLECmd — degrades gracefully); new SIEM kinds `malfind`, `browser_ioc`
+
 ## v2.12
 - Report completeness: **evidence index** — every CSV with row counts + "what to look for" guidance + pointers to supertimeline/SIEM/verdict/layer files
 - Host snapshot section: Defender state + detection history, stored credentials, outbound RDP targets, BITS jobs
