@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.15
+- **`-Mode Parse`** (new mode + menu item 8): analyst-side completion of a collected case — re-runs the raw-driven parsers from your kit (AmcacheParser/RBCmd/PECmd/LECmd/JLECmd/SQLECmd, chainsaw execution history, hayabusa detection pack) against the case's `raw\` evidence, then regenerates supertimeline, verdict, SIEM export and `report.html`; zip inputs are repacked in place. Closes the contractor flow: endpoint does what it can, one command finishes the rest
+- **`csv\parse_needed.csv`**: for every missing artifact — parser, .NET requirement, whether the raw evidence shipped, and the exact way to finish it (endpoint-only vs `-Mode Parse`); shown in the report evidence index
+- **`case.json` records the endpoint's .NET inventory** (`DotNet`: Framework 4.x release + .NET 9 desktop runtime presence) — EZ parsers need 4.x, SQLECmd needs .NET 9
+- **Full-preset full-NTFS preservation**: module 5.5 keeps unfiltered `mft_full_<drive>.csv` / `usn_full_<drive>.csv` under `raw\analysis\` for analyst-side work; auto-skipped when the endpoint has <10 GB free (Standard/Quick stay lean)
+- Verdict confidence in Parse mode now uses the **endpoint's** recorded elevation (not the analyst PC's)
+- Shared `Invoke-RegenerateOutputs` (New-Package + Parse mode) and `Invoke-BrowserIocXref` (module 8.7 + Parse mode)
+
 ## v2.14
 - **DNS beaconing** (module 4.8 + 4.3): Sysmon EID 22 DNS queries parsed → `sysmon_dns.csv`; same periodicity engine applied per process+domain → `dns_beacon_candidates.csv`; verdict signals (high=floor 3, medium=floor 2), report section, domains+resolved IPs in IOC block, SIEM kind `dns_beacon`
 - **`-Mode Tune`** (new mode + menu item 6): shows top-hit Sigma rules from the newest case, exclude (`exclude_rules.txt`) or demote (`level_tuning.txt`) — hayabusa-native formats that travel with Deploy `-PushTools`

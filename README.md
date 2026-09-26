@@ -4,7 +4,7 @@
 
 **Read-only by design** — never kills processes, never deletes files, never modifies the system. Only reads and copies.
 
-## One script, five modes
+## One script, every role covered
 
 ```powershell
 # COLLECT (default) - triage the machine this runs on:
@@ -25,11 +25,12 @@
 # ANALYZE - merge any number of OPHIRA_*.zip into one fleet view (+ Sigma timeline):
 .\Ophira.ps1 -Mode Analyze -AnalyzePath .\collections
 
-# SETUP / LINKS / UPDATERULES / TUNE:
+# SETUP / LINKS / UPDATERULES / TUNE / PARSE:
 .\Ophira.ps1 -Mode Setup -SetupTools hayabusa,AmcacheParser,RBCmd,loldrivers
 .\Ophira.ps1 -Mode Links
 .\Ophira.ps1 -Mode UpdateRules       # refresh hayabusa Sigma rules
 .\Ophira.ps1 -Mode Tune              # pick noisy Sigma rules -> exclude/demote (travels with -PushTools)
+.\Ophira.ps1 -Mode Parse -ParsePath .\OPHIRA_HOST_20260926_120000.zip   # finish a case on YOUR pc
 ```
 
 **Owner handoff:** send the whole folder. They double-click `RUN-OPHIRA.bat`, accept UAC, wait 3-5 minutes. A folder window opens with the result file selected and its path is copied to the clipboard — they paste it into an email. If you pre-fill `ophira.config.txt` (SHARE=/CASE=/ANALYST=), results upload to your share automatically and there's literally nothing to send.
@@ -38,7 +39,7 @@
 
 Running `.\Ophira.ps1` bare (no flags) first asks **who is using the tool**:
 
-- `[1] Security / IR team` → **task menu**: collect this PC · push & run on remote PCs · analyze collected results · setup tools · update rules · **tune Sigma rules** · tool links. Deploy and Analyze are guided wizards (targets, credentials, depth, share — plain questions with `[defaults]`, confirm summary, then the existing parallel engine runs). Deploy has an **advanced options** prompt (Full depth, log analysis window, host parallelism). After each task you return to the menu.
+- `[1] Security / IR team` → **task menu**: collect this PC · push & run on remote PCs · analyze collected results · setup tools · update rules · **tune Sigma rules** · tool links · **finish a collected case (analyst-side parse)**. Deploy and Analyze are guided wizards (targets, credentials, depth, share — plain questions with `[defaults]`, confirm summary, then the existing parallel engine runs). Deploy has an **advanced options** prompt (Full depth, log analysis window, host parallelism). After each task you return to the menu.
 - `[2] The security team asked me to run this` → the guided automatic owner flow (same as the .bat).
 
 Flags always win: `-SimpleUI`, `-NoMenu`, or any explicit `-Mode` skips the gate entirely, so automation and `RUN-OPHIRA.bat` behave exactly as before. Non-interactive sessions never see the gate.
@@ -70,6 +71,26 @@ Wizard answers are remembered only when you answer **y** to "Remember these answ
    - DEFENDER — detections, exclusions, status, operational log
    - MEMORY — optional RAM capture (winpmem), optional Volatility 3 quick pass (pslist/cmdline/svcscan + **malfind** → verdict signal + netscan on hits)
 3. **Packaging** — SHA256 manifest (per file + package + script self-hash + tool inventory), `case.json`, **compromise verdict** (`verdict.json`: 5-level verdict + coverage-weighted confidence + signals + caveats), `report.html`, **supertimeline.csv** (all events merged chronologically), **delta_new.csv** (new findings vs previous collection), **siem_export.ndjson** (Splunk/Elastic-ready records incl. verdict/beacon/mass-modification), **attack_layer.json** (MITRE ATT&CK Navigator layer — load at navigator.mitre.org), **logging_gaps.csv** (log cleared/stopped + evtx gap tamper check), ZIP
+
+## Endpoint vs analyst-side parsing
+
+The bundled forensic parsers run **on the endpoint during collection** so the case zip arrives with ready-made CSVs, verdict and report. Their inputs are **also preserved raw**, so anything the endpoint couldn't finish (tool missing, .NET too old, module skipped, non-admin) can be finished on your PC:
+
+```
+.\Ophira.ps1 -Mode Parse -ParsePath .\OPHIRA_HOST_20260926_120000.zip
+```
+
+One command re-runs the raw-driven parsers from *your* kit (AmcacheParser, RBCmd, PECmd, LECmd, JLECmd, SQLECmd + chainsaw + the hayabusa detection pack) against the case's `raw\` evidence, then regenerates supertimeline, verdict, SIEM export and `report.html`. Zip inputs are repacked in place.
+
+Every collection also writes **`csv\parse_needed.csv`**: for each missing artifact it names the parser, the .NET requirement, whether the raw evidence is even in the zip, and the exact way to finish it — so ".NET 9 missing on endpoint" is never confused with "module skipped". `case.json` records the endpoint's .NET inventory (`DotNet`).
+
+| Parser | .NET need | Raw input shipped in the zip |
+|---|---|---|
+| AmcacheParser / RBCmd / PECmd / LECmd / JLECmd / SBECmd / MFTECmd | .NET 4.x (OS-built-in on Win8.1+) | yes (except MFTECmd: live-volume only) |
+| SQLECmd | .NET 9 desktop runtime (often absent - parse analyst-side) | yes (`raw\browser\`) |
+| hayabusa / chainsaw (Rust) | none | yes (`raw\evtx\`, `raw\registry\`) |
+
+Full NTFS preservation: the `Full` preset additionally keeps the **unfiltered** `mft_full_<drive>.csv` / `usn_full_<drive>.csv` under `raw\analysis\` (auto-skipped if the endpoint has <10 GB free) - big servers on Standard stay lean, deep dives get everything.
 
 ## Compromise verdict (v2.6)
 
@@ -147,6 +168,7 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 - [x] Report completeness: evidence index + snapshots; ATT&CK Navigator layers; SIEM verdict/beacon/USN records (v2.12)
 - [x] Research-driven Phase F: posture audit w/ hardening recs, ShellBags, browser parse + IOC xref, ransomware extensions, multi-drive NTFS, malfind quick-pass (v2.13)
 - [x] Detection depth: DNS beaconing (EID 22), `-Mode Tune` Sigma FP feedback, LOLDrivers hash xref, hayabusa 4.1 wins (extract-base64 command recovery, RDP logon summary, sort-csv dedupe) (v2.14)
+- [x] Analyst-side completion: `-Mode Parse` (finish a case on your PC), `parse_needed.csv` honesty + endpoint .NET inventory, Full-preset full-NTFS preservation (v2.15)
 - [ ] Real-host pilot run (validate hayabusa timing + MFTECmd on live volume)
 - [ ] Role-based presets (WebServer / DC / Workstation)
 

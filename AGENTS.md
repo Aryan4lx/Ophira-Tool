@@ -27,12 +27,13 @@ CI (GitHub Actions, `windows-latest`) runs the same suite on every push.
 - Test harnesses extract functions/modules from Ophira.ps1 by regex: `(?s)function NAME \{.*?\r?\n\}` (column-0 closing brace) and `(?s)Id = 'N.N';.*?Run = \{(.*?)\r?\n        \} \}\r?\n    \[pscustomobject\]@\{ Id = '<NEXT>'`.
 
 ## Architecture map (all inside Ophira.ps1)
-- Top: param block → PS<5 gate → config load (`ophira.config.txt`) → helpers → `Show-RoleGate`/`Show-TaskMenu`/wizards → `-Mode` dispatch.
+- Top: param block → PS<5 gate → config load (`ophira.config.txt`) → helpers → `Show-RoleGate`/`Show-TaskMenu`/wizards → `-Mode` dispatch (incl. `Tune`, `Parse`).
 - Modules: array of `[pscustomobject]@{ Id; Cat; Name; Default; Quick; Run = { ... } }` (IDs 2.x persistence, 3.x network, 4.x logs, 5.x artifacts, 6.x defender, 7.x memory, 8.x context).
 - Execution: `Invoke-SelectedModules` phases A (volatile, sequential) → B (parallel pool) → C/CI (heavy analytics pool); workers get functions rehydrated from `$script:SharedFunctions` + seed vars (CaseDir/CsvDir/RawDir/MemDir/Computer/Preset, `$script:LogHours`). New module-only helpers must be added to `$script:SharedFunctions` or they silently don't exist in workers.
 - IO: `Save-Rows -Name x -Rows $r` → `csv\x.csv` (writes `# no entries` marker when empty — `Import-CaseCsv` returns `@()` for missing/marker files). Raw copies → `raw\<sub>\`.
 - Verdict: `Get-CompromiseVerdict` — `Add-Signal name floor count detail`, coverage `Add-Cov name present weight`; floors: 4=near-certain IOC/YARA-high, 3=strong (live IOC, crit Sigma, beacon-high, USN bursts), 2=suspicious, two strong signals escalate to 3. NOT every artifact deserves a signal (avoid FP storms — e.g. COM hijacks stay report-only).
 - Report: `New-HtmlReport` imports every CSV at top, renders sections with nav anchors; verdict computed BEFORE report in `New-Package`.
+- Derived artifacts (supertimeline/gaps/parse_needed/verdict/SIEM/layer/report) are rebuilt by the shared `Invoke-RegenerateOutputs` — called by `New-Package` AND `-Mode Parse` (analyst-side completion; adopts case identity via `$script:` case vars, uses `$script:EndpointAdmin` for verdict elevation context).
 - Fixture tests: extract real functions/modules from the script, stub `Save-Rows`/`Invoke-NativeTool`/`Write-CaseLog`, feed synthetic CSVs, assert on captured rows / rendered HTML. Keep one `tests\test_*.ps1` per feature.
 
 ## Floor & dependencies

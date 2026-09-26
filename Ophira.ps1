@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.14  -  Windows Incident Response Triage Toolkit
+Ophira v2.15  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -7,7 +7,7 @@ by a responder during early triage / threat hunting.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links', 'UpdateRules', 'Tune')]
+    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links', 'UpdateRules', 'Tune', 'Parse')]
     [string]$Mode = 'Collect',
     [string]$CaseID = "",
     [string]$Analyst = "",
@@ -26,13 +26,14 @@ param(
     [string]$TargetsFile = '',
     [int]$MaxThreads = 8,
     [string]$AnalyzePath = '.',
+    [string]$ParsePath = '',
     [string]$HayabusaPath = '',
     [string]$DeltaPath = '',
     [string[]]$SetupTools,
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.14"
+$ScriptVersion = "2.15"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -1282,12 +1283,85 @@ function Invoke-NativeTool {
     }
 }
 
+function Get-DotNetRelease {
+    # Endpoint .NET inventory - EZ parsers need .NET 4.x; SQLECmd needs the .NET 9 desktop runtime.
+    $parts = @()
+    try {
+        $r = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -Name Release -ErrorAction Stop).Release
+        $v = '4.6+'
+        foreach ($k in @(533320, 528040, 461808, 461308, 460798, 394802)) {
+            if ($r -ge $k) { $v = @{ 533320 = '4.8.1'; 528040 = '4.8'; 461808 = '4.7.2'; 461308 = '4.7.1'; 460798 = '4.7'; 394802 = '4.6.2' }[$k]; break }
+        }
+        $parts += ".NET Framework $v (release $r)"
+    } catch { $parts += '.NET Framework: not detected' }
+    $nine = $false
+    try {
+        $dn = Get-Command dotnet.exe -ErrorAction SilentlyContinue
+        if ($dn) { $nine = @((& dotnet.exe --list-runtimes 2>$null) | Where-Object { "$_" -match 'WindowsDesktop\.App 9\.' }).Count -gt 0 }
+    } catch { }
+    $parts += if ($nine) { '.NET 9 desktop runtime: present' } else { '.NET 9 desktop runtime: absent' }
+    return ($parts -join '; ')
+}
+
+function Invoke-BrowserIocXref {
+    # Cross-checks parsed browser history against the IOC domain list (module 8.7 and -Mode Parse).
+    $iocs = Get-IocList
+    if (-not $iocs -or $iocs.Domains.Count -eq 0) { return }
+    $hist = Import-CaseCsv 'browser_history'
+    $hits = @()
+    foreach ($r in $hist) {
+        $u = "$($r.URL)"
+        if (-not $u) { continue }
+        $hm = [regex]::Match($u, '^(?i)https?://([^/:]+)')
+        if (-not $hm.Success) { continue }
+        $host2 = $hm.Groups[1].Value.ToLower()
+        foreach ($k in $iocs.Domains.Keys) {
+            if ($host2 -eq $k -or $host2.EndsWith(".$k")) {
+                $hits += [pscustomobject]@{ Indicator = $k; Host = $host2; URL = $u; Title = "$($r.URLTitle)"; Match = 'browser-history' }
+                break
+            }
+        }
+    }
+    Save-Rows -Name 'ioc_hits_browser' -Rows $hits
+    if (@($hits).Count -gt 0) { Write-CaseLog "    BROWSER IOC HITS: $(@($hits).Count) domain(s) from your IOC list in browser history -> csv\ioc_hits_browser.csv" 'Red' }
+}
+
+function Get-ParseNeeds {
+    # For every expected artifact that is missing, say WHY and how to finish it
+    # (endpoint-only source vs analyst-side re-parse via -Mode Parse).
+    $dn = Get-DotNetRelease
+    $nineOk = "$dn" -match '9 desktop runtime: present'
+    $caps = @(
+        @{ Artifact = 'amcache.csv';            Parser = 'AmcacheParser'; Net = 'net4'; Input = 'registry\Amcache.hve'; Live = $false }
+        @{ Artifact = 'recyclebin.csv';         Parser = 'RBCmd';         Net = 'net4'; Input = 'recyclebin';           Live = $false }
+        @{ Artifact = 'prefetch_parsed.csv';    Parser = 'PECmd';         Net = 'net4'; Input = 'prefetch';             Live = $false }
+        @{ Artifact = 'lnk_parsed.csv';         Parser = 'LECmd';         Net = 'net4'; Input = 'recent';               Live = $false }
+        @{ Artifact = 'jumplist_parsed*.csv';   Parser = 'JLECmd';        Net = 'net4'; Input = 'jumplists';            Live = $false }
+        @{ Artifact = 'browser_history.csv';    Parser = 'SQLECmd';       Net = 'net9'; Input = 'browser';              Live = $false }
+        @{ Artifact = 'execution_timeline.csv'; Parser = 'chainsaw';      Net = 'none'; Input = 'registry\SYSTEM.hiv';  Live = $false }
+        @{ Artifact = 'hayabusa_timeline.csv';  Parser = 'hayabusa';      Net = 'none'; Input = 'evtx';                 Live = $false }
+        @{ Artifact = 'shellbags.csv';          Parser = 'SBECmd';        Net = 'net4'; Input = 'live C:\Users';        Live = $true }
+        @{ Artifact = 'mft_recent.csv';         Parser = 'MFTECmd';       Net = 'net4'; Input = 'live volume (admin)';  Live = $true }
+    )
+    $rows = @()
+    foreach ($c in $caps) {
+        if (Test-Path (Join-Path $CsvDir $c.Artifact)) { continue }
+        if ($c.Live) { $how = 'endpoint-only source - rerun collection elevated on the host' }
+        elseif (-not (Test-Path (Join-Path $RawDir $c.Input))) { $how = 'raw evidence not collected (module skipped on endpoint)' }
+        elseif ($c.Net -eq 'net9' -and -not $nineOk) { $how = 'endpoint lacks .NET 9 - run on analyst PC: Ophira.ps1 -Mode Parse -Path <case>' }
+        else { $how = 'tool was missing on endpoint - run on analyst PC: Ophira.ps1 -Mode Parse -Path <case>' }
+        $rows += [pscustomobject]@{ Artifact = $c.Artifact; Parser = $c.Parser; DotNet = $c.Net; RawInput = $c.Input; HowToFinish = $how }
+    }
+    Save-Rows -Name 'parse_needed' -Rows $rows
+    if ($rows.Count -gt 0) { Write-CaseLog "    $($rows.Count) artifact(s) unfinished on endpoint - see csv\parse_needed.csv (-Mode Parse completes most of them analyst-side)" 'Yellow' }
+}
+
 $script:SharedFunctions = @(
     'Get-KitRoot', 'Get-ToolsDir', 'Get-LogStart', 'Get-IocList', 'Test-TrustedPublisher',
     'Save-Rows', 'Out-RawText', 'Invoke-ExeCapture', 'Invoke-NativeTool', 'Get-WmiOrCim', 'Convert-WmiDate',
     'Test-IsPublicIp', 'Test-IsUserWritablePath', 'Get-SignatureInfo', 'Get-SysmonState',
     'Get-UserProfileList', 'Get-UserAssistRows', 'ConvertTo-Rot13', 'Get-FilteredEvents', 'Export-Evtx',
-    'Import-CaseCsv'
+    'Import-CaseCsv', 'Invoke-BrowserIocXref'
 )
 
 $script:ModuleWorkerText = @'
@@ -2205,6 +2279,18 @@ $script:Modules = @(
                 $exeExt = @('.exe', '.dll', '.ps1', '.bat', '.cmd', '.vbs', '.js', '.jar', '.hta', '.scr', '.msi', '.py', '.wsf', '.lnk')
                 $cutoff = (Get-Date).AddDays(-30)   # ponytail: fixed 30-day recency ($LogHours is not seeded into worker runspaces)
                 $ransomExt = @('.locked', '.locky', '.crypt', '.crypto', '.enc', '.encrypted', '.enc1', '.cry', '.cerber', '.wallet', '.onion', '.aes', '.rsa', '.mallox', '.pha', '.devos', '.mkp', '.faust', '.elh', '.ransom', '.payform', '.locked1')
+                $keepFull = {
+                    # Full preset only: preserve the unfiltered parser output for analyst-side work (skips when disk is tight).
+                    param($srcCsv, $outName)
+                    $root = [IO.Path]::GetPathRoot($CaseDir).TrimEnd('\')
+                    $free = 0
+                    try { $free = (Get-PSDrive -Name ($root.TrimEnd(':')) -ErrorAction Stop).Free } catch { }
+                    if ($free -lt 10GB) { Write-CaseLog "    Full preset: under 10GB free on $root - skipping full NTFS preservation" 'DarkYellow'; return }
+                    $an = Join-Path $RawDir 'analysis'
+                    if (-not (Test-Path $an)) { New-Item -ItemType Directory -Path $an -Force | Out-Null }
+                    Copy-Item -LiteralPath $srcCsv -Destination (Join-Path $an $outName) -Force
+                    Write-CaseLog "    Full preset: preserved $outName -> raw\analysis\ (full $([math]::Round((Get-Item -LiteralPath $srcCsv).Length / 1MB, 1)) MB)" 'Gray'
+                }
                 $keep = New-Object System.Collections.Generic.List[object]
                 $mftTotal = 0
                 $bursts = @()
@@ -2243,6 +2329,7 @@ $script:Modules = @(
                             $flags = @('exec'); if ($userPath) { $flags += 'user-path' }; if ($recent) { $flags += 'recent' }
                             $keep.Add([pscustomobject]@{ Drive = $dl; Entry = "$($_.$cEntry)"; Created = "$($_.$cCreated)"; LastModified = "$($_.$cMod)"; Size = "$($_.$cSize)"; Name = $name; Path = $path; Flags = ($flags -join ';') })
                         }
+                        if ("$Preset" -eq 'Full') { & $keepFull $mftFull "mft_full_$($d.Name).csv" }
                         Remove-Item -LiteralPath $mftFull -Force -ErrorAction SilentlyContinue
                     } else { Write-CaseLog "    MFT parse on $dl produced no output (not elevated?)" 'DarkYellow' }
 
@@ -2287,6 +2374,7 @@ $script:Modules = @(
                                 }
                             }
                         }
+                        if ("$Preset" -eq 'Full') { & $keepFull $usnFull "usn_full_$($d.Name).csv" }
                         Remove-Item -LiteralPath $usnFull -Force -ErrorAction SilentlyContinue
                     }
                 }
@@ -2698,27 +2786,7 @@ $script:Modules = @(
                 $nK = & $merge '*ChromiumBrowser_KeywordSearches_*.csv' 'browser_searches'
                 Get-ChildItem -Path $CsvDir -Filter 'SQLite.Interop.dll' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
                 Write-CaseLog "    browser parsed: $nH visits, $nD downloads, $nK searches -> csv\browser_*.csv" 'Gray'
-                # IOC domain cross-check
-                $iocs = Get-IocList
-                if ($iocs -and $iocs.Domains.Count -gt 0) {
-                    $hist = Import-CaseCsv 'browser_history'
-                    $hits = @()
-                    foreach ($r in $hist) {
-                        $u = "$($r.URL)"
-                        if (-not $u) { continue }
-                        $hm = [regex]::Match($u, '^(?i)https?://([^/:]+)')
-                        if (-not $hm.Success) { continue }
-                        $host2 = $hm.Groups[1].Value.ToLower()
-                        foreach ($k in $iocs.Domains.Keys) {
-                            if ($host2 -eq $k -or $host2.EndsWith(".$k")) {
-                                $hits += [pscustomobject]@{ Indicator = $k; Host = $host2; URL = $u; Title = "$($r.URLTitle)"; Match = 'browser-history' }
-                                break
-                            }
-                        }
-                    }
-                    Save-Rows -Name 'ioc_hits_browser' -Rows $hits
-                    if (@($hits).Count -gt 0) { Write-CaseLog "    BROWSER IOC HITS: $(@($hits).Count) domain(s) from your IOC list in browser history -> csv\ioc_hits_browser.csv" 'Red' }
-                }
+                Invoke-BrowserIocXref
             } elseif (-not $sqlExe) {
                 Write-CaseLog "    SQLECmd not in tools\ - browser DBs left as raw copies (parse at HQ or run Setup)" 'DarkGray'
             }
@@ -3772,6 +3840,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'recyclebin'                      = 'RBCmd recycle bin parse (original paths + delete times)'
         'srum_usage'                      = 'SRUM: per-app resource/network usage over weeks'
         'logging_gaps'                    = 'Log clear/stop events + evtx coverage gaps'
+        'parse_needed'                    = 'Artifacts not finished on the endpoint + exactly how to finish them (-Mode Parse)'
         'delta_new'                       = 'Findings NEW since the previous collection'
         'supertimeline'                   = 'All event sources merged chronologically - the master timeline'
     }
@@ -4102,7 +4171,7 @@ function Get-CompromiseVerdict {
     Add-Cov 'RAM capture (bonus)' (Test-Path $MemDir) 3
     $coverageRaw = 0
     foreach ($c in $cov) { if ($c.Collected) { $coverageRaw += $c.Weight } }
-    $isAdminRun = Test-IsAdmin
+    $isAdminRun = if ($null -ne $script:EndpointAdmin) { [bool]$script:EndpointAdmin } else { Test-IsAdmin }
     if (-not $isAdminRun) { $coverageRaw -= 15 }
     if ($coverageRaw -gt 100) { $coverageRaw = 100 }
     if ($coverageRaw -lt 0) { $coverageRaw = 0 }
@@ -4157,6 +4226,35 @@ function Get-CompromiseVerdict {
     }
 }
 
+function Invoke-RegenerateOutputs {
+    # Shared by New-Package and -Mode Parse: rebuilds every derived artifact from csv\
+    # (supertimeline, gaps, parse_needed, verdict.json, SIEM export, ATT&CK layer, report.html).
+    param([pscustomobject]$Case)
+    try { New-SuperTimeline } catch { Write-CaseLog "    supertimeline failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-LoggingGaps } catch { Write-CaseLog "    logging gaps failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { Get-ParseNeeds } catch { Write-CaseLog "    parse-needed check failed: $($_.Exception.Message)" 'DarkYellow' }
+    $script:Verdict = $null
+    try {
+        $script:Verdict = Get-CompromiseVerdict
+        if ($script:Verdict) {
+            $script:Verdict | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $CaseDir 'verdict.json') -Encoding UTF8
+            if ($Case) {
+                $Case | Add-Member -NotePropertyName Verdict -NotePropertyValue ([pscustomobject]@{
+                    Level = $script:Verdict.Level
+                    ConfidencePercent = $script:Verdict.ConfidencePercent
+                    SignalCount = $script:Verdict.Signals.Count
+                    CaveatCount = $script:Verdict.Caveats.Count
+                }) -Force
+            }
+            $vColor = switch ($script:Verdict.LevelRank) { 4 { 'Red' } 3 { 'Red' } 2 { 'Yellow' } 1 { 'Green' } default { 'DarkYellow' } }
+            Write-CaseLog "    VERDICT: $($script:Verdict.Level) (confidence $($script:Verdict.ConfidencePercent)%) - $($script:Verdict.Signals.Count) signal(s), $($script:Verdict.Caveats.Count) caveat(s) -> verdict.json" $vColor
+        }
+    } catch { Write-CaseLog "    verdict engine failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-SiemExport } catch { Write-CaseLog "    siem export failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-AttackLayer } catch { Write-CaseLog "    ATT&CK layer failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-HtmlReport | Out-Null } catch { Write-CaseLog "    report generation failed: $($_.Exception.Message)" 'DarkYellow' }
+}
+
 function New-Package {
     Write-Host ""
     Write-CaseLog "Packaging case folder..." 'Cyan'
@@ -4173,6 +4271,7 @@ function New-Package {
         AdminElevated = (Test-IsAdmin)
         SysmonPresent = (Get-SysmonState)
         LogHours = $LogHours
+        DotNet = (Get-DotNetRelease)
         OutputFolder = $CaseDir
     }
     if ($script:ModuleTimings) {
@@ -4182,30 +4281,8 @@ function New-Package {
     $case | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $CaseDir 'case.json') -Encoding UTF8
 
     try { Invoke-DeltaCompare -Path $DeltaPath } catch { Write-CaseLog "    delta failed: $($_.Exception.Message)" 'DarkYellow' }
-    try { New-SuperTimeline } catch { Write-CaseLog "    supertimeline failed: $($_.Exception.Message)" 'DarkYellow' }
-    try { New-LoggingGaps } catch { Write-CaseLog "    logging gaps failed: $($_.Exception.Message)" 'DarkYellow' }
-
-    $script:Verdict = $null
-    try {
-        $script:Verdict = Get-CompromiseVerdict
-        if ($script:Verdict) {
-            $script:Verdict | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $CaseDir 'verdict.json') -Encoding UTF8
-            $case | Add-Member -NotePropertyName Verdict -NotePropertyValue ([pscustomobject]@{
-                Level = $script:Verdict.Level
-                ConfidencePercent = $script:Verdict.ConfidencePercent
-                SignalCount = $script:Verdict.Signals.Count
-                CaveatCount = $script:Verdict.Caveats.Count
-            }) -Force
-            $case | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $CaseDir 'case.json') -Encoding UTF8
-            $vColor = switch ($script:Verdict.LevelRank) { 4 { 'Red' } 3 { 'Red' } 2 { 'Yellow' } 1 { 'Green' } default { 'DarkYellow' } }
-            Write-CaseLog "    VERDICT: $($script:Verdict.Level) (confidence $($script:Verdict.ConfidencePercent)%) - $($script:Verdict.Signals.Count) signal(s), $($script:Verdict.Caveats.Count) caveat(s) -> verdict.json" $vColor
-        }
-    } catch { Write-CaseLog "    verdict engine failed: $($_.Exception.Message)" 'DarkYellow' }
-
-    try { New-SiemExport } catch { Write-CaseLog "    siem export failed: $($_.Exception.Message)" 'DarkYellow' }
-    try { New-AttackLayer } catch { Write-CaseLog "    ATT&CK layer failed: $($_.Exception.Message)" 'DarkYellow' }
-
-    try { New-HtmlReport | Out-Null } catch { Write-CaseLog "    report generation failed: $($_.Exception.Message)" 'DarkYellow' }
+    Invoke-RegenerateOutputs -Case $case
+    if ($script:Verdict) { $case | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $CaseDir 'case.json') -Encoding UTF8 }
 
     $manifest = @()
     $manifest += "Ophira v$ScriptVersion evidence manifest"
@@ -4349,6 +4426,7 @@ function Show-TaskMenu {
         Write-Host "   [5]  Update detection rules (hayabusa)" -ForegroundColor Yellow
         Write-Host "   [6]  Tune Sigma rules (reduce false positives)" -ForegroundColor Yellow
         Write-Host "   [7]  Tool links" -ForegroundColor Yellow
+        Write-Host "   [8]  Finish a collected case (parse evidence analyst-side)" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "   [Q]  Quit" -ForegroundColor DarkGray
         Write-Host ""
@@ -4362,6 +4440,7 @@ function Show-TaskMenu {
             '^(?i)5$' { return 'UpdateRules' }
             '^(?i)6$' { return 'Tune' }
             '^(?i)7$' { return 'Links' }
+            '^(?i)8$' { return 'Parse' }
             '^(?i)q$' { return $null }
             default { }
         }
@@ -4480,6 +4559,129 @@ function Invoke-TuneMode {
     Write-Host ""
     Write-Host "Tune done: $nEx excluded, $nLv demoted (written into tools\hayabusa rules\config)." -ForegroundColor $(if ($nEx + $nLv -gt 0) { 'Green' } else { 'Gray' })
     Write-Host "These settings travel with Deploy (-PushTools) to every host. Re-run a collection to see the effect." -ForegroundColor Gray
+    return $true
+}
+
+function Invoke-ParseMode {
+    # Analyst-side completion: run THIS kit's parsers over a case's raw\ evidence and
+    # regenerate everything the endpoint couldn't finish (tool missing, .NET gap, skipped module).
+    # Only reads raw\ inputs - never touches the analyst's own system state as evidence.
+    param([string]$Path)
+    Write-Host ""
+    Write-Host "=== Finish a collected case (analyst-side parsing) ===" -ForegroundColor Cyan
+    if (-not $Path) { $Path = (Read-Host "  Case folder or OPHIRA_*.zip path").Trim(' "') }
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { Write-Host "  Path not found: $Path" -ForegroundColor Red; return $false }
+    $tmp = $null
+    $caseDirP = $Path
+    if ((Test-Path -LiteralPath $Path -PathType Leaf) -and $Path -match '\.zip$') {
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ("ophira_parse_" + (Get-Date -Format 'HHmmss'))
+        if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+            [IO.Compression.ZipFile]::ExtractToDirectory($Path, $tmp)
+        } catch { Write-Host "  cannot extract zip: $($_.Exception.Message)" -ForegroundColor Red; return $false }
+        $caseDirP = $tmp
+    }
+    $meta = $null
+    $cj = Join-Path $caseDirP 'case.json'
+    if (Test-Path $cj) { try { $meta = Get-Content $cj -Raw | ConvertFrom-Json } catch { } }
+    if (-not $meta) { Write-Host "  case.json not found - not an Ophira case folder?" -ForegroundColor Red; if ($tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }; return $false }
+
+    # adopt the case identity so every shared function operates on the case, not this PC
+    $script:CaseDir = $caseDirP
+    $script:CsvDir = Join-Path $caseDirP 'csv'
+    $script:RawDir = Join-Path $caseDirP 'raw'
+    $script:MemDir = Join-Path $caseDirP 'memory'
+    $script:CaseLog = Join-Path $caseDirP 'collection.log'
+    $script:Computer = "$($meta.Computer)"
+    $script:CurrentCaseID = "$($meta.CaseID)"
+    $script:CurrentAnalyst = "$($meta.Analyst)"
+    $script:LogHours = $(if ($meta.LogHours) { [int]$meta.LogHours } else { 168 })
+    $script:Sysmon = [bool]$meta.SysmonPresent
+    $script:EndpointAdmin = [bool]$meta.AdminElevated
+    $st = $null
+    try { $st = [datetime]"$($meta.StartedUTC)" } catch { }
+    if (-not $st) { $st = Get-Date }
+    $script:StartTime = $st
+    Add-Content -LiteralPath $script:CaseLog -Encoding UTF8 -Value ("[{0}] === analyst parse session (Ophira v{1}) ===" -f (Get-Date -Format 'HH:mm:ss'), $ScriptVersion)
+    Write-Host "  Case: $($meta.Computer)  collected $($meta.StartedUTC)  ($($meta.Tool))" -ForegroundColor Gray
+    $before = @(Get-ChildItem -LiteralPath $script:CsvDir -Filter '*.csv' -File -ErrorAction SilentlyContinue).Count
+
+    # 1) modules that read ONLY raw\ evidence - reuse the real module code verbatim
+    foreach ($id in @('4.6', '5.4', '8.4')) {
+        $m = $script:Modules | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+        if ($m) {
+            Write-Host "  module ${id}: $($m.Name)" -ForegroundColor Cyan
+            try { & $m.Run } catch { Write-Host "    failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+        }
+    }
+
+    # 2) parse-only halves of the copy+parse modules (their raw inputs ship inside the zip)
+    $tDir = Get-ToolsDir
+    $findTool = {
+        param($filter)
+        if ($tDir) { Get-ChildItem -Path $tDir -Recurse -Filter $filter -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
+    }
+    $runTool = {
+        param($exe, $toolArgs, $label)
+        if (-not $exe) { Write-Host "  $label - tool not in tools\ (run -Mode Setup)" -ForegroundColor DarkYellow; return }
+        Write-Host "  $label..." -ForegroundColor Cyan
+        $null = Invoke-NativeTool -ExePath $exe.FullName -ToolArgs $toolArgs -WorkingDirectory $exe.DirectoryName
+    }
+    $pfDst = Join-Path $script:RawDir 'prefetch'
+    if ((Test-Path $pfDst) -and -not (Test-Path (Join-Path $script:CsvDir 'prefetch_parsed.csv'))) {
+        & $runTool (& $findTool 'PECmd*.exe') @('-d', $pfDst, '--csv', $script:CsvDir, '--csvf', 'prefetch_parsed.csv') 'PECmd: prefetch run counts'
+    }
+    $recDst = Join-Path $script:RawDir 'recent'
+    if ((Test-Path $recDst) -and -not (Test-Path (Join-Path $script:CsvDir 'lnk_parsed.csv'))) {
+        & $runTool (& $findTool 'LECmd*.exe') @('-d', $recDst, '--csv', $script:CsvDir, '--csvf', 'lnk_parsed.csv') 'LECmd: recent LNK files'
+    }
+    $jlDst = Join-Path $script:RawDir 'jumplists'
+    if ((Test-Path $jlDst) -and -not (Test-Path (Join-Path $script:CsvDir 'jumplist_parsed*.csv'))) {
+        & $runTool (& $findTool 'JLECmd*.exe') @('-d', $jlDst, '--csv', $script:CsvDir, '--csvf', 'jumplist_parsed.csv') 'JLECmd: jump lists'
+    }
+    $brDst = Join-Path $script:RawDir 'browser'
+    if ((Test-Path $brDst) -and -not (Test-Path (Join-Path $script:CsvDir 'browser_history.csv'))) {
+        $sqlExe = & $findTool 'SQLECmd*.exe'
+        if ($sqlExe) {
+            & $runTool $sqlExe @('-d', $brDst, '--csv', $script:CsvDir) 'SQLECmd: browser history/downloads'
+            $merge = {
+                param([string]$glob, [string]$name)
+                $files = @(Get-ChildItem -Path $script:CsvDir -Filter $glob -File -ErrorAction SilentlyContinue)
+                $all = @()
+                foreach ($f2 in $files) { try { $all += @(Import-Csv -LiteralPath $f2.FullName -ErrorAction Stop) } catch { } }
+                if ($all.Count -gt 0) { Save-Rows -Name $name -Rows $all }
+                foreach ($f2 in $files) { Remove-Item -LiteralPath $f2.FullName -Force -ErrorAction SilentlyContinue }
+            }
+            & $merge '*ChromiumBrowser_HistoryVisits_*.csv' 'browser_history'
+            & $merge '*ChromiumBrowser_Downloads_*.csv' 'browser_downloads'
+            & $merge '*ChromiumBrowser_KeywordSearches_*.csv' 'browser_searches'
+            Get-ChildItem -Path $script:CsvDir -Filter 'SQLite.Interop.dll' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            Invoke-BrowserIocXref
+        }
+    }
+
+    # 3) regenerate everything derived from csv\
+    Invoke-RegenerateOutputs -Case $meta
+    try {
+        $meta | Add-Member -NotePropertyName AnalystParsedUTC -NotePropertyValue ((Get-Date).ToUniversalTime().ToString('o')) -Force
+        $meta | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cj -Encoding UTF8
+    } catch { }
+
+    $after = @(Get-ChildItem -LiteralPath $script:CsvDir -Filter '*.csv' -File -ErrorAction SilentlyContinue).Count
+    Write-Host ""
+    Write-Host "Done: $before -> $after CSVs. Regenerated report.html / verdict.json / supertimeline.csv / siem_export.ndjson." -ForegroundColor Green
+    Write-Host "csv\parse_needed.csv lists anything that still needs the ORIGINAL endpoint (live-only sources)." -ForegroundColor Gray
+
+    # 4) re-pack if the input was a zip
+    if ($tmp) {
+        try {
+            $items = Get-ChildItem -LiteralPath $caseDirP | Where-Object { $_.Name -ne 'memory' } | ForEach-Object { $_.FullName }
+            Compress-Archive -Path $items -DestinationPath $Path -CompressionLevel Fastest -Force
+            Write-Host "Repacked: $Path" -ForegroundColor Green
+        } catch { Write-Host "repack failed ($($_.Exception.Message)) - parsed files remain in $caseDirP" -ForegroundColor Yellow }
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
     return $true
 }
 
@@ -4634,6 +4836,7 @@ if ($bareLaunch -and [Environment]::UserInteractive) {
                 'Setup' { Invoke-SetupWizard }
         'UpdateRules' { if (-not (Invoke-UpdateRulesMode)) { exit 1 } }
                 'Tune' { Invoke-TuneMode | Out-Null }
+                'Parse' { Invoke-ParseMode | Out-Null }
                 'Links' { Show-ToolLinks }
             }
             Write-Host ""
@@ -4657,6 +4860,7 @@ if ($Mode -ne 'Collect') {
         }
         'UpdateRules' { Invoke-UpdateRulesMode }
         'Tune' { Invoke-TuneMode | Out-Null }
+        'Parse' { Invoke-ParseMode -Path $ParsePath | Out-Null }
     }
     exit 0
 }
