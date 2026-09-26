@@ -1,0 +1,14 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax gate + fixture suites
+        shell: powershell
+        run: tests/run-tests.ps1
