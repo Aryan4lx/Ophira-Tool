@@ -31,6 +31,7 @@
 .\Ophira.ps1 -Mode UpdateRules       # refresh hayabusa Sigma rules
 .\Ophira.ps1 -Mode Tune              # pick noisy Sigma rules -> exclude/demote (travels with -PushTools)
 .\Ophira.ps1 -Mode Parse -ParsePath .\OPHIRA_HOST_20260926_120000.zip   # finish a case on YOUR pc
+.\Ophira.ps1 -Mode Process -ParsePath .\OPHIRA_HOST_20260926_120000.zip -ProcessName evil.exe   # pivot on one process
 ```
 
 **Owner handoff:** send the whole folder. They double-click `RUN-OPHIRA.bat`, accept UAC, wait 3-5 minutes. A folder window opens with the result file selected and its path is copied to the clipboard — they paste it into an email. If you pre-fill `ophira.config.txt` (SHARE=/CASE=/ANALYST=), results upload to your share automatically and there's literally nothing to send.
@@ -39,7 +40,7 @@
 
 Running `.\Ophira.ps1` bare (no flags) first asks **who is using the tool**:
 
-- `[1] Security / IR team` → **task menu**: collect this PC · push & run on remote PCs · analyze collected results · setup tools · update rules · **tune Sigma rules** · tool links · **finish a collected case (analyst-side parse)**. Deploy and Analyze are guided wizards (targets, credentials, depth, share — plain questions with `[defaults]`, confirm summary, then the existing parallel engine runs). Deploy has an **advanced options** prompt (Full depth, log analysis window, host parallelism). After each task you return to the menu.
+- `[1] Security / IR team` → **task menu**: collect this PC · push & run on remote PCs · analyze collected results · setup tools · update rules · **tune Sigma rules** · tool links · **finish a collected case (analyst-side parse)** · **analyze a single process**. Deploy and Analyze are guided wizards (targets, credentials, depth, share — plain questions with `[defaults]`, confirm summary, then the existing parallel engine runs). Deploy has an **advanced options** prompt (Full depth, log analysis window, host parallelism). After each task you return to the menu.
 - `[2] The security team asked me to run this` → the guided automatic owner flow (same as the .bat).
 
 Flags always win: `-SimpleUI`, `-NoMenu`, or any explicit `-Mode` skips the gate entirely, so automation and `RUN-OPHIRA.bat` behave exactly as before. Non-interactive sessions never see the gate.
@@ -112,7 +113,9 @@ Run Ophira again on the same box days later: it auto-finds the previous case, co
 
 - **Correlation score** — evidence stacks per binary: user-path (+1), unsigned (+2), binary deleted (+3), public connection (+2), persistence refs (+2 each), IOC hash hit (+4) → verdict
 - **Trusted publishers** — validly-signed binaries from known publishers (or your `tools\trusted.txt`) cap at LOW; IOC hits always override
-- **`-Mode Tune`** — the FP feedback loop: shows your top-hit Sigma rules with counts, pick offenders, exclude them entirely or demote to informational. Written into hayabusa's native `exclude_rules.txt` / `level_tuning.txt`, so the tuning travels with Deploy `-PushTools` to every host you push to
+- **`-Mode Tune`** — the FP feedback loop: shows your top-hit Sigma rules with counts, pick offenders, exclude them entirely or demote to informational. Written into hayabusa's native `exclude_rules.txt` / `level_tuning.txt`, so the tuning travels with Deploy `-PushTools` to every host you push to. `[V]`iew / `[ED]`it open the rule's actual .yml in Notepad so you can see (or adjust) exactly what it matches before deciding
+- **Sigma rule logs** — every matched rule gets its own event log: `csv\sigma_rules\<rule>.csv` (time, host, event ID, RecordID, hayabusa-extracted details) + an index, and `report.html` lets you expand each rule to read the matched events inline. RecordID locates the exact record in the shipped `raw\evtx\`
+- **`-Mode Process`** — single-process pivot: point it at a case (zip or folder) with a name, path fragment or hash; it searches every collected CSV, auto-pivots hash → path → name, groups what the evidence says (processes, network, execution history, persistence, YARA, Sigma, ...) and writes `csv\process_pivot.csv`
 - **Amcache SHA1 × IOC** — historical execution matched against your IOC list = near-certain TP with a timestamp
 - **report.html** — **compromise assessment report v2**: verdict banner with confidence bar + contributing signals + "what would change this verdict" caveats, evidence coverage table, **MITRE ATT&CK grid** (tactic chips + technique table from hayabusa tags, with cannot-rule-out telemetry notes), findings grouped by tactic, defanged copy-ready IOC list, YARA findings, logon/account analysis, **recovered attacker commands** (decoded base64/obfuscated PowerShell), persistence inventory, **file-system evidence section** (USN mass-modification windows + ransomware extensions, most-run prefetch, MFT user-path executables), **C2 beaconing candidates (connections + DNS)**, **driver check (LOLDrivers)**, **host snapshot** (AV state + detections, stored credentials, outbound RDP, BITS, malfind, browser IOCs, **security posture audit**), recommendations incl. **hardening actions from BAD posture findings**, **evidence index** (every CSV with row counts + what to look for — the map into all collected artifacts), VT deep links
 - **Raw evidence** — every flag is backed by raw CSV/evtx/hive so any verdict can be verified
@@ -125,25 +128,29 @@ Merges N case zips → `fleet_report.csv` + **`fleet_report.html`** (**per-host 
 
 ## Companion tools
 
-Bundled in `tools\` in this repo (self-contained kit). Refresh via `-Mode Setup` or each project's releases:
+Two folders — **`tools\endpoint\`** is what `Deploy -PushTools` ships to remote hosts (hayabusa, chainsaw, yara, the EZ parsers, LOLDrivers lists, winpmem ≈ 72 MB zipped, 9979 files); **`tools\analyst\`** never leaves your PC (volatility3 memory analysis, SQLECmd browser parser — it needs .NET 9 which endpoints rarely have; its targets are parsed analyst-side via `-Mode Parse`). Ophira finds tools recursively in both. Refresh via `-Mode Setup` or each project's releases:
 
 | Tool | Enables | Download |
 |---|---|---|
-| winpmem | RAM capture (7.1) | https://github.com/Velocidex/winpmem/releases |
-| hayabusa | Sigma timeline (4.6) + fleet + `-Mode UpdateRules` | https://github.com/Yamato-Security/hayabusa/releases |
-| Volatility 3 | offline memory analysis + optional on-host pass | https://github.com/volatilityfoundation/volatility3/releases |
-| chainsaw | execution timeline, SRUM, evtx gaps (5.4) + offline Sigma | https://github.com/WithSecureOpenSource/chainsaw/releases |
-| AmcacheParser (EZ) | execution inventory + SHA1×IOC (8.4) | https://github.com/EricZimmerman/AmcacheParser/releases |
-| RBCmd (EZ) | recycle bin parse (8.4) | https://github.com/EricZimmerman/RBCmd/releases |
-| MFTECmd (EZ) | live $MFT + USN journal forensics, all NTFS drives (5.5) | https://download.ericzimmermanstools.com/MFTECmd.zip |
-| PECmd (EZ) | prefetch run counts (5.1) | https://download.ericzimmermanstools.com/PECmd.zip |
-| LECmd / JLECmd (EZ) | LNK + Jump List parse (8.5) | https://download.ericzimmermanstools.com/LECmd.zip |
-| SBECmd (EZ) | ShellBags folder-browsing history (8.8) | https://download.ericzimmermanstools.com/SBECmd.zip |
-| SQLECmd (EZ, .NET 9) | browser History/Downloads SQLite parse (8.7) | https://download.ericzimmermanstools.com/net9/SQLECmd.zip |
-| LOLDrivers datasets | malicious/vulnerable driver hash xref (8.10) | https://github.com/magicsword-io/LOLDrivers |
-| yara-x | YARA scan of flagged binaries (4.7), MIT rule pack bundled | https://github.com/VirusTotal/yara-x/releases |
+| winpmem | RAM capture (7.1) — endpoint | https://github.com/Velocidex/winpmem/releases |
+| hayabusa | Sigma timeline (4.6) + fleet + `-Mode UpdateRules` — endpoint | https://github.com/Yamato-Security/hayabusa/releases |
+| Volatility 3 | offline memory analysis + optional on-host pass — analyst | https://github.com/volatilityfoundation/volatility3/releases |
+| chainsaw | execution timeline, SRUM, evtx gaps (5.4) + offline Sigma — endpoint | https://github.com/WithSecureOpenSource/chainsaw/releases |
+| AmcacheParser (EZ) | execution inventory + SHA1×IOC (8.4) — endpoint | https://github.com/EricZimmerman/AmcacheParser/releases |
+| RBCmd (EZ) | recycle bin parse (8.4) — endpoint | https://github.com/EricZimmerman/RBCmd/releases |
+| MFTECmd (EZ) | live $MFT + USN journal forensics, all NTFS drives (5.5) — endpoint | https://download.ericzimmermanstools.com/MFTECmd.zip |
+| PECmd (EZ) | prefetch run counts (5.1) — endpoint | https://download.ericzimmermanstools.com/PECmd.zip |
+| LECmd / JLECmd (EZ) | LNK + Jump List parse (8.5) — endpoint | https://download.ericzimmermanstools.com/LECmd.zip |
+| SBECmd (EZ) | ShellBags folder-browsing history (8.8) — endpoint | https://download.ericzimmermanstools.com/SBECmd.zip |
+| SQLECmd (EZ, .NET 9) | browser History/Downloads SQLite parse (8.7) — analyst (.NET 9) | https://download.ericzimmermanstools.com/net9/SQLECmd.zip |
+| LOLDrivers datasets | malicious/vulnerable driver hash xref (8.10) — endpoint | https://github.com/magicsword-io/LOLDrivers |
+| yara-x | YARA scan of flagged binaries (4.7), MIT rule pack bundled — endpoint | https://github.com/VirusTotal/yara-x/releases |
 
-Analyst-side quick wins on a collected case:
+**Push tools packaging is AV-resilient**: Defender flags a few bundled Sigma `.yml` files (rules that *describe* Defender tampering) and can block bulk archiving - `-PushTools` zips per-file and skips whatever AV objects to, with the skip count shown.
+
+**KAPE and Kansa:** Ophira deliberately replaces Kansa (push/run/remove + log modules are built in, with verdicts and fleet on top). [KAPE](https://www.kroll.com/en/insights/publications/cyber/kroll-artifact-parser-extractor-kape) is a great **complement, not a replacement**: when one box needs deep full-disk acquisition beyond triage scope, run KAPE separately on that box - our `raw\` evidence covers the common artifacts so you only escalate when needed.
+
+**Analyst-side quick wins on a collected case:**
 ```
 vol.exe -f memory\physmem.raw windows.pslist.PsList
 chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
@@ -152,6 +159,7 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 ## Design rules
 
 - Read-only; degrades gracefully without admin (logs what failed)
+- **Seeing odd ASCII art when you launch `. \Ophira.ps1` directly?** That is your own PowerShell profile (`$PROFILE` - it loads for every script started in that console), not Ophira. `RUN-OPHIRA.bat` launches with `-NoProfile`, so the owner flow never shows it
 - PowerShell 5.1 baseline (Win 2008 R2+ with updates), no dependencies. Hosts with PowerShell < 5.0 get a clear fail-fast message with remote-collection alternatives instead of cryptic errors
 - Fallbacks for 2008-era boxes (netstat/arp/ipconfig parsing when cmdlets missing)
 - Per-module failure isolation; speed/precision via presets (Flash 15s → Quick 1-2 min → Standard 3-5 min)
@@ -169,6 +177,7 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 - [x] Research-driven Phase F: posture audit w/ hardening recs, ShellBags, browser parse + IOC xref, ransomware extensions, multi-drive NTFS, malfind quick-pass (v2.13)
 - [x] Detection depth: DNS beaconing (EID 22), `-Mode Tune` Sigma FP feedback, LOLDrivers hash xref, hayabusa 4.1 wins (extract-base64 command recovery, RDP logon summary, sort-csv dedupe) (v2.14)
 - [x] Analyst-side completion: `-Mode Parse` (finish a case on your PC), `parse_needed.csv` honesty + endpoint .NET inventory, Full-preset full-NTFS preservation (v2.15)
+- [x] Triage depth v2: sigma per-rule event logs + report drill-down, `-Mode Process` single-process pivot, Tune V/ED rule viewer/editor, endpoint/analyst tool split for PushTools (v2.16)
 - [ ] Real-host pilot run (validate hayabusa timing + MFTECmd on live volume)
 - [ ] Role-based presets (WebServer / DC / Workstation)
 

@@ -1,7 +1,7 @@
 # AGENTS.md — conventions for coding agents working on this repo
 
 ## What this is
-Ophira: **single-file** PowerShell 5.1 Windows IR triage toolkit (`Ophira.ps1`, ~4000 lines). READ-ONLY by design (only reads/copies; Setup downloads tools). Committed companion binaries live in `tools\` (hayabusa, yara-x, EZ parsers - they are tracked in git). `collections/`, `*.zip`, `OPHIRA_*/`, `tools/iocs.txt` are gitignored.
+Ophira: **single-file** PowerShell 5.1 Windows IR triage toolkit (`Ophira.ps1`, ~4000 lines). READ-ONLY by design (only reads/copies; Setup downloads tools). Committed companion binaries live in `tools\` - split into `tools\endpoint\` (shipped by Deploy `-PushTools`, packed per-entry via `Compress-ToolZip` because Defender blocks bulk-zipping some Sigma `.yml`) and `tools\analyst\` (vol3, SQLECmd - never shipped). `collections/`, `*.zip`, `OPHIRA_*/`, `tools/iocs.txt`, `tools/KAPE/` are gitignored.
 
 ## Commands (run before every commit)
 ```powershell

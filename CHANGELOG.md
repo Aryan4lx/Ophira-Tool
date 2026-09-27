@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.16
+- **Sigma rule logs**: one CSV per matched rule under `csv\sigma_rules\` (time, host, event ID, RecordID, details) + `index.csv`; `report.html` Sigma section now has per-rule drill-down - expand a rule to read its matched events inline
+- **`-Mode Tune` gains `[V]`iew / `[ED]`it**: locates the rule's .yml in the bundled rules by RuleID and opens it in Notepad (ED waits for close); edits apply on the next run
+- **`-Mode Process`** (new mode + menu item 9): single-process pivot over a collected case - name, path fragment or hash; auto-pivots hash → path → name; groups evidence by artifact type → `csv\process_pivot.csv`
+- **`tools\` split**: `tools\endpoint\` (shipped via Deploy `-PushTools`: hayabusa/chainsaw/yara/EZ parsers/loldrivers/winpmem, ~72 MB zip) vs `tools\analyst\` (vol3, SQLECmd — never shipped); Setup downloads into the right folder; tool discovery is recursive so existing layouts keep working
+- **AV-resilient push packaging**: Defender flags some bundled Sigma `.yml` files and blocks `Compress-Archive` entirely — `-PushTools` now zips per-entry, skipping AV-blocked files with a visible skip count; remote extraction does the same
+- Parse mode refactored onto shared `Open-CaseSession` (also used by Process mode)
+
 ## v2.15
 - **`-Mode Parse`** (new mode + menu item 8): analyst-side completion of a collected case — re-runs the raw-driven parsers from your kit (AmcacheParser/RBCmd/PECmd/LECmd/JLECmd/SQLECmd, chainsaw execution history, hayabusa detection pack) against the case's `raw\` evidence, then regenerates supertimeline, verdict, SIEM export and `report.html`; zip inputs are repacked in place. Closes the contractor flow: endpoint does what it can, one command finishes the rest
 - **`csv\parse_needed.csv`**: for every missing artifact — parser, .NET requirement, whether the raw evidence shipped, and the exact way to finish it (endpoint-only vs `-Mode Parse`); shown in the report evidence index

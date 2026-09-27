@@ -62,8 +62,11 @@ Check "regen: script Verdict set" ($script:Verdict.LevelRank -eq 2)
 # ============================================================================
 # PART 3 - Invoke-ParseMode end-to-end on a synthetic case FOLDER
 # ============================================================================
-$m = [regex]::Match($src, "(?s)function Invoke-ParseMode \{.*?\r?\n\}")
-if (-not $m.Success) { throw 'Invoke-ParseMode extract failed' }
+foreach ($fn in @('Open-CaseSession', 'Invoke-ParseMode')) {
+    $m = [regex]::Match($src, "(?s)function $fn \{.*?\r?\n\}")
+    if (-not $m.Success) { throw "$fn extract failed" }
+    Invoke-Expression $m.Value
+}
 $case3 = Join-Path $env:TEMP "ophira_pm_$stamp"
 $csv3 = Join-Path $case3 'csv'; $raw3 = Join-Path $case3 'raw'
 New-Item -ItemType Directory -Path $csv3, "$raw3\prefetch", "$raw3\recent", "$raw3\evtx", "$raw3\registry" -Force | Out-Null
