@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.17
+- **Hotfix**: `Get-LvlRank` (plus `Split-TagList`/`Get-TacticLabel`) promoted from nested-in-`New-HtmlReport` to top-level functions - v2.16's `New-SigmaRuleLogs` called it from top-level scope and every collection printed `CommandNotFound` errors at the sigma-rule-logs step (rule CSVs were still written; only the worst-first index sorting broke). Caught on Windows Server 2025, present everywhere. Regression guard added: the test suite asserts these helpers are top-level (column-0 definitions) and the live full-run was re-verified
+- Test harnesses updated to declare the (now top-level) helper dependencies explicitly
+
 ## v2.16
 - **Sigma rule logs**: one CSV per matched rule under `csv\sigma_rules\` (time, host, event ID, RecordID, details) + `index.csv`; `report.html` Sigma section now has per-rule drill-down - expand a rule to read its matched events inline
 - **`-Mode Tune` gains `[V]`iew / `[ED]`it**: locates the rule's .yml in the bundled rules by RuleID and opens it in Notepad (ED waits for close); edits apply on the next run

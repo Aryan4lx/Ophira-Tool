@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.16  -  Windows Incident Response Triage Toolkit
+Ophira v2.17  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -34,7 +34,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.16"
+$ScriptVersion = "2.17"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -3161,6 +3161,32 @@ function New-VtLink {
     return $lbl
 }
 
+function Get-LvlRank {
+    # Top-level (was nested in New-HtmlReport): also used by New-SigmaRuleLogs and fleet reporting.
+    param([string]$l)
+    switch -Regex ("$l") { 'crit' { 5; break } 'high' { 4; break } 'med' { 3; break } 'low' { 2; break } default { 1 } }
+}
+
+function Get-TacticLabel {
+    param([string]$abbr)
+    $tacticNames = @{
+        'Recon' = 'Reconnaissance'; 'ResDevDev' = 'Resource Development'; 'InitAccess' = 'Initial Access'
+        'Exec' = 'Execution'; 'Persis' = 'Persistence'; 'PrivEsc' = 'Privilege Escalation'
+        'DefEvade' = 'Defense Evasion'; 'CredAccess' = 'Credential Access'; 'Disc' = 'Discovery'
+        'LatMov' = 'Lateral Movement'; 'Collect' = 'Collection'; 'C2' = 'Command and Control'
+        'Exfil' = 'Exfiltration'; 'Impact' = 'Impact'; 'ImpairC2' = 'Impair Command and Control'; 'ImpairProc' = 'Impair Process'
+    }
+    $a = "$abbr".Trim()
+    if ($tacticNames.ContainsKey($a)) { return $tacticNames[$a] }
+    return $a
+}
+
+function Split-TagList {
+    param([string]$s)
+    if (-not "$s") { return @() }
+    return @([regex]::Split("$s", '[^A-Za-z0-9.\-]+') | Where-Object { $_ -and $_.Length -gt 1 })
+}
+
 function Import-CaseCsv {
     param([string]$Name)
     if ($Name -notmatch '\.csv$') { $Name = "$Name.csv" }
@@ -3207,26 +3233,6 @@ function New-HtmlReport {
     $memMfR = @(Import-CaseCsv 'memory_malfind.csv')
     $browserIocR = @(Import-CaseCsv 'ioc_hits_browser.csv')
     $postureBad = @($posture | Where-Object { $_.Status -eq 'BAD' })
-
-    function Get-LvlRank([string]$l) {
-        switch -Regex ("$l") { 'crit' { 5; break } 'high' { 4; break } 'med' { 3; break } 'low' { 2; break } default { 1 } }
-    }
-    $tacticNames = @{
-        'Recon' = 'Reconnaissance'; 'ResDevDev' = 'Resource Development'; 'InitAccess' = 'Initial Access'
-        'Exec' = 'Execution'; 'Persis' = 'Persistence'; 'PrivEsc' = 'Privilege Escalation'
-        'DefEvade' = 'Defense Evasion'; 'CredAccess' = 'Credential Access'; 'Disc' = 'Discovery'
-        'LatMov' = 'Lateral Movement'; 'Collect' = 'Collection'; 'C2' = 'Command and Control'
-        'Exfil' = 'Exfiltration'; 'Impact' = 'Impact'; 'ImpairC2' = 'Impair Command and Control'; 'ImpairProc' = 'Impair Process'
-    }
-    function Get-TacticLabel([string]$abbr) {
-        $a = "$abbr".Trim()
-        if ($tacticNames.ContainsKey($a)) { return $tacticNames[$a] }
-        return $a
-    }
-    function Split-TagList([string]$s) {
-        if (-not "$s") { return @() }
-        return @([regex]::Split("$s", '[^A-Za-z0-9.\-]+') | Where-Object { $_ -and $_.Length -gt 1 })
-    }
 
     $css = @'
 <style>

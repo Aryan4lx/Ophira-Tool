@@ -16,8 +16,8 @@ function New-Csv { param($Path, [string[]]$Header, [string[]]$Lines) ($Header + 
 # ============================================================================
 $m = [regex]::Match($src, "(?s)function New-SigmaRuleLogs \{.*?\r?\n\}")
 if (-not $m.Success) { throw 'New-SigmaRuleLogs extract failed' }
-$mLvl = [regex]::Match($src, "(?s)function Get-LvlRank\b.*?\r?\n    \}")
-if (-not $mLvl.Success) { throw 'Get-LvlRank extract failed' }
+$mLvl = [regex]::Match($src, "(?s)function Get-LvlRank\b.*?\r?\n\}")
+if (-not $mLvl.Success) { throw 'Get-LvlRank extract failed - must be a TOP-LEVEL function (column-0 braces)' }
 Invoke-Expression ($mLvl.Value + "`r`n" + $m.Value)
 $case1 = Join-Path $env:TEMP "ophira_srl_$stamp"
 $CsvDir = Join-Path $case1 'csv'
@@ -45,23 +45,17 @@ $aRows = @(Import-Csv (Join-Path $srlDir 'Suspicious_Rust_BEBEA_x2.csv'))
 Check "rule logs: rule CSV carries event rows w/ RecordID" ($aRows.Count -eq 2 -and $aRows[0].RecordID -eq '11')
 $idx = @(Import-Csv (Join-Path $srlDir 'index.csv'))
 Check "rule logs: index sorted worst-first with hit counts" ($idx[0].Rule -eq 'Suspicious: Rust/BEBEA x2' -and [int]$idx[0].Hits -eq 2)
+Check "regression: Get-LvlRank/Split-TagList/Get-TacticLabel defined at TOP level (column 0)" (($src -match '(?m)^function Get-LvlRank') -and ($src -match '(?m)^function Split-TagList') -and ($src -match '(?m)^function Get-TacticLabel'))
 
 # ============================================================================
 # PART 2 - report drill-down renders per-rule details blocks
 # ============================================================================
 $defs = ''
-foreach ($n in @('ConvertTo-HtmlEsc', 'New-VtLink', 'Import-CaseCsv', 'Get-CompromiseVerdict', 'New-HtmlReport')) {
+foreach ($n in @('ConvertTo-HtmlEsc', 'New-VtLink', 'Import-CaseCsv', 'Get-CompromiseVerdict', 'New-HtmlReport', 'Get-LvlRank', 'Split-TagList', 'Get-TacticLabel')) {
     $m2 = [regex]::Match($src, "(?s)function $n\b.*?\r?\n\}")
     if (-not $m2.Success) { throw "extract failed: $n" }
     $defs += $m2.Value + "`r`n"
 }
-# the tactic helpers are nested inside New-HtmlReport (4-space indented closing braces)
-foreach ($n in @('Get-LvlRank', 'Get-TacticLabel', 'Split-TagList')) {
-    $m2 = [regex]::Match($src, "(?s)function $n\b.*?\r?\n    \}")
-    if (-not $m2.Success) { throw "extract failed: $n" }
-    $defs += $m2.Value + "`r`n"
-}
-$defs += "`$tacticNames = @{ 'Recon'='Reconnaissance'; 'Exec'='Execution'; 'C2'='Command and Control' }`r`n"
 Invoke-Expression $defs
 $case2 = Join-Path $env:TEMP "ophira_dd_$stamp"
 $csvDir2 = Join-Path $case2 'csv'; $RawDir = Join-Path $case2 'raw'; $CaseDir = $case2; $MemDir = Join-Path $case2 'mem'
