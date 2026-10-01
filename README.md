@@ -2,6 +2,22 @@
 
 **One PowerShell script** (5.1+, zero dependencies) for Windows incident response: collect evidence on an endpoint, push it across a fleet, analyze the results, and fetch companion tools.
 
+## Get the kit
+
+`git clone` is the reliable path (long file paths in the bundled rule packs exceed Windows' 260-char ZIP limit in some locations):
+
+```
+git clone https://github.com/Aryan4lx/Ophira-Tool.git
+```
+
+If you download the ZIP instead, do **not** use Explorer's built-in extractor - use either:
+
+```
+tar -xf Ophira-Tool-main.zip        # tar.exe ships with Windows 10+ and handles long paths
+```
+
+or 7-Zip ("Extract" from the context menu).
+
 **Read-only by design** — never kills processes, never deletes files, never modifies the system. Only reads and copies.
 
 ## One script, every role covered
@@ -167,6 +183,36 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 - **hayabusa time-boxing** — scans only the configured log range (`--time-offset`) with eid-filter (`-E`); per-module timings recorded in `case.json` (`ModuleTimings`)
 - Native tools launched console-less (`.NET CreateNoWindow`) — avoids console handshake stalls and runspace pipe overhead
 
+## Testing on a VM (safe demo recipe)
+
+Snapshot first, host-only networking is enough (nothing below needs internet), revert after.
+
+**Recommended MalwareBazaar sample: Mimikatz** (browse the `mimikatz` tag) - it lights up every detection surface:
+
+1. Before running the collection, add the sample's hashes to `tools\iocs.txt` (one per line - the SHA256 **and** SHA1 shown on the MalwareBazaar page):
+   ```
+   <sha256 of sample>
+   <sha1 of sample>
+   ```
+2. Run the sample on the VM, then collect (`RUN-OPHIRA.bat` or `.\Ophira.ps1 -NoMenu -Preset Standard`).
+3. What you should see: flash-triage IOC hit (if still running), **amcache historical-execution hit** ("this exact hash executed on DATE" = verdict-forcing evidence), **YARA high hit** (bundled `ophira-pack.yar` has Mimikatz/Cobalt Strike/Metasploit/LaZagne/Rubeus/BloodHound rules) → verdict **COMPROMISED**.
+
+Cobalt Strike beacon samples (tag `cobalt-strike`) also match the YARA pack; current families (tags `AgentTesla`, `Lumma`, `Remcos`...) are realistic but only light up the IOC path - add their hashes to `iocs.txt`.
+
+**Beaconing demo without live C2** (most sample C2s are dead) - run this on the VM as the "malware", it generates a textbook periodic callback that module 4.8 flags `[high]`:
+
+```powershell
+while ($true) { try { (New-Object Net.Sockets.TcpClient('1.1.1.1', 443)).Close() } catch {}; Start-Sleep -Seconds 60 }
+```
+
+**Ransomware/USN demo without ransomware** - mass-create files with ransom extensions in a user folder; module 5.5 detects the write burst + extensions (verdict floor 3):
+
+```powershell
+1..3000 | ForEach-Object { Set-Content "C:\Users\$env:USERNAME\Documents\doc$_.docx.locked" 'x' }
+```
+
+**The real test**: run a collection, then re-run it and check the delta ("NEW findings"), and run `-Mode Process -ProcessName <sample>` to see the single-process pivot pull the whole story together.
+
 ## Roadmap
 
 - [x] YARA scan of flagged binaries (module 4.7 + bundled `ophira-pack.yar`)
@@ -178,6 +224,8 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 - [x] Detection depth: DNS beaconing (EID 22), `-Mode Tune` Sigma FP feedback, LOLDrivers hash xref, hayabusa 4.1 wins (extract-base64 command recovery, RDP logon summary, sort-csv dedupe) (v2.14)
 - [x] Analyst-side completion: `-Mode Parse` (finish a case on your PC), `parse_needed.csv` honesty + endpoint .NET inventory, Full-preset full-NTFS preservation (v2.15)
 - [x] Triage depth v2: sigma per-rule event logs + report drill-down, `-Mode Process` single-process pivot, Tune V/ED rule viewer/editor, endpoint/analyst tool split for PushTools (v2.16)
+- [x] Analyst-side completion: `-Mode Parse` (finish a case on your PC), `parse_needed.csv` + endpoint .NET inventory, Full-preset full-NTFS preservation (v2.15); hotfix helper scoping (v2.17)
+- [x] **Connections: cross-source entity correlation** - binaries/accounts/remotes joined across all artifacts with category-strength scoring, report drill-down + SRUM per-app network consumers; repo trim + long-path hardening (v2.18)
 - [ ] Real-host pilot run (validate hayabusa timing + MFTECmd on live volume)
 - [ ] Role-based presets (WebServer / DC / Workstation)
 

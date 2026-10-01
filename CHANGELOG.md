@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.18
+- **Connections: cross-source entity correlation** (`New-EntityCorrelation`, runs at packaging + in `-Mode Parse`):
+  - **Binaries** joined across ~16 artifacts (flash verdict, running processes, hashes, amcache+IOC, prefetch, services/tasks/autoruns/ASEP persistence, connections, beacons, SRUM usage, YARA, LOLDrivers, MFT created, sigma alerts) → `entities_binaries.csv` with evidence-category counts, first/last seen, hashes, SRUM bytes
+  - **Accounts** joined across logon events (types/failures/sources), RDP sessions, RDP-out MRU targets, console history, brute-force → `entities_accounts.csv`
+  - **Remote endpoints** joined across connections, beacon flags, brute-force sources, RDP targets → `entities_remotes.csv`
+  - Report "**Connections - correlated entities**" section: top multi-source binaries as expandable story cards, account-activity + remote-endpoint tables, and a "**Top network consumers (SRUM)**" table finally surfacing the ~30-day per-app byte history
+  - Report-only (no verdict changes); graceful when sources are missing
+- **Repo trim**: removed upstream test fixtures/docs from bundled rule packs (~21 MB / 883 files; deepest path 229→211 chars - GitHub ZIP no longer hits MAX_PATH when extracted with `tar -xf` or 7-Zip)
+- **`\\?\` long-path hardening** in push packaging + remote tool extraction
+- README: "Get the kit" (git clone / `tar -xf` / 7-Zip) + "Testing on a VM" guide (MalwareBazaar sample recipe, iocs.txt hash prep, beacon + ransomware simulators)
+- Real-case fix: empty `Image`/`ProcessPath` values no longer abort correlation; SRUM device-style paths (`\device\harddiskvolumeN\`) normalize to drive letters
+
 ## v2.17
 - **Hotfix**: `Get-LvlRank` (plus `Split-TagList`/`Get-TacticLabel`) promoted from nested-in-`New-HtmlReport` to top-level functions - v2.16's `New-SigmaRuleLogs` called it from top-level scope and every collection printed `CommandNotFound` errors at the sigma-rule-logs step (rule CSVs were still written; only the worst-first index sorting broke). Caught on Windows Server 2025, present everywhere. Regression guard added: the test suite asserts these helpers are top-level (column-0 definitions) and the live full-run was re-verified
 - Test harnesses updated to declare the (now top-level) helper dependencies explicitly

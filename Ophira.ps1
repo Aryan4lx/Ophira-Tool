@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.17  -  Windows Incident Response Triage Toolkit
+Ophira v2.18  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -34,7 +34,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.17"
+$ScriptVersion = "2.18"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -530,14 +530,18 @@ function Compress-ToolZip {
     Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
     if (Test-Path $DestZip) { Remove-Item $DestZip -Force }
-    $zip = [IO.Compression.ZipFile]::Open($DestZip, [IO.Compression.ZipArchiveMode]::Create)
+    $zipPath = $DestZip
+    if ($zipPath.Length -gt 240) { $zipPath = "\\?\$zipPath" }
+    $zip = [IO.Compression.ZipFile]::Open($zipPath, [IO.Compression.ZipArchiveMode]::Create)
     $added = 0
     $skipped = 0
     try {
         foreach ($f in (Get-ChildItem -LiteralPath $SourceDir -Recurse -File)) {
             $rel = $f.FullName.Substring($SourceDir.Length + 1).Replace('\', '/')
+            $srcPath = $f.FullName
+            if ($srcPath.Length -gt 240) { $srcPath = "\\?\$srcPath" }
             try {
-                $null = [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $f.FullName, $rel, [IO.Compression.CompressionLevel]::Fastest)
+                $null = [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $srcPath, $rel, [IO.Compression.CompressionLevel]::Fastest)
                 $added++
             } catch { $skipped++ }
         }
@@ -602,6 +606,7 @@ function Invoke-DeployMode {
                         foreach ($entry in $zip.Entries) {
                             if ("$($entry.Name)" -eq '') { continue }
                             $dest = Join-Path "$using:remoteDir\tools" $entry.FullName
+                            if ($dest.Length -gt 240) { $dest = "\\?\$dest" }
                             $destDir = Split-Path $dest -Parent
                             if (-not (Test-Path $destDir)) { $null = New-Item -ItemType Directory -Path $destDir -Force }
                             try { [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true) } catch { $skipped++ }
@@ -3210,6 +3215,10 @@ function New-HtmlReport {
     $dnsBeacons = @(Import-CaseCsv 'dns_beacon_candidates.csv')
     $lolHits = @(Import-CaseCsv 'loldrivers_hits.csv')
     $psCmds = @(Import-CaseCsv 'ps_decoded_commands.csv')
+    $entB = @(Import-CaseCsv 'entities_binaries.csv')
+    $entA = @(Import-CaseCsv 'entities_accounts.csv')
+    $entR = @(Import-CaseCsv 'entities_remotes.csv')
+    $srumRows = @(Import-CaseCsv 'srum_usage.csv')
     $usnBursts = @(Import-CaseCsv 'usn_write_bursts.csv')
     $mftRecent = @(Import-CaseCsv 'mft_recent.csv')
     $pfParsed = @(Import-CaseCsv 'prefetch_parsed.csv')
@@ -3273,7 +3282,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
     $null = $sb.AppendLine("<h1>OPHIRA COMPROMISE ASSESSMENT REPORT</h1>")
     $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' }) &nbsp;|&nbsp; Elevated: $(if (Test-IsAdmin) { 'yes' } else { 'NO' })</div>")
-    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#snapshot'>Snapshot</a><a href='#drivers'>Drivers</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
+    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#snapshot'>Snapshot</a><a href='#drivers'>Drivers</a><a href='#entities'>Connections</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
 
     # ---------- verdict banner ----------
     $null = $sb.AppendLine("<a name='verdict'></a><h2>Verdict</h2>")
@@ -3723,6 +3732,61 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         $null = $sb.AppendLine("<div class='meta'>No malicious/vulnerable driver matches (or tools\loldrivers datasets missing - run -Mode Setup, needs admin + module 1.6).</div>")
     }
 
+    # ---------- connections: correlated entities ----------
+    $null = $sb.AppendLine("<a name='entities'></a><h2>Connections - correlated entities</h2>")
+    $null = $sb.AppendLine("<div class='meta'>Each entity below joins evidence from multiple independent sources (processes, execution history, persistence, network, SRUM usage, YARA, Sigma...) into one story. More categories touching one binary = stronger signal. Full data: csv\entities_binaries.csv / entities_accounts.csv / entities_remotes.csv</div>")
+    $entTop = @($entB | Where-Object { [int]"$($_.CatCount)" -ge 2 } | Select-Object -First 8)
+    if ($entTop.Count -gt 0) {
+        foreach ($e in $entTop) {
+            $vCls = switch -Regex ("$($e.Verdict)") { 'HIGH' { 'crit'; break } 'MEDIUM' { 'med'; break } default { 'info' } }
+            $vTxt = if ("$($e.Verdict)") { ", verdict <span class='$vCls'>$($e.Verdict)</span>" } else { '' }
+            $null = $sb.AppendLine("<details><summary><b>$(ConvertTo-HtmlEsc $e.Name)</b> - <span class='high'>$($e.CatCount) evidence categories</span>$vTxt</summary>")
+            $null = $sb.AppendLine("<table><tr><th>Path</th><th>First seen</th><th>Last seen</th><th>Signer</th><th>Hashes</th></tr>")
+            $null = $sb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $e.Path)</td><td>$(ConvertTo-HtmlEsc $e.FirstSeen)</td><td>$(ConvertTo-HtmlEsc $e.LastSeen)</td><td>$(ConvertTo-HtmlEsc $e.Signer)</td><td class='path'>$(ConvertTo-HtmlEsc $e.Hashes)</td></tr></table>")
+            if ("$($e.Bytes)") { $null = $sb.AppendLine("<div class='meta'>SRUM network usage history: $(ConvertTo-HtmlEsc $e.Bytes)</div>") }
+            $null = $sb.AppendLine("<table><tr><th>Source</th><th>Detail</th></tr>")
+            foreach ($ev in (("$($e.Evidence)" -split ' \| ') | Select-Object -First 14)) {
+                $parts = "$ev" -split ': ', 2
+                $null = $sb.AppendLine("<tr><td><b>$(ConvertTo-HtmlEsc $parts[0])</b></td><td class='path'>$(ConvertTo-HtmlEsc ($parts[1..($parts.Length-1)] -join ': '))</td></tr>")
+            }
+            $null = $sb.AppendLine("</table></details>")
+        }
+    } else {
+        $null = $sb.AppendLine("<div class='meta'>No multi-source binary correlations in this case (a binary must appear in 2+ independent evidence sources to be listed here).</div>")
+    }
+    if ($entA.Count -gt 0 -and @($entA | Where-Object { [int]$_.Logons -gt 0 -or [int]$_.Failed -gt 0 -or "$($_.RdpOutTargets)" -or [double]"$($_.ConsoleHistoryKB)" -gt 0 }).Count -gt 0) {
+        $null = $sb.AppendLine("<h3>Account activity</h3><table><tr><th>Account</th><th>Logons</th><th>Failed</th><th>Logon types</th><th>Source IPs</th><th>RDP out to</th><th>Console hist</th></tr>")
+        foreach ($a2 in ($entA | Select-Object -First 10)) {
+            $fCls = if ([int]"$($a2.Failed)" -ge 5) { 'crit' } elseif ([int]"$($a2.Failed)" -gt 0) { 'med' } else { 'info' }
+            $null = $sb.AppendLine("<tr><td><b>$(ConvertTo-HtmlEsc $a2.Account)</b></td><td>$($a2.Logons)</td><td class='$fCls'>$($a2.Failed)</td><td>$(ConvertTo-HtmlEsc $a2.LogonTypes)</td><td>$(ConvertTo-HtmlEsc $a2.Sources)</td><td class='path'>$(ConvertTo-HtmlEsc $a2.RdpOutTargets)</td><td>$($a2.ConsoleHistoryKB) KB</td></tr>")
+        }
+        $null = $sb.AppendLine("</table>")
+    }
+    if ($entR.Count -gt 0 -and @($entR | Where-Object { [int]$_.Connections -gt 0 -or "$($_.Beacon)" -or [int]$_.FailedLogons -gt 0 -or [int]$_.RdpOutCount -gt 0 }).Count -gt 0) {
+        $null = $sb.AppendLine("<h3>Remote endpoints</h3><table><tr><th>Remote</th><th>Public</th><th>Conns</th><th>Talkers</th><th>Beacon</th><th>Failed logons</th><th>RDP out</th></tr>")
+        foreach ($e in ($entR | Select-Object -First 12)) {
+            $bCls = switch -Regex ("$($e.Beacon)") { 'high' { 'crit'; break } 'medium' { 'med'; break } default { 'info' } }
+            $null = $sb.AppendLine("<tr><td>$(New-VtLink $e.Remote)</td><td>$(ConvertTo-HtmlEsc $e.Public)</td><td>$($e.Connections)</td><td class='path'>$(ConvertTo-HtmlEsc $e.Talkers)</td><td class='$bCls'>$(ConvertTo-HtmlEsc $e.Beacon)</td><td class='$(if ([int]"$($e.FailedLogons)" -gt 0) { 'crit' } else { 'info' })'>$($e.FailedLogons)</td><td>$($e.RdpOutCount)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table>")
+    }
+    if ($srumRows.Count -gt 0) {
+        $appCol = @($srumRows[0].PSObject.Properties.Name | Where-Object { $_ -match '(?i)^(app|application|path|name|image)' } | Select-Object -First 1)[0]
+        $numCols = @($srumRows[0].PSObject.Properties.Name | Where-Object { $_ -match '(?i)byte|sent|recv' })
+        if ($appCol -and $numCols.Count -gt 0) {
+            $null = $sb.AppendLine("<h3>Top network consumers (SRUM - per-app history)</h3><table><tr><th>Application</th>$((($numCols | Select-Object -First 4) | ForEach-Object { "<th>$(ConvertTo-HtmlEsc $_)</th>" }) -join '')</tr>")
+            $srumTop = $srumRows
+            try {
+                $srumTop = @($srumRows | Sort-Object -Property @{e = { $t = 0L; foreach ($nc in ($numCols | Select-Object -First 4)) { $p2 = $_.PSObject.Properties[$nc]; if ($p2) { $t += [long]"$($p2.Value)" } }; $t }; Descending = $true } | Select-Object -First 12)
+            } catch { }
+            foreach ($s2 in $srumTop) {
+                $cells = ($numCols | Select-Object -First 4) | ForEach-Object { $p2 = $s2.PSObject.Properties[$_]; "<td>$(ConvertTo-HtmlEsc $(if ($p2) { $p2.Value }))</td>" }
+                $null = $sb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $s2.$appCol)</td>$($cells -join '')</tr>")
+            }
+            $null = $sb.AppendLine("</table><div class='meta'>SRUM records ~30 days of per-application network/resource usage. High sustained upload from a user-path binary = exfiltration candidate. Source: csv\srum_usage.csv</div>")
+        }
+    }
+
     # ---------- host snapshot ----------
     $null = $sb.AppendLine("<a name='snapshot'></a><h2>Host snapshot (AV state, stored credentials, outbound RDP)</h2>")
     $snapAny = $false
@@ -3912,6 +3976,9 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'srum_usage'                      = 'SRUM: per-app resource/network usage over weeks'
         'logging_gaps'                    = 'Log clear/stop events + evtx coverage gaps'
         'parse_needed'                    = 'Artifacts not finished on the endpoint + exactly how to finish them (-Mode Parse)'
+        'entities_binaries'               = 'Binaries joined across ALL evidence sources (execution/persistence/network/verdict...) with category counts'
+        'entities_accounts'               = 'Accounts joined across logons/RDP/console history with failure counts'
+        'entities_remotes'                = 'Remote endpoints joined across connections/beacons/brute-force/RDP targets'
         'delta_new'                       = 'Findings NEW since the previous collection'
         'supertimeline'                   = 'All event sources merged chronologically - the master timeline'
     }
@@ -3997,6 +4064,249 @@ function New-SigmaRuleLogs {
     $index | Sort-Object { Get-LvlRank "$($_.MaxLevel)" } -Descending |
         Export-Csv -LiteralPath (Join-Path $dir 'index.csv') -NoTypeInformation -Encoding UTF8
     Write-CaseLog "    sigma rule logs: $($index.Count) rule(s) -> csv\sigma_rules\ (per-rule event CSVs + index.csv)" 'DarkGray'
+}
+
+function New-EntityCorrelation {
+    # Cross-source entity correlation (report-only): joins binaries, accounts and remote
+    # endpoints across the case CSVs so one entity's story is readable in one place.
+    # Missing sources contribute nothing - graceful by design.
+    $CAP = 2000
+    $rowsOf = {
+        param([string]$name)
+        try { return @((Import-CaseCsv $name) | Select-Object -First $CAP) } catch { return @() }
+    }
+
+    # ---------- binaries: keyed by full path, name fallback ----------
+    $binsByPath = @{}
+    $binsByName = @{}
+    $binNew = {
+        param([string]$raw)
+        $p = ("$raw").Trim().Trim('"')
+        # SRUM reports device-style paths - normalize to the drive letter (best effort: volume 3 is C: on the vast majority of systems)
+        # ponytail: fixed harddiskvolume->C: mapping; per-volume letter resolution needs the mounteddevices hive
+        $p = $p -replace '(?i)^\\device\\harddiskvolume\d+\\', 'C:\'
+        if (-not $p) { return $null }
+        $lk = $p.ToLower()
+        $nk = Split-Path $lk -Leaf
+        if (-not $nk) { $nk = $lk }
+        if ($p.Contains('\') -and $binsByPath.ContainsKey($lk)) { return $binsByPath[$lk] }
+        if (-not $p.Contains('\') -and $binsByName.ContainsKey($nk)) { return $binsByName[$nk] }
+        $b = [pscustomobject]@{
+            Path = $(if ($p.Contains('\')) { $p } else { "(name-only) $p" })
+            Name = $nk
+            Cats = New-Object System.Collections.Generic.List[string]
+            Evidence = New-Object System.Collections.Generic.List[string]
+            Hashes = New-Object System.Collections.Generic.List[string]
+            Verdict = ''; Signer = ''; FirstSeen = ''; LastSeen = ''; Bytes = ''
+        }
+        $binsByPath[$lk] = $b
+        if (-not $binsByName.ContainsKey($nk)) { $binsByName[$nk] = $b }
+        return $b
+    }
+    $binAdd = {
+        param($b, [string]$cat, [string]$detail, [string]$when)
+        if (-not $b) { return }
+        if ($b.Cats -notcontains $cat) { $b.Cats.Add($cat) }
+        if ($detail) {
+            $line = "$cat`: $detail"
+            if ($b.Evidence.Count -lt 14 -and -not $b.Evidence.Contains($line)) { $b.Evidence.Add($line.Substring(0, [Math]::Min(220, $line.Length))) }
+        }
+        if ($when) {
+            $t = $null
+            try { $t = [datetime]$when } catch { }
+            if ($t) {
+                if (-not $b.FirstSeen -or $t -lt [datetime]$b.FirstSeen) { $b.FirstSeen = "$t" }
+                if (-not $b.LastSeen -or $t -gt [datetime]$b.LastSeen) { $b.LastSeen = "$t" }
+            }
+        }
+    }
+    $binFromRow = {
+        param($r)
+        foreach ($pn in @('Binary', 'Image', 'ProcessPath', 'Process', 'Executable', 'Application', 'AppPath', 'App')) {
+            $p2 = $r.PSObject.Properties[$pn]
+            if ($p2 -and "$($p2.Value)") { return (& $binNew $p2.Value) }
+        }
+        # 'Path'/'PathName' are only trusted when they name a real binary (service/task rows abuse these for names)
+        foreach ($pn in @('PathName', 'SourceFile', 'Path')) {
+            $p2 = $r.PSObject.Properties[$pn]
+            if ($p2 -and "$($p2.Value)" -match '\.(exe|dll|sys|ps1|bat|js|vbs|hta|com|ocx|drv)$') { return (& $binNew $p2.Value) }
+        }
+        foreach ($pn in @('Actions', 'Value', 'Details', 'Command')) {
+            $p2 = $r.PSObject.Properties[$pn]
+            if ($p2 -and "$($p2.Value)" -match '(?i)([a-z]:\\[^\s"|]+\.(exe|dll|sys|ps1|bat|js|vbs|hta))') { return (& $binNew $Matches[1]) }
+        }
+        foreach ($pn in @('Name', 'ExecutableName', 'FileName')) {
+            $p2 = $r.PSObject.Properties[$pn]
+            if ($p2 -and "$($p2.Value)" -match '\.(exe|dll|sys|ps1|bat|js|vbs|hta)$') { return (& $binNew $p2.Value) }
+        }
+        return $null
+    }
+
+    foreach ($r in (& $rowsOf 'flash_process_scored')) {
+        $b = & $binFromRow $r
+        if ($b) { $b.Verdict = "$($r.Verdict)"; $b.Signer = "$($r.Signer)"; & $binAdd $b 'verdict' "[$($r.Verdict) $($r.Score)] $($r.Evidence)" '' }
+    }
+    foreach ($r in (& $rowsOf 'processes')) { & $binAdd (& $binFromRow $r) 'running' "PID $($r.PID)" '' }
+    foreach ($r in (& $rowsOf 'process_hashes')) { $b = & $binFromRow $r; if ($b) { $null = $b.Hashes.Add("$($r.SHA256)"); & $binAdd $b 'hash' "$($r.SHA256)" '' } }
+    foreach ($src in @('services', 'services_flagged')) {
+        foreach ($r in (& $rowsOf $src)) {
+            $b = & $binFromRow $r
+            $svcName = if ($r.PSObject.Properties['Service']) { "$($r.Service)" } elseif ($r.PSObject.Properties['Name']) { "$($r.Name)" } else { '' }
+            & $binAdd $b 'svc-persist' "service $svcName" ''
+        }
+    }
+    foreach ($r in (& $rowsOf 'scheduled_tasks_flagged')) { & $binAdd (& $binFromRow $r) 'task-persist' "task $($r.Name) (runas $($r.RunAs)) flags $($r.Flags)" '' }
+    foreach ($src in @('autoruns_runkeys', 'asep_sweep')) {
+        foreach ($r in (& $rowsOf $src)) { & $binAdd (& $binFromRow $r) 'autorun-persist' "$($r.Location) / $($r.Name)" '' }
+    }
+    foreach ($r in (& $rowsOf 'sysmon_network')) { & $binAdd (& $binFromRow $r) 'conn' "$($r.DestIp):$($r.DestPort)" "$($r.Time)" }
+    foreach ($r in (& $rowsOf 'flash_public_connections')) { & $binAdd (& $binFromRow $r) 'conn' "public $($r.RemoteAddress):$($r.RemotePort)" '' }
+    foreach ($r in (& $rowsOf 'beacon_candidates')) { & $binAdd (& $binFromRow $r) 'beacon' "[$($r.Severity)] -> $($r.RemoteIp):$($r.Port) every ~$($r.MedianIntervalSec)s" '' }
+    foreach ($r in (& $rowsOf 'dns_beacon_candidates')) { & $binAdd (& $binFromRow $r) 'beacon' "[$($r.Severity)] DNS $($r.Domain) every ~$($r.MedianIntervalSec)s" '' }
+    foreach ($r in (& $rowsOf 'srum_usage')) {
+        $b = & $binFromRow $r
+        if ($b) {
+            $bt = (@($r.PSObject.Properties | Where-Object { $_.Name -match '(?i)byte|sent|recv|duration' } | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
+            if ($bt) { $b.Bytes = if ($b.Bytes) { "$($b.Bytes); $bt" } else { $bt }
+                if ($b.Bytes.Length -gt 300) { $b.Bytes = $b.Bytes.Substring(0, 300) + '...' } }
+            & $binAdd $b 'srum-usage' $bt ''
+        }
+    }
+    foreach ($r in (& $rowsOf 'yara_hits')) { & $binAdd (& $binFromRow $r) 'yara' "$($r.Rule)" '' }
+    foreach ($r in (& $rowsOf 'loldrivers_hits')) { & $binAdd (& $binFromRow $r) 'loldriver' "$($r.Status)" '' }
+    foreach ($r in (& $rowsOf 'mft_recent')) { & $binAdd (& $binFromRow $r) 'mft-created' $r.Created "$($r.Created)" }
+    foreach ($r in (& $rowsOf 'ioc_hits_amcache')) { & $binAdd (& $binFromRow $r) 'ioc' "$($r.Indicator) (amcache $($r.SourceFile))" '' }
+    foreach ($r in ((& $rowsOf 'hayabusa_timeline') | Where-Object { (Get-LvlRank "$($_.Level)") -ge 3 })) {
+        if ("$($r.Details)" -match '(?i)([a-z0-9_\-]+\.(exe|dll|ps1|js|vbs|hta))') { & $binAdd (& $binNew $Matches[1]) 'sigma' "[$($r.Level)] $($r.RuleTitle)" "$($r.Timestamp)" }
+    }
+
+    # ---------- accounts ----------
+    $accts = @{}
+    $acctGet = {
+        param([string]$name)
+        $a2 = ("$name").Trim()
+        if (-not $a2 -or $a2 -match '^(-|\$|DWM-|UMFD-)$' -or $a2 -in @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE', 'ANONYMOUS LOGON')) { return $null }
+        $lk = $a2.ToLower()
+        if (-not $accts.ContainsKey($lk)) {
+            $accts[$lk] = [pscustomobject]@{
+                Account = $a2; Logons = 0; Failed = 0
+                Types = New-Object System.Collections.Generic.List[string]
+                Sources = New-Object System.Collections.Generic.List[string]
+                RdpTargets = New-Object System.Collections.Generic.List[string]
+                ConsoleKB = 0.0; Created = ''
+                Evidence = New-Object System.Collections.Generic.List[string]
+            }
+        }
+        return $accts[$lk]
+    }
+    $acctFromRow = {
+        param($r)
+        foreach ($pn in @('Account', 'User', 'UserName', 'TargetUserName', 'SubjectUserName', 'RunAs')) {
+            $p2 = $r.PSObject.Properties[$pn]
+            if ($p2 -and "$($p2.Value)") { return (& $acctGet $p2.Value) }
+        }
+        return $null
+    }
+    $logonTypeNames = @{ 2 = 'interactive'; 3 = 'network'; 4 = 'batch'; 5 = 'service'; 7 = 'unlock'; 8 = 'net-cleartext'; 9 = 'new-creds'; 10 = 'rdp'; 11 = 'cached' }
+    foreach ($r in (& $rowsOf 'security_auth_events')) {
+        $a2 = & $acctFromRow $r
+        if (-not $a2) { continue }
+        if ("$($r.EventId)" -eq '4624') {
+            $a2.Logons++
+            $lt = $null
+            try { $lt = [int]"$($r.LogonType)" } catch { }
+            $tn = if ($lt -and $logonTypeNames.ContainsKey($lt)) { $logonTypeNames[$lt] } else { '' }
+            if ($tn -and $a2.Types -notcontains $tn) { $null = $a2.Types.Add($tn) }
+            if ($tn -eq 'rdp') { if ($a2.Evidence.Count -lt 14) { $a2.Evidence.Add("rdp-in logon at $($r.Time)") | Out-Null } }
+        }
+        if ("$($r.EventId)" -eq '4625') { $a2.Failed++; if ("$($r.SourceIp)" -and -not $a2.Sources.Contains("$($r.SourceIp)")) { $null = $a2.Sources.Add("$($r.SourceIp)") } }
+    }
+    foreach ($r in (& $rowsOf 'rdp_localsession')) {
+        $a2 = & $acctFromRow $r
+        if ($a2 -and $a2.Evidence.Count -lt 14 -and -not ($a2.Evidence | Where-Object { $_ -match '^rdp-session' })) { $a2.Evidence.Add("rdp-session: $($r.TimeCreated)") | Out-Null }
+    }
+    foreach ($r in (& $rowsOf 'rdp_client_targets')) {
+        $a2 = & $acctFromRow $r
+        if ($a2) {
+            if (-not $a2.RdpTargets.Contains("$($r.TargetServer)")) { $null = $a2.RdpTargets.Add("$($r.TargetServer)") }
+            $a2.Evidence.Add("rdp-out: $($r.TargetServer) (hint $($r.UsernameHint))") | Out-Null
+        }
+    }
+    foreach ($r in (& $rowsOf 'powershell_console_history')) {
+        $a2 = & $acctFromRow $r
+        if ($a2) { $a2.ConsoleKB = [math]::Round($a2.ConsoleKB + [double]"$($r.KB)", 1); $a2.Evidence.Add("console history: $($r.KB) KB (raw\useractivity\$($a2.Account))") | Out-Null }
+    }
+
+    # ---------- remote endpoints ----------
+    $rem = @{}
+    $remGet = {
+        param([string]$ip)
+        $k = ("$ip").Trim().ToLower()
+        if (-not $k) { return $null }
+        if (-not $rem.ContainsKey($k)) {
+            $rem[$k] = [pscustomobject]@{
+                Remote = "$ip"; Public = (Test-IsPublicIp $ip); Conns = 0
+                Talkers = New-Object System.Collections.Generic.List[string]
+                Beacon = ''; Brute = 0; RdpOut = 0
+                Evidence = New-Object System.Collections.Generic.List[string]
+            }
+        }
+        return $rem[$k]
+    }
+    foreach ($r in (& $rowsOf 'sysmon_network')) {
+        $e = & $remGet $r.DestIp
+        if ($e) {
+            $e.Conns++
+            if ("$($r.Image)") { $leaf = Split-Path "$($r.Image)" -Leaf; if ($leaf -and -not $e.Talkers.Contains($leaf)) { $null = $e.Talkers.Add($leaf) } }
+        }
+    }
+    foreach ($r in (& $rowsOf 'flash_public_connections')) {
+        $e = & $remGet $r.RemoteAddress
+        if ($e) {
+            $e.Conns++
+            if ("$($r.ProcessPath)") { $leaf = Split-Path "$($r.ProcessPath)" -Leaf; if ($leaf -and -not $e.Talkers.Contains($leaf)) { $null = $e.Talkers.Add($leaf) } }
+        }
+    }
+    foreach ($r in (& $rowsOf 'beacon_candidates')) { $e = & $remGet $r.RemoteIp; if ($e) { $e.Beacon = "$($r.Severity)"; $e.Evidence.Add("beacon $($r.Severity) from $($r.Process)") | Out-Null } }
+    foreach ($r in (& $rowsOf 'dns_beacon_candidates')) { $e = & $remGet $r.ResolvedIp; if ($e) { if (-not $e.Beacon) { $e.Beacon = "$($r.Severity)" }; $e.Evidence.Add("dns-beacon $($r.Severity) for $($r.Domain)") | Out-Null } }
+    foreach ($r in (& $rowsOf 'security_bruteforce_candidates')) { $e = & $remGet $r.SourceIp; if ($e) { $e.Brute = [int]"$($r.FailedLogons)"; $e.Evidence.Add("brute-force: $($r.FailedLogons) failed logons") | Out-Null } }
+    foreach ($r in (& $rowsOf 'rdp_client_targets')) { $e = & $remGet $r.TargetServer; if ($e) { $e.RdpOut++; $e.Evidence.Add("rdp-out target (hint $($r.UsernameHint))") | Out-Null } }
+
+    # ---------- emit ----------
+    if ($env:OPHIRA_DBG_ENT) { foreach ($kv in $binsByPath.GetEnumerator()) { Write-Host ("DBG bin: {0} -> [{1}]" -f $kv.Key, ($kv.Value.Cats -join ",")) } }
+    if ($env:OPHIRA_DBG_ENT) { foreach ($a2 in $accts.Values) { Write-Host ("DBG acct: {0} logons={1} failed={2}" -f $a2.Account, $a2.Logons, $a2.Failed) } }
+    $binRows = @($binsByPath.Values | ForEach-Object {
+        [pscustomobject]@{
+            Categories = ($_.Cats -join ';'); CatCount = $_.Cats.Count; Name = $_.Name; Path = $_.Path
+            Verdict = $_.Verdict; Signer = $_.Signer; FirstSeen = $_.FirstSeen; LastSeen = $_.LastSeen
+            Hashes = (($_.Hashes | Select-Object -Unique | Select-Object -First 4) -join ';'); Bytes = $_.Bytes
+            Evidence = ($_.Evidence -join ' | ')
+        }
+    } | Sort-Object @{e = 'CatCount'; Descending = $true }, @{e = { if ("$($_.Verdict)" -match 'HIGH') { 2 } elseif ("$($_.Verdict)" -match 'MEDIUM') { 1 } else { 0 } }; Descending = $true })
+    Save-Rows -Name 'entities_binaries' -Rows $binRows
+
+    $acctRows = @($accts.Values | ForEach-Object {
+        $ev = ($_.Evidence | Select-Object -Unique | Select-Object -First 12) -join ' | '
+        [pscustomobject]@{
+            Account = $_.Account; Logons = $_.Logons; Failed = $_.Failed; LogonTypes = ($_.Types -join ';')
+            Sources = ($_.Sources | Select-Object -Unique) -join ';'; RdpOutTargets = ($_.RdpTargets | Select-Object -Unique) -join ';'
+            ConsoleHistoryKB = $_.ConsoleKB; Evidence = $ev
+        }
+    } | Sort-Object @{e = 'Failed'; Descending = $true }, @{e = 'Logons'; Descending = $true })
+    Save-Rows -Name 'entities_accounts' -Rows $acctRows
+
+    $remRows = @($rem.Values | ForEach-Object {
+        [pscustomobject]@{
+            Remote = $_.Remote; Public = $_.Public; Connections = $_.Conns
+            Talkers = (($_.Talkers | Select-Object -Unique | Select-Object -First 6) -join ';')
+            Beacon = $_.Beacon; FailedLogons = $_.Brute; RdpOutCount = $_.RdpOut
+            Evidence = (($_.Evidence | Select-Object -Unique | Select-Object -First 10) -join ' | ')
+        }
+    } | Sort-Object @{e = 'Beacon'; Descending = $true }, @{e = 'FailedLogons'; Descending = $true }, @{e = 'Connections'; Descending = $true })
+    Save-Rows -Name 'entities_remotes' -Rows $remRows
+
+    $multi = @($binRows | Where-Object { $_.CatCount -ge 2 }).Count
+    Write-CaseLog "    entity correlation: $($binRows.Count) binaries ($multi multi-source), $($acctRows.Count) accounts, $($remRows.Count) remotes -> csv\entities_*.csv" 'DarkGray'
 }
 
 function New-LoggingGaps {
@@ -4265,6 +4575,7 @@ function Get-CompromiseVerdict {
     Add-Cov 'Defender status' (Test-Path (Join-Path $CsvDir 'defender_status.csv')) 5
     Add-Cov 'YARA binary scan' (Test-Path (Join-Path $CsvDir 'yara_scanned.csv')) 5
     Add-Cov 'DNS query telemetry (Sysmon EID 22)' (Test-Path (Join-Path $CsvDir 'sysmon_dns.csv')) 4
+    Add-Cov 'Entity correlation' (Test-Path (Join-Path $CsvDir 'entities_binaries.csv')) 3
     Add-Cov 'LOLDrivers driver hash check' (Test-Path (Join-Path $CsvDir 'loldrivers_hits.csv')) 3
     Add-Cov 'Sysmon telemetry (bonus)' ([bool]$Sysmon) 5
     Add-Cov 'RAM capture (bonus)' (Test-Path $MemDir) 3
@@ -4331,6 +4642,7 @@ function Invoke-RegenerateOutputs {
     param([pscustomobject]$Case)
     try { New-SuperTimeline } catch { Write-CaseLog "    supertimeline failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-SigmaRuleLogs } catch { Write-CaseLog "    sigma rule logs failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-EntityCorrelation } catch { Write-CaseLog "    entity correlation failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-LoggingGaps } catch { Write-CaseLog "    logging gaps failed: $($_.Exception.Message)" 'DarkYellow' }
     try { Get-ParseNeeds } catch { Write-CaseLog "    parse-needed check failed: $($_.Exception.Message)" 'DarkYellow' }
     $script:Verdict = $null
@@ -5211,3 +5523,4 @@ if ($script:SimpleUI) {
     Write-Host "Press any key to close..." -ForegroundColor DarkGray
     try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
 }
+
