@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.19  -  Windows Incident Response Triage Toolkit
+Ophira v2.20  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -34,7 +34,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.19"
+$ScriptVersion = "2.20"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -767,6 +767,8 @@ function Invoke-AnalyzeMode {
     }
     $pool.Close()
     $pool.Dispose()
+    $lateralRaw = New-Object System.Collections.Generic.List[object]
+    $hostIps = @{}
     foreach ($src in $sources) {
         $tmp = $null
         $dir = $src.FullName
@@ -806,6 +808,7 @@ function Invoke-AnalyzeMode {
                 'process_hashes.csv'                 = 'FileHash'
                 'loldrivers_hits.csv'                = 'LolDriver'
                 'dns_beacon_candidates.csv'          = 'DnsBeacon'
+                'hunt_findings.csv'                  = 'HuntHit'
             }
             foreach ($k in $map.Keys) {
                 $f = Join-Path $csvDir $k
@@ -823,6 +826,7 @@ function Invoke-AnalyzeMode {
                             if ($r.PSObject.Properties['RemoteAddress']) { $detail += "$($r.RemoteAddress):$($r.RemotePort) <- $($r.ProcessPath)" }
                             if ($r.PSObject.Properties['Service']) { $detail += "$($r.Service) $($r.Binary)" }
                             if ($r.PSObject.Properties['Verdict']) { $detail = "[$($r.Verdict) $($r.Score)] " + $detail + " {$($r.Evidence)}" }
+                            if ($k -eq 'hunt_findings.csv') { $detail = "[$($r.Severity)] $($r.Rule): $($r.Entity) - $($r.Evidence)" }
                         if ($k -eq 'flash_process_scored.csv' -and $r.PSObject.Properties['Signer'] -and "$($r.Signer)") {
                             $signerRows += [pscustomobject]@{ Host = $host_; Signer = "$($r.Signer)"; Name = "$($r.Name)"; Verdict = "$($r.Verdict)" }
                         }
@@ -831,6 +835,28 @@ function Invoke-AnalyzeMode {
                         }
                     } catch { }
                 }
+            }
+            # lateral-chain input: share access rows + local IPs for cross-host stitching (v2.20)
+            $sa = Join-Path $csvDir 'security_share_access.csv'
+            if (Test-Path $sa) {
+                try {
+                    foreach ($r in (Import-Csv $sa)) {
+                        $ip = "$($r.SourceIp)"
+                        if (-not $ip -or $ip -eq '-' -or $ip -eq '::1' -or $ip -eq '127.0.0.1') { continue }
+                        $lateralRaw.Add([pscustomobject]@{ Host = $host_; Time = "$($r.Time)"; EventId = "$($r.EventId)"; Account = "$($r.Account)"; ShareName = "$($r.ShareName)"; TargetName = "$($r.RelativeTargetName)"; SourceIp = $ip })
+                    }
+                } catch { }
+            }
+            $ni = Join-Path $csvDir 'net_interfaces.csv'
+            if (Test-Path $ni) {
+                try {
+                    foreach ($r in (Import-Csv $ni)) {
+                        foreach ($ip in ("$($r.IPv4)" -split ',')) {
+                            $ip = $ip.Trim()
+                            if ($ip) { $hostIps[$ip] = $host_ }
+                        }
+                    }
+                } catch { }
             }
         }
         $e = Join-Path $dir 'raw\evtx'
@@ -854,9 +880,9 @@ function Invoke-AnalyzeMode {
         }
         if ($hosts.Count -gt $withVerdict.Count) { Write-Host "    ($($hosts.Count - $withVerdict.Count) legacy case(s) without verdict - rerun those hosts with Ophira v2.6+)" -ForegroundColor DarkGray }
     }
-    $highRisk = @($findings | Where-Object { $_.Type -in @('IOC-HIT', 'AVDetection') })
+    $highRisk = @($findings | Where-Object { $_.Type -in @('IOC-HIT', 'AVDetection', 'HuntHit') })
     if ($highRisk.Count) {
-        Write-Host "`n  *** HIGH-PRIORITY (IOC hits / AV detections) ***" -ForegroundColor Red
+        Write-Host "`n  *** HIGH-PRIORITY (IOC hits / AV detections / hunt hits) ***" -ForegroundColor Red
         $highRisk | Group-Object Host | ForEach-Object { Write-Host "    $($_.Name): $($_.Count)" -ForegroundColor Red }
     }
     $crossHost = @()
@@ -892,6 +918,21 @@ function Invoke-AnalyzeMode {
         }
     }
     $hayOut = $null
+    $lateral = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $lateralRaw) {
+        if (-not $hostIps.ContainsKey($r.SourceIp)) { continue }
+        $from = $hostIps[$r.SourceIp]
+        if ($from -eq $r.Host) { continue }
+        $null = $lateral.Add([pscustomobject]@{ FromHost = $from; ToHost = $r.Host; Account = $r.Account; Share = $r.ShareName; Target = $r.TargetName; Time = $r.Time; SourceIp = $r.SourceIp; EventId = $r.EventId })
+    }
+    if ($lateral.Count -gt 0) {
+        $latCsv = Join-Path $OutFolder 'fleet_lateral_chain.csv'
+        $lateral.ToArray() | Sort-Object FromHost, ToHost | Export-Csv -LiteralPath $latCsv -NoTypeInformation -Encoding UTF8
+        Write-Host "`n  LATERAL MOVEMENT CHAINS (share access from another collected host): $($lateral.Count) -> fleet_lateral_chain.csv" -ForegroundColor Magenta
+        foreach ($l in ($lateral.ToArray() | Sort-Object FromHost, ToHost | Select-Object -First 20)) {
+            Write-Host ("    {0} -> {1} [{2}] share={3} target={4} ({5})" -f $l.FromHost, $l.ToHost, $l.Account, $l.Share, $l.Target, $l.SourceIp) -ForegroundColor Magenta
+        }
+    }
     if ($HayabusaExe -and $evtxDirs.Count -gt 0) {
         Write-Host "`n  Running hayabusa fleet timeline over $($evtxDirs.Count) hosts' evtx..." -ForegroundColor Cyan
         $merged = Join-Path ([IO.Path]::GetTempPath()) 'fleet_merged_evtx'
@@ -960,11 +1001,18 @@ a{color:#8ab4f8}.foot{margin-top:40px;color:#565e6b;font-size:11px}
     }
     $null = $fsb.AppendLine("</table><div class='meta'>Per-host verdict details: each case zip's verdict.json + report.html. Host list CSV: fleet_hosts.csv</div>")
     if ($highRisk.Count -gt 0) {
-        $null = $fsb.AppendLine("<h2>High-priority findings (IOC / AV)</h2><table><tr><th>Host</th><th>Type</th><th>Detail</th></tr>")
+        $null = $fsb.AppendLine("<h2>High-priority findings (IOC / AV / hunt)</h2><table><tr><th>Host</th><th>Type</th><th>Detail</th></tr>")
         foreach ($f in ($highRisk | Sort-Object Host | Select-Object -First 100)) {
             $null = $fsb.AppendLine("<tr><td class='IOC'>$(ConvertTo-HtmlEsc $f.Host)</td><td>$(ConvertTo-HtmlEsc $f.Type)</td><td class='path'>$(ConvertTo-HtmlEsc $f.Detail)</td></tr>")
         }
-        $null = $fsb.AppendLine("</table>")
+        $null = $fsb.AppendLine("</table><div class='meta'>HuntHit rows are high/medium technique detections from each host's csv\hunt_findings.csv</div>")
+    }
+    if ($lateral.Count -gt 0) {
+        $null = $fsb.AppendLine("<h2>Lateral movement chains (share access between collected hosts)</h2><table><tr><th>From</th><th>To</th><th>Account</th><th>Share</th><th>Target</th><th>Time</th><th>Source IP</th></tr>")
+        foreach ($l in ($lateral.ToArray() | Sort-Object FromHost, ToHost | Select-Object -First 100)) {
+            $null = $fsb.AppendLine("<tr><td class='IOC'>$(ConvertTo-HtmlEsc $l.FromHost)</td><td>$(ConvertTo-HtmlEsc $l.ToHost)</td><td>$(ConvertTo-HtmlEsc $l.Account)</td><td>$(ConvertTo-HtmlEsc $l.Share)</td><td class='path'>$(ConvertTo-HtmlEsc $l.Target)</td><td>$(ConvertTo-HtmlEsc $l.Time)</td><td>$(ConvertTo-HtmlEsc $l.SourceIp)</td></tr>")
+        }
+        $null = $fsb.AppendLine("</table><div class='meta'>Joined each host's csv\security_share_access.csv SourceIp against every other host's csv\net_interfaces.csv. CSV: fleet_lateral_chain.csv</div>")
     }
     if ($hayOut -and (Test-Path $hayOut)) {
         $ftech = @{}
@@ -1406,7 +1454,7 @@ $script:SharedFunctions = @(
     'Save-Rows', 'Out-RawText', 'Invoke-ExeCapture', 'Invoke-NativeTool', 'Get-WmiOrCim', 'Convert-WmiDate',
     'Test-IsPublicIp', 'Test-IsUserWritablePath', 'Get-SignatureInfo', 'Get-SysmonState',
     'Get-UserProfileList', 'Get-UserAssistRows', 'ConvertTo-Rot13', 'Get-FilteredEvents', 'Export-Evtx',
-    'Import-CaseCsv', 'Invoke-BrowserIocXref'
+    'Import-CaseCsv', 'Invoke-BrowserIocXref', 'Get-EventDataRows'
 )
 
 $script:ModuleWorkerText = @'
@@ -1924,7 +1972,7 @@ $script:Modules = @(
     [pscustomobject]@{ Id = '4.1'; Cat = 'LOGS'; Name = 'Security log (auth events + evtx export)'; Default = $true; Quick = $false;
         Run = {
             $start = Get-LogStart
-            $ids = @(4624, 4625, 4648, 4672, 4720, 4722, 4724, 4726, 4728, 4732, 4735, 4756, 4688, 1102)
+            $ids = @(4624, 4625, 4648, 4672, 4720, 4722, 4724, 4726, 4728, 4732, 4735, 4756, 4688, 4698, 5140, 5145, 1102)
             $ev = Get-FilteredEvents -LogName 'Security' -Ids $ids -Start $start
             Save-Rows -Name 'security_events' -Rows $ev
             $auth = @($ev | Where-Object { $_.Id -in @(4624, 4625) } | ForEach-Object {
@@ -1942,6 +1990,22 @@ $script:Modules = @(
             $sum = @($auth | Group-Object Account, SourceIp | Sort-Object Count -Descending | Select-Object -First 100 |
                 ForEach-Object { [pscustomobject]@{ AccountSource = $_.Name; Count = $_.Count } })
             Save-Rows -Name 'security_auth_summary' -Rows $sum
+            # v2.20 structured parses (fields need audit policy: 4688 cmdline needs "Include Command Line")
+            $procEv = Get-EventDataRows -LogName 'Security' -Id @(4688) -Start $start -Cap 4000 -Fields ([ordered]@{ Account = 'SubjectUserName'; NewProcess = 'NewProcessName'; CommandLine = 'CommandLine'; ParentProcess = 'ParentProcessName' })
+            Save-Rows -Name 'security_proc_events' -Rows $procEv
+            if ($procEv.Count -gt 0) { Write-CaseLog "    4688 process creations: $($procEv.Count) (empty CommandLine = cmdline audit off)" 'Gray' }
+            $taskEv = Get-EventDataRows -LogName 'Security' -Id @(4698) -Start $start -Cap 500 -Fields ([ordered]@{ Account = 'SubjectUserName'; TaskName = 'TaskName'; TaskContent = 'TaskContent' })
+            foreach ($t in $taskEv) {
+                $cmd = ''
+                if ("$($t.TaskContent)" -match '<Command>([^<]+)</Command>') { $cmd = $Matches[1] }
+                $t | Add-Member -NotePropertyName Command -NotePropertyValue $cmd -Force
+                $t.PSObject.Properties.Remove('TaskContent')
+            }
+            Save-Rows -Name 'security_task_install' -Rows $taskEv
+            if ($taskEv.Count -gt 0) { Write-CaseLog "    4698 scheduled task installs: $($taskEv.Count)" 'Gray' }
+            $shareEv = Get-EventDataRows -LogName 'Security' -Id @(5140, 5145) -Start $start -Cap 8000 -Fields ([ordered]@{ Account = 'SubjectUserName'; ShareName = 'ShareName'; RelativeTargetName = 'RelativeTargetName'; SourceIp = 'IpAddress'; AccessList = 'AccessList' })
+            Save-Rows -Name 'security_share_access' -Rows $shareEv
+            if ($shareEv.Count -ge 8000) { Write-CaseLog "    share access: capped at 8000 rows - wide file-share activity (file server?)" 'DarkGray' }
             Export-Evtx -LogName 'Security' -FileName 'Security.evtx'
         } }
     [pscustomobject]@{ Id = '4.2'; Cat = 'LOGS'; Name = 'PowerShell operational log (4104 script blocks)'; Default = $true; Quick = $false;
@@ -2008,6 +2072,15 @@ $script:Modules = @(
             } catch { }
             Save-Rows -Name 'sysmon_image_load' -Rows $img
             if ($img.Count -gt 0) { Write-CaseLog "    sysmon image loads: $($img.Count) (DLL side-load data source)" 'Gray' }
+            # v2.20: EID 10 process access (LSASS-access data source), EID 13 registry (UAC-bypass/persistence), EID 2 file time (timestomping)
+            $pa = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(10) -Start $start -Cap 3000 -Fields ([ordered]@{ SourceImage = 'SourceImage'; TargetImage = 'TargetImage'; GrantedAccess = 'GrantedAccess'; CallTrace = 'CallTrace' })
+            Save-Rows -Name 'sysmon_process_access' -Rows $pa
+            if ($pa.Count -ge 3000) { Write-CaseLog "    EID 10 process access: capped at 3000 - widen the Sysmon ProcessAccess filter" 'DarkGray' }
+            $reg = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(13) -Start $start -Cap 5000 -Fields ([ordered]@{ EventType = 'EventType'; TargetObject = 'TargetObject'; Image = 'Image' })
+            Save-Rows -Name 'sysmon_registry' -Rows $reg
+            $ft = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(2) -Start $start -Cap 1000 -Fields ([ordered]@{ Image = 'Image'; TargetFilename = 'TargetFilename'; CreationUtcTime = 'CreationUtcTime'; PreviousCreationUtcTime = 'PreviousCreationUtcTime' })
+            Save-Rows -Name 'sysmon_file_time' -Rows $ft
+            if ($ft.Count -gt 0) { Write-CaseLog "    EID 2 file creation-time changes: $($ft.Count) (timestomping data source)" 'Yellow' }
             Export-Evtx -LogName 'Microsoft-Windows-Sysmon/Operational' -FileName 'Sysmon_Operational.evtx'
         } }
     [pscustomobject]@{ Id = '4.4'; Cat = 'LOGS'; Name = 'RDP logs (LocalSessionManager + ConnectionManager)'; Default = $true; Quick = $false;
@@ -2491,6 +2564,10 @@ $script:Modules = @(
             $start = Get-LogStart
             $ev = Get-FilteredEvents -LogName 'Microsoft-Windows-Windows Defender/Operational' -Ids @(1116, 1117, 5001, 5007) -Start $start -MaxMsg 500
             Save-Rows -Name 'defender_events' -Rows $ev
+            $dconf = @($ev | Where-Object { $_.Id -in @(5001, 5007) } | ForEach-Object {
+                [pscustomobject]@{ Time = $_.TimeCreated; EventId = $_.Id; Detail = ("$($_.Message)" -replace '\s+', ' ').Trim() }
+            })
+            Save-Rows -Name 'defender_config_events' -Rows $dconf
             Export-Evtx -LogName 'Microsoft-Windows-Windows Defender/Operational' -FileName 'Defender_Operational.evtx'
         } }
     [pscustomobject]@{ Id = '7.1'; Cat = 'MEMORY'; Name = 'RAM capture via winpmem (needs tools\winpmem, LARGE output)'; Default = $false; Quick = $false;
@@ -3155,6 +3232,29 @@ function Export-Evtx {
             Write-CaseLog "    evtx export failed: $LogName" 'DarkYellow'
         }
     } catch { Write-CaseLog "    evtx export error: $LogName" 'DarkYellow' }
+}
+
+function Get-EventDataRows {
+    # Structured EventData extraction for security/sysmon event IDs (XML fields, newest-first, capped).
+    param([string]$LogName, [int[]]$Id, $Fields, $Start, [int]$Cap = 3000)
+    $rows = New-Object System.Collections.Generic.List[object]
+    try {
+        $filter = @{ LogName = $LogName; Id = $Id }
+        if ($Start) { $filter.StartTime = $Start }
+        $raw = Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue
+        if (-not $raw) { return @() }
+        foreach ($e in ($raw | Select-Object -First $Cap)) {
+            $d = @{}
+            try {
+                $x = [xml]$e.ToXml()
+                $x.Event.EventData.Data | ForEach-Object { $d[$_.Name] = $_.'#text' }
+            } catch { }
+            $o = [ordered]@{ Time = $e.TimeCreated; EventId = $e.Id }
+            foreach ($k in $Fields.Keys) { $o[$k] = "$($d[$Fields[$k]])" }
+            $null = $rows.Add([pscustomobject]$o)
+        }
+    } catch { }
+    return $rows.ToArray()
 }
 
 function Get-PresetSelection {
@@ -3909,7 +4009,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
             $sevCls = switch -Regex ("$($h2.Severity)") { 'high' { 'crit'; break } 'medium' { 'med'; break } default { 'info' } }
             $null = $sb.AppendLine("<tr><td class='$sevCls'><b>$(ConvertTo-HtmlEsc $h2.Severity)</b></td><td>$(ConvertTo-HtmlEsc $h2.Rule)</td><td>$(ConvertTo-HtmlEsc $h2.Attck)</td><td class='path'>$(ConvertTo-HtmlEsc $h2.Entity)</td><td class='path'>$(ConvertTo-HtmlEsc $h2.Evidence)</td></tr>")
         }
-        $null = $sb.AppendLine("</table><div class='meta'>High-severity hunt rules are high-precision (version-info renames, side-loaded system DLLs, downloaded-then-executed) and contribute to the verdict. Verify against the cited raw evidence. Source: csv\hunt_findings.csv</div>")
+        $null = $sb.AppendLine("</table><div class='meta'>High-severity hunt rules are high-precision (version-info renames, side-loaded system DLLs, downloaded-then-executed, LSASS access, Office-to-interpreter chains, proxy-execution LOLBin command lines, admin-share staging, Defender tamper) and contribute to the verdict. Medium rules (UAC bypass pattern, discovery storms, timestomping, USB/account/RDP anomalies) are report-only leads. Verify against the cited raw evidence. Source: csv\hunt_findings.csv</div>")
     } else {
         $null = $sb.AppendLine("<div class='meta'>No hunt findings - all techniques clean.</div>")
     }
@@ -4166,7 +4266,14 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'srum_usage'                      = 'SRUM: per-app resource/network usage over weeks'
         'logging_gaps'                    = 'Log clear/stop events + evtx coverage gaps'
         'parse_needed'                    = 'Artifacts not finished on the endpoint + exactly how to finish them (-Mode Parse)'
-        'hunt_findings'                   = 'Technique-based hunt detections (renamed binaries, side-loads, download-exec, account/RDP anomalies)'
+        'hunt_findings'                   = 'Technique-based hunt detections (renamed binaries, side-loads, download-exec, LSASS access, Office chains, proxy-exec, share staging, UAC bypass, discovery storms, Defender tamper, timestomping)'
+        'security_proc_events'            = '4688 process creations with parent + command line (needs cmdline audit) - Office chains, proxy-exec, discovery storms'
+        'security_task_install'           = '4698 scheduled task installs with the task action - remote/atexec-style persistence'
+        'security_share_access'           = '5140/5145 share access incl. admin-share writes - lateral movement + staging data source'
+        'sysmon_process_access'           = 'Sysmon EID 10 ProcessAccess - LSASS credential-dump data source'
+        'sysmon_registry'                 = 'Sysmon EID 13 RegistryEvent - UAC bypass / persistence data source'
+        'sysmon_file_time'                = 'Sysmon EID 2 file creation-time changes - timestomping evidence'
+        'defender_config_events'          = 'Defender 5001/5007 - real-time protection disabled / exclusion changes (tamper)'
         'memory_live_scan'                = 'Flagged-process minidumps + YARA hits found in live memory'
         'sysmon_image_load'               = 'Sysmon DLL loads (EID 7) - side-load data source'
         'bam_lastexec'                    = 'BAM/DAM last-execution per user (survives Prefetch deletion)'
@@ -4645,6 +4752,122 @@ function New-HuntFindings {
         & $find 'RDP logon from public internet IP' 'medium' "$($g.Name)" "$($g.Count) RDP logon(s): $accts" 'T1021.001'
     }
 
+    # ---------- R8: LSASS access - non-system process opened lsass.exe (Sysmon EID 10) ----------
+    $lsassOk = @('csrss.exe', 'lsm.exe', 'smss.exe', 'wininit.exe', 'winlogon.exe', 'services.exe', 'svchost.exe', 'lsass.exe', 'lsaiso.exe', 'msmpeng.exe', 'nissrv.exe', 'mssense.exe', 'sense.exe', 'sgrmbroker.exe', 'wmiprvse.exe', 'vssvc.exe', 'dfsr.exe', 'dfsrs.exe', 'taskhostw.exe', 'sihost.exe', 'spoolsv.exe')
+    $lsassHits = @{}
+    foreach ($r in (Import-CaseCsv 'sysmon_process_access')) {
+        $tgt = "$($r.TargetImage)"
+        if ($tgt -notmatch '(?i)\\lsass\.exe$') { continue }
+        $src = "$($r.SourceImage)"
+        $leaf = ''
+        try { $leaf = (Split-Path $src -Leaf).ToLower() } catch { }
+        if (-not $leaf -or $lsassOk -contains $leaf) { continue }
+        if (-not $lsassHits.ContainsKey($src)) { $lsassHits[$src] = New-Object System.Collections.Generic.List[string] }
+        $null = $lsassHits[$src].Add("granted=$($r.GrantedAccess) @ $($r.Time)")
+    }
+    foreach ($kv in ($lsassHits.GetEnumerator() | Sort-Object { $_.Value.Count } -Descending | Select-Object -First 10)) {
+        & $find 'LSASS access - non-system process opened lsass.exe' 'high' $kv.Key "$($kv.Value.Count) handle event(s): $($kv.Value[0])" 'T1003.001'
+    }
+
+    # ---------- R9: Office app spawned interpreter (4688 parent-child chain) ----------
+    $officeApps = @('winword.exe', 'excel.exe', 'powerpnt.exe', 'outlook.exe', 'mspub.exe', 'onenote.exe', 'onenotem.exe')
+    $interpreters = @('cmd.exe', 'powershell.exe', 'pwsh.exe', 'wscript.exe', 'cscript.exe', 'mshta.exe', 'rundll32.exe', 'regsvr32.exe', 'msbuild.exe', 'installutil.exe', 'certutil.exe', 'bitsadmin.exe', 'curl.exe', 'msxsl.exe')
+    $r9Seen = @{}
+    foreach ($r in (Import-CaseCsv 'security_proc_events')) {
+        $par = ''; $kid = ''
+        try { $par = (Split-Path "$($r.ParentProcess)" -Leaf).ToLower() } catch { }
+        try { $kid = (Split-Path "$($r.NewProcess)" -Leaf).ToLower() } catch { }
+        if (-not $par -or -not $kid -or $officeApps -notcontains $par -or $interpreters -notcontains $kid) { continue }
+        $k = "$par>$kid"
+        if ($r9Seen.ContainsKey($k)) { $r9Seen[$k]++ ; continue }
+        $r9Seen[$k] = 1
+        $cmd = "$($r.CommandLine)"; if ($cmd.Length -gt 200) { $cmd = $cmd.Substring(0, 200) + '...' }
+        & $find 'Office app spawned interpreter' 'high' "$par -> $kid" "$($r.Time): $cmd" 'T1566.001/T1059'
+    }
+
+    # ---------- R10: proxy-execution LOLBin command lines (4688 CommandLine; needs cmdline audit) ----------
+    $r10Seen = @{}
+    foreach ($r in (Import-CaseCsv 'security_proc_events')) {
+        $cmd = "$($r.CommandLine)".Trim()
+        if ($cmd.Length -lt 8) { continue }
+        $low = $cmd.ToLower()
+        $hit = ''
+        $sev = 'high'
+        if ($low -match '(-enc\b|-encodedcommand\b|frombase64string)') { $hit = 'encoded command' }
+        elseif ($low -match 'certutil\.exe.+\s(-urlcache|-decode|-decodehex)') { $hit = 'certutil download/decode' }
+        elseif ($low -match 'mshta\.exe.*(https?://|vbscript:|javascript:)') { $hit = 'mshta remote/script URL' }
+        elseif ($low -match 'rundll32\.exe.*(javascript:|comsvcs\.dll,?\s*minidump)') { $hit = 'rundll32 script/minidump' }
+        elseif ($low -match 'regsvr32(\.exe)?\s+/i:/?(https?|file):') { $hit = 'regsvr32 remote scriplet' }
+        elseif ($low -match 'bitsadmin(\.exe)?\s+(/transfer|/create)') { $hit = 'bitsadmin download'; $sev = 'medium' }
+        elseif ($low -match 'msiexec(\.exe)?.*https?://') { $hit = 'msiexec remote package'; $sev = 'medium' }
+        elseif ($low -match 'wmic(\.exe)?.*\sprocess\s+call\s+create') { $hit = 'wmic process create'; $sev = 'medium' }
+        if (-not $hit) { continue }
+        $key = "$hit|$low"
+        if ($r10Seen.ContainsKey($key)) { continue }
+        $r10Seen[$key] = $true
+        if ($r10Seen.Count -gt 20) { break }
+        & $find "LOLBin proxy-execution - $hit" $sev "$($r.NewProcess)" "$($r.Time): $(if ($cmd.Length -gt 220) { $cmd.Substring(0, 220) + '...' } else { $cmd })" 'T1218'
+    }
+
+    # ---------- R11: UAC bypass pattern - ms-settings shell\open\command writes (Sysmon EID 13) ----------
+    $r11Seen = @{}
+    foreach ($r in (Import-CaseCsv 'sysmon_registry')) {
+        $to = "$($r.TargetObject)"
+        if ($to -notmatch '(?i)\\ms-settings\\shell\\open\\command') { continue }
+        $k = $to -replace '^HKEY_USERS\\[^\\]+', 'HKCU'
+        if ($r11Seen.ContainsKey($k)) { continue }
+        $r11Seen[$k] = $true
+        & $find 'UAC bypass pattern - ms-settings command hijack' 'medium' $to "registry write by $($r.Image) (fodhelper/eventvwr technique)" 'T1548.002'
+    }
+
+    # ---------- R12: executable written via admin share (5145 WriteData/Append on ADMIN$/x$) ----------
+    $r12Seen = @{}
+    foreach ($r in (Import-CaseCsv 'security_share_access')) {
+        if ("$($r.EventId)" -ne '5145') { continue }
+        $share = ("$($r.ShareName)" -replace '^[\*\\\s]+', '')
+        if ($share -notmatch '(?i)^admin\$' -and $share -notmatch '(?i)^[a-z]\$$') { continue }
+        $tn = "$($r.RelativeTargetName)"
+        if ($tn -notmatch '(?i)\.(exe|dll|ps1|bat|cmd|hta|js|vbs|vbe|jse|scr|psm1|jar|msi)$') { continue }
+        if ("$($r.AccessList)" -notmatch '%%4415|%%4416') { continue }
+        $k = "$($r.Account)|$share|$tn"
+        if ($r12Seen.ContainsKey($k)) { continue }
+        $r12Seen[$k] = $true
+        & $find 'Admin-share executable staging' 'high' "$($r.SourceIp)" "'$tn' written on \\$share by $($r.Account) at $($r.Time)" 'T1021.002'
+    }
+
+    # ---------- R13: discovery command storm (4688 recon-tool burst per account) ----------
+    $discBins = @('whoami.exe', 'net.exe', 'net1.exe', 'nltest.exe', 'systeminfo.exe', 'ipconfig.exe', 'quser.exe', 'qwinsta.exe', 'tasklist.exe', 'netstat.exe', 'nslookup.exe', 'arp.exe', 'route.exe', 'klist.exe', 'wmic.exe', 'dsquery.exe', 'adfind.exe', 'csvde.exe', 'ldifde.exe', 'tree.exe')
+    $discByAcct = @{}
+    foreach ($r in (Import-CaseCsv 'security_proc_events')) {
+        $leaf = ''
+        try { $leaf = (Split-Path "$($r.NewProcess)" -Leaf).ToLower() } catch { }
+        if ($discBins -notcontains $leaf) { continue }
+        $a = "$($r.Account)"; if (-not $a) { $a = '(unknown)' }
+        if (-not $discByAcct.ContainsKey($a)) { $discByAcct[$a] = New-Object System.Collections.Generic.List[string] }
+        $null = $discByAcct[$a].Add($leaf)
+    }
+    foreach ($kv in ($discByAcct.GetEnumerator() | Sort-Object { $_.Value.Count } -Descending | Select-Object -First 5)) {
+        $distinct = @($kv.Value | Sort-Object -Unique).Count
+        if ($kv.Value.Count -lt 15 -and $distinct -lt 6) { continue }
+        $tools = ($kv.Value | Sort-Object -Unique | Select-Object -First 8) -join ', '
+        & $find 'Discovery command storm' 'medium' $kv.Key "$($kv.Value.Count) recon commands ($distinct distinct): $tools" 'T1087/T1082'
+    }
+
+    # ---------- R14: Defender tamper - real-time protection off / exclusion change (5001/5007) ----------
+    $dcfg = @(Import-CaseCsv 'defender_config_events')
+    $rtOff = @($dcfg | Where-Object { "$($_.EventId)" -eq '5001' })
+    if ($rtOff.Count -gt 0) {
+        & $find 'Defender real-time protection DISABLED' 'high' $Computer "$($rtOff.Count) disable event(s), last at $($rtOff[-1].Time) - tamper or manual change" 'T1562.001'
+    }
+    foreach ($e in (@($dcfg | Where-Object { "$($_.EventId)" -eq '5007' -and "$($_.Detail)" -match '(?i)exclusion' }) | Select-Object -First 3)) {
+        & $find 'Defender exclusion configuration changed' 'high' $Computer "$($e.Time): $($e.Detail)" 'T1562.001'
+    }
+
+    # ---------- R15: timestomping - creation time changed (Sysmon EID 2) ----------
+    foreach ($r in ((Import-CaseCsv 'sysmon_file_time') | Select-Object -First 10)) {
+        & $find 'File creation time changed (timestomping candidate)' 'medium' "$($r.TargetFilename)" "by $($r.Image): $($r.PreviousCreationUtcTime) -> $($r.CreationUtcTime)" 'T1070.006'
+    }
+
     Save-Rows -Name 'hunt_findings' -Rows $out.ToArray()
     $hi = @($out | Where-Object { $_.Severity -eq 'high' }).Count
     if ($out.Count -gt 0) {
@@ -4722,6 +4945,11 @@ function New-SiemExport {
     }
     foreach ($b in (Import-CaseCsv 'ioc_hits_browser')) {
         $o = [ordered]@{}; $o['ts'] = "$($StartTime.ToString('o'))"; $o['kind'] = 'browser_ioc'; $o['host'] = $base.host; $o['indicator'] = $b.Indicator; $o['url'] = $b.URL; $o['caseid'] = $base.caseid
+        $lines.Add(($o | ConvertTo-Json -Compress))
+    }
+    foreach ($h in (Import-CaseCsv 'hunt_findings')) {
+        if ("$($h.Severity)" -notin @('high', 'medium')) { continue }
+        $o = [ordered]@{}; $o['ts'] = "$($h.Found)"; $o['kind'] = 'hunt_finding'; $o['host'] = $base.host; $o['severity'] = $h.Severity; $o['rule'] = $h.Rule; $o['entity'] = $h.Entity; $o['attack'] = $h.Attck; $o['evidence'] = $h.Evidence; $o['caseid'] = $base.caseid
         $lines.Add(($o | ConvertTo-Json -Compress))
     }
     if ($script:Verdict) {
@@ -4875,7 +5103,7 @@ function Get-CompromiseVerdict {
     $dnsMed = @($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
     $lolMal = @($lol | Where-Object { $_.Status -eq 'malicious' }).Count
     $hunt = Import-CaseCsv 'hunt_findings'
-    $huntHi = @($hunt | Where-Object { "$($_.Severity)" -eq 'high' -and "$($_.Rule)" -match 'Renamed LOLBin|side-load|Downloaded then executed' })
+    $huntHi = @($hunt | Where-Object { "$($_.Severity)" -eq 'high' -and "$($_.Rule)" -match 'Renamed LOLBin|side-load|Downloaded then executed|LSASS access|Office app spawned|proxy-execution|Admin-share staging|Defender (real-time|exclusion)' })
     $usnBurstN = @($usnBursts).Count
     $rExt = ((@($usnBursts) | Where-Object { "$($_.RansomExt)" } | ForEach-Object { "$($_.RansomExt)" } | Sort-Object -Unique) -join ',')
     # ponytail: COM hijacks + StartupApproved excluded from the signal (per-user COM has many legit users, e.g. Teams/OneDrive); they stay report-visible
@@ -4886,7 +5114,7 @@ function Get-CompromiseVerdict {
     Add-Signal 'C2 beaconing - highly regular callbacks' 3 $beaconHi (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp):$($_.Port) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'C2 DNS beaconing - highly regular domain queries' 3 $dnsHi (($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.Domain) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'Known-malicious driver on disk (LOLDrivers)' 2 $lolMal (($lol | Where-Object { $_.Status -eq 'malicious' } | Select-Object -First 3 | ForEach-Object { "$($_.Name): $($_.Path)" }) -join '; ')
-    Add-Signal 'Hunt technique - renamed binary / side-load / downloaded-exec' 2 $huntHi.Count (($huntHi | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
+    Add-Signal 'Hunt technique - renamed binary / side-load / download-exec / LSASS access / Office chain / proxy-exec / share staging / Defender tamper' 2 $huntHi.Count (($huntHi | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'Ransomware-like mass file modification (USN journal)' 3 $usnBurstN ((($usnBursts | Select-Object -First 3 | ForEach-Object { "$($_.WindowStart): $($_.WriteEvents) writes / $($_.DistinctFiles) files" }) -join '; ') + $(if ($rExt) { " - RANSOM EXTENSIONS: $rExt" }))
     Add-Signal 'Uncommon persistence mechanism (IFEO/AppInit/Winlogon/netsh/LSA)' 2 $asepHotN (($asep | Where-Object { $_.Flags -match 'user-path|nondefault' -and "$($_.Category)" -notmatch 'ComHijack|StartupApproved' } | Select-Object -First 3 | ForEach-Object { "$($_.Category): $($_.Name) = $($_.Value)" }) -join '; ')
     Add-Signal 'Memory malfind indicators (injected code regions)' 2 @($memMf).Count (($memMf | Select-Object -First 3 | ForEach-Object { "$($_.Process)($($_.PID))" }) -join '; ')
@@ -4926,6 +5154,7 @@ function Get-CompromiseVerdict {
     Add-Cov 'DNS query telemetry (Sysmon EID 22)' (Test-Path (Join-Path $CsvDir 'sysmon_dns.csv')) 4
     Add-Cov 'Entity correlation' (Test-Path (Join-Path $CsvDir 'entities_binaries.csv')) 3
     Add-Cov 'Hunt rules' (Test-Path (Join-Path $CsvDir 'hunt_findings.csv')) 3
+    Add-Cov 'Structured telemetry (4688 / Sysmon 10-13)' ((Test-Path (Join-Path $CsvDir 'security_proc_events.csv')) -or (Test-Path (Join-Path $CsvDir 'sysmon_process_access.csv'))) 3
     Add-Cov 'LOLDrivers driver hash check' (Test-Path (Join-Path $CsvDir 'loldrivers_hits.csv')) 3
     Add-Cov 'Sysmon telemetry (bonus)' ([bool]$Sysmon) 5
     Add-Cov 'RAM capture (bonus)' (Test-Path $MemDir) 3

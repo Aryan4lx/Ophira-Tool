@@ -227,7 +227,7 @@ while ($true) { try { (New-Object Net.Sockets.TcpClient('1.1.1.1', 443)).Close()
 - [x] Analyst-side completion: `-Mode Parse` (finish a case on your PC), `parse_needed.csv` + endpoint .NET inventory, Full-preset full-NTFS preservation (v2.15); hotfix helper scoping (v2.17)
 - [x] **Connections: cross-source entity correlation** - binaries/accounts/remotes joined across all artifacts with category-strength scoring, report drill-down + SRUM per-app network consumers; repo trim + long-path hardening (v2.18)
 - [x] **Hunt pack**: R1-R7 technique detections (renamed LOLBin, DLL side-loads live+static, download-exec, USB trail, account lifecycle, public RDP) with ATT&CK tags + verdict floors; BAM/DAM, USB history, UAL, Office MRU, local-admins, audit-policy artifacts; module 7.2 flagged-process minidumps + YARA (v2.19)
-- [ ] **APT depth (v2.20)**: structured parses (Sysmon EID 1/10/13, 4688/4698/5140/5145, Defender 5001/5007) + hunt rules for Office→interpreter chains, LSASS access, proxy-execution LOLBins, UAC bypass, timestomping, admin-share staging, discovery storms, fleet lateral-chain stitching
+- [x] **APT depth**: structured parses (4688 process-creation w/ cmdline, 4698 task installs, 5140/5145 share access, Sysmon EID 10/13/2, Defender 5001/5007) + hunt rules R8-R15 (LSASS access, Office→interpreter chains, proxy-exec LOLBin command lines, UAC bypass, timestomping, admin-share staging, discovery storms, Defender tamper); fleet lateral-chain stitching + SIEM hunt records (v2.20)
 - [ ] Real-host pilot run (validate hayabusa timing + MFTECmd on live volume)
 - [ ] Role-based presets (WebServer / DC / Workstation)
 

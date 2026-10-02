@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.20
+- **APT depth**: structured event parses + hunt rules R8-R15
+  - **Structured parses** via new `Get-EventDataRows` helper (named EventData fields from the event XML, newest-first, capped; added to the worker whitelist):
+    - `security_proc_events.csv` - 4688 process creations (account, process, command line, parent; empty CommandLine = cmdline audit policy off, rules degrade to parent-child chains)
+    - `security_task_install.csv` - 4698 task installs with the action command; `security_share_access.csv` - 5140/5145 (share, target name, source IP, access list; capped 8000)
+    - `sysmon_process_access.csv` - EID 10 (LSASS-access data source); `sysmon_registry.csv` - EID 13 (UAC-bypass/persistence); `sysmon_file_time.csv` - EID 2 (timestomping)
+    - `defender_config_events.csv` - 5001 real-time-protection off / 5007 config changes
+  - **Hunt rules**: R8 **LSASS access** - non-system process opens lsass.exe w/ core-process allowlist (high); R9 **Office→interpreter chain** - WINWORD/EXCEL/OUTLOOK parent spawning cmd/powershell/wscript/mshta/rundll32... (high); R10 **proxy-execution LOLBin command lines** - encoded commands, certutil download/decode, mshta remote, comsvcs minidump, regsvr32 scriptlet (high) + bitsadmin/msiexec-remote/wmic-create (medium); R11 **UAC bypass** - ms-settings shell\open\command registry hijack (medium); R12 **admin-share executable staging** - 5145 WriteData of exe/dll/ps1... on ADMIN$/x$ (high); R13 **discovery command storms** - per-account recon-tool bursts (medium); R14 **Defender tamper** - RT disabled / exclusion changed (high); R15 **timestomping** - EID 2 creation-time changes (medium)
+  - R8/R9/R10/R12/R14 join R1-R4 as **floor-2 verdict signals** (signal text updated); R11/R13/R15 are report-only leads
+  - SIEM export gains `hunt_finding` records (high+medium); evidence index documents all 7 new CSVs; new coverage row "Structured telemetry (4688 / Sysmon 10-13)"
+- **Fleet lateral-chain stitching**: each host's `security_share_access.csv` source IPs joined against every other host's `net_interfaces.csv` → `fleet_lateral_chain.csv` + console summary + fleet-report "Lateral movement chains" table (host A → share → host B); hunt hits now surface as fleet HuntHit high-priority findings
+- Hygiene: removed stray `Ophira_dbg.ps1` / `SQLite.Interop.dll` from repo root; `tests\test_v220.ps1` (26 checks)
+
 ## v2.19
 - **Hunt pack** (`New-HuntFindings`, R1-R7) - technique-based detections ported from Velociraptor-style logic → `hunt_findings.csv` (Rule/Severity/Entity/ATT&CK/Evidence) + report "Hunt findings" section:
   - R1 **renamed LOLBin** (T1036.003): embedded version-info identity vs filename against the BinaryRename LOLBin table (cmd/powershell/mshta/regsvr32/rundll32/certutil/...)
