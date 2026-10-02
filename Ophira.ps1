@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.18  -  Windows Incident Response Triage Toolkit
+Ophira v2.19  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -34,7 +34,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.18"
+$ScriptVersion = "2.19"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -1990,6 +1990,24 @@ $script:Modules = @(
                 }
             } catch { }
             Save-Rows -Name 'sysmon_dns' -Rows $dns
+            # EID 7: image loads - the DLL side-load data source
+            $img = @()
+            try {
+                $filter = @{ LogName = 'Microsoft-Windows-Sysmon/Operational'; Id = 7 }
+                if ($start) { $filter.StartTime = $start }
+                $rawI = Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue
+                foreach ($e in ($rawI | Select-Object -First 3000)) {
+                    $x = [xml]$e.ToXml()
+                    $d = @{}
+                    $x.Event.EventData.Data | ForEach-Object { $d[$_.Name] = $_.'#text' }
+                    $img += [pscustomobject]@{
+                        Time = $e.TimeCreated; Process = $d['Image']; Dll = $d['ImageLoaded']
+                        Signed = $d['Signed']; Signature = $d['Signature']; Company = $d['Company']; Description = $d['Description']
+                    }
+                }
+            } catch { }
+            Save-Rows -Name 'sysmon_image_load' -Rows $img
+            if ($img.Count -gt 0) { Write-CaseLog "    sysmon image loads: $($img.Count) (DLL side-load data source)" 'Gray' }
             Export-Evtx -LogName 'Microsoft-Windows-Sysmon/Operational' -FileName 'Sysmon_Operational.evtx'
         } }
     [pscustomobject]@{ Id = '4.4'; Cat = 'LOGS'; Name = 'RDP logs (LocalSessionManager + ConnectionManager)'; Default = $true; Quick = $false;
@@ -2533,7 +2551,68 @@ $script:Modules = @(
                 Write-CaseLog "    Memory capture FAILED" 'Red'
             }
         } }
-    [pscustomobject]@{ Id = '8.1'; Cat = 'CONTEXT'; Name = 'Attacker activity (console history, RDP targets, recycle bin)'; Default = $true; Quick = $true;
+    [pscustomobject]@{ Id = '7.2'; Cat = 'MEMORY'; Name = 'Live memory triage - minidumps of flagged processes + YARA (opt-in, admin, budgeted)'; Default = $false; Quick = $false;
+        Run = {
+            $cands = @()
+            foreach ($r in (Import-CaseCsv 'flash_process_scored')) {
+                if ("$($r.Verdict)" -match '^(HIGH|MEDIUM)$' -and "$($r.Path)" -and "$($r.PID)") { $cands += [pscustomobject]@{ PID = [int]$r.PID; Path = "$($r.Path)"; Name = "$($r.Name)"; Verdict = "$($r.Verdict)" } }
+            }
+            $cands = @($cands | Sort-Object -Property @{e = { if ($_.Verdict -eq 'HIGH') { 0 } else { 1 } } } | Select-Object -First 10)
+            if ($cands.Count -eq 0) { Write-CaseLog '    no flagged processes - live memory triage skipped' 'Gray'; return }
+            $root = [IO.Path]::GetPathRoot($CaseDir).TrimEnd('\')
+            $free = 0
+            try { $free = (Get-PSDrive -Name ($root.TrimEnd(':')) -ErrorAction Stop).Free } catch { }
+            if ($free -lt 10GB) { Write-CaseLog "    under 10GB free on $root - live memory triage skipped" 'Yellow'; return }
+            $tDir = Get-ToolsDir
+            $yr = $null
+            $rulesDir = $null
+            if ($tDir) {
+                $yr = Get-ChildItem -Path $tDir -Recurse -Filter 'yr.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+                $rulesDir = Join-Path $tDir 'yara\rules'
+            }
+            $dmpDir = Join-Path $RawDir 'minidumps'
+            New-Item -ItemType Directory -Path $dmpDir -Force | Out-Null
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class OphiraDump {
+    [DllImport("dbghelp.dll", SetLastError = true)]
+    public static extern bool MiniDumpWriteDump(IntPtr hProcess, uint processId, IntPtr hFile, uint dumpType, IntPtr exceptionParam, IntPtr userStreamParam, IntPtr callbackParam);
+}
+'@ -ErrorAction SilentlyContinue
+            $critical = @('lsass', 'csrss', 'smss', 'wininit', 'winlogon', 'services', 'svchost', 'windefend', 'msmpeng')
+            $rows = @()
+            $used = 0L
+            foreach ($c in $cands) {
+                if ($used -ge 2GB) { Write-CaseLog '    dump budget (2GB) reached - stopping' 'Yellow'; break }
+                $pn = ($c.Name -replace '\.exe$', '').ToLower()
+                if ($critical -contains $pn) { Write-CaseLog "    skip $($c.Name) (security-critical process)" 'DarkYellow'; continue }
+                try {
+                    $proc = Get-Process -Id $c.PID -ErrorAction Stop
+                    if ($proc.PrivateMemorySize64 -gt 1.5GB) { Write-CaseLog "    skip $($c.Name) (private memory > 1.5GB)" 'DarkYellow'; continue }
+                    $outFile = Join-Path $dmpDir "$($c.Name)_$($c.PID).dmp"
+                    $ok = $false
+                    $fs = [IO.File]::Create($outFile)
+                    try {
+                        $ok = [OphiraDump]::MiniDumpWriteDump($proc.Handle, [uint32]$c.PID, $fs.SafeFileHandle.DangerousGetHandle(), [uint32]0x26, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero)
+                    } finally { $fs.Close() }
+                    if (-not $ok -or -not (Test-Path -LiteralPath $outFile)) { Write-CaseLog "    dump failed: $($c.Name)" 'DarkYellow'; continue }
+                    $used += (Get-Item -LiteralPath $outFile).Length
+                    $hits = ''
+                    if ($yr -and (Test-Path $rulesDir)) {
+                        $res = Invoke-NativeTool -ExePath $yr.FullName -ToolArgs @('scan', '-m', '--output-format=ndjson', $rulesDir, $outFile) -WorkingDirectory $yr.DirectoryName -CaptureOut
+                        if ($res -and $res.ExitCode -eq 0 -and $res.StdOut) {
+                            $hits = (@($res.StdOut | ForEach-Object { try { ($_ | ConvertFrom-Json).rule } catch { } }) | Where-Object { $_ } | Sort-Object -Unique) -join ';'
+                        }
+                    }
+                    $rows += [pscustomobject]@{ Process = $c.Name; PID = $c.PID; Path = $c.Path; Verdict = $c.Verdict; Dump = "raw\minidumps\$([IO.Path]::GetFileName($outFile))"; DumpMB = [math]::Round((Get-Item -LiteralPath $outFile).Length / 1MB, 1); YaraHits = $hits }
+                    Write-CaseLog "    minidump: $($c.Name) ($([math]::Round((Get-Item -LiteralPath $outFile).Length / 1MB, 1)) MB)$(if ($hits) { " YARA: $hits" })" $(if ($hits) { 'Red' } else { 'Gray' })
+                } catch { Write-CaseLog "    cannot dump $($c.Name): $($_.Exception.Message)" 'DarkYellow' }
+            }
+            Save-Rows -Name 'memory_live_scan' -Rows $rows
+            if ($rows.Count -gt 0) { Write-CaseLog "    live memory triage: $($rows.Count) dump(s), $([math]::Round($used / 1MB, 0)) MB total -> raw\minidumps + csv\memory_live_scan.csv" 'Cyan' }
+        } }
+[pscustomobject]@{ Id = '8.1'; Cat = 'CONTEXT'; Name = 'Attacker activity (console history, RDP targets, recycle bin)'; Default = $true; Quick = $true;
         Run = {
             $profiles = Get-UserProfileList
             $dest = Join-Path $RawDir 'useractivity'
@@ -2655,6 +2734,15 @@ $script:Modules = @(
                 }
             }
             Save-Rows -Name 'domain_info' -Rows $dom
+            # local administrators (account entities + rogue-admin hunting)
+            $la = @()
+            try {
+                $laOut = & net.exe localgroup administrators 2>$null | Where-Object { $_ -match '\S' } | Select-Object -Skip 6
+                $laOut = @($laOut | Where-Object { $_ -notmatch 'The command completed' })
+                foreach ($member in $laOut) { $la += [pscustomobject]@{ Group = 'Administrators'; Member = "$member".Trim() } }
+                if ($la.Count -gt 0) { Write-CaseLog "    local admins: $($la.Count) member(s)" 'Gray' }
+            } catch { }
+            Save-Rows -Name 'local_admins' -Rows $la
             if ($cs -and $cs.PartOfDomain) {
                 Invoke-ExeCapture -SubDir 'context' -Name 'nltest_dsgetdc.txt' -Exe nltest.exe -Arguments "/dsgetdc:$env:USERDOMAIN"
                 Invoke-ExeCapture -SubDir 'context' -Name 'nltest_trusts.txt' -Exe nltest.exe -Arguments '/domain_trusts'
@@ -2912,6 +3000,16 @@ $script:Modules = @(
                 if ("$bl" -match 'On') { Add-Posture 'BitLocker (OS volume)' 'GOOD' 'Protection on' }
                 elseif ("$bl" -match 'Off') { Add-Posture 'BitLocker (OS volume)' 'WARN' 'Disk not encrypted - offline tampering/theft exposure' }
             } catch { }
+            # audit policy coverage (no auditing = silent intrusion)
+            try {
+                $ap = & auditpol.exe '/get' '/category:*' '/r' 2>$null | ConvertFrom-Csv
+                $badAudit = @($ap | Where-Object { $_.'Inclusion Setting' -match '^(No Auditing)$' })
+                if (@($ap).Count -gt 0) {
+                    if ($badAudit.Count -ge 6) { Add-Posture 'Audit policy' 'BAD' "$($badAudit.Count) of $($ap.Count) categories have NO auditing - intrusion leaves no trace" }
+                    elseif ($badAudit.Count -gt 0) { Add-Posture 'Audit policy' 'WARN' "$($badAudit.Count) categories without auditing: $((@($badAudit | Select-Object -First 4 | ForEach-Object { $_.'Subcategory' })) -join ', ')" }
+                    else { Add-Posture 'Audit policy' 'GOOD' 'All categories auditing' }
+                }
+            } catch { }
             # WinRM trusted hosts
             $th = & $rp 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN' 'TrustedHosts'
             if ("$th" -match '\*' -or "$th" -match '[^0-9a-fA-F:\.].*,.*') { Add-Posture 'WinRM TrustedHosts' 'WARN' "Broad trust list: $th" }
@@ -2954,6 +3052,75 @@ $script:Modules = @(
                 Write-CaseLog "    LOLDrivers: $mal MALICIOUS, $vul vulnerable driver(s) on disk ($checked hashed) -> csv\loldrivers_hits.csv" $(if ($mal -gt 0) { 'Red' } else { 'Yellow' })
             } else {
                 Write-CaseLog "    LOLDrivers: $checked drivers hashed - no malicious/vulnerable matches" 'Gray'
+            }
+        } }
+    [pscustomobject]@{ Id = '8.11'; Cat = 'CONTEXT'; Name = 'Host history extras (BAM/DAM last-exec, USB devices, Office MRU, UAL raw)'; Default = $true; Quick = $false;
+        Run = {
+            # BAM/DAM: per-user background execution tracking (survives Prefetch deletion)
+            $bam = @()
+            foreach ($svc in @('bam', 'dam')) {
+                $base = "Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$svc\State\UserSettings"
+                if (-not (Test-Path $base)) { continue }
+                foreach ($sid in (Get-ChildItem $base -ErrorAction SilentlyContinue)) {
+                    $t = $sid.LastWriteTime
+                    foreach ($v in (Get-ItemProperty -LiteralPath $sid.PSPath -ErrorAction SilentlyContinue).PSObject.Properties) {
+                        if ($v.Name -in @('Version', 'SequenceNumber') -or $v.Name -match '^PS') { continue }
+                        if ("$($v.Value)" -and "$($v.Value)" -notmatch '^(Version|SequenceNumber)$') {
+                            $bam += [pscustomobject]@{ Source = $svc.ToUpper(); Sid = $sid.PSChildName; Executable = "$($v.Value)"; LastWrite = $t }
+                        }
+                    }
+                }
+            }
+            Save-Rows -Name 'bam_lastexec' -Rows $bam
+            if ($bam.Count -gt 0) { Write-CaseLog "    BAM/DAM: $($bam.Count) last-exec entries -> csv\bam_lastexec.csv" 'Gray' }
+            # USB storage devices (every USB device ever connected)
+            $usbs = @()
+            $usbBase = 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\USBSTOR'
+            if (Test-Path $usbBase) {
+                foreach ($dev in (Get-ChildItem $usbBase -ErrorAction SilentlyContinue)) {
+                    foreach ($inst in (Get-ChildItem $dev.PSPath -ErrorAction SilentlyContinue)) {
+                        $ip = Get-ItemProperty -LiteralPath $inst.PSPath -ErrorAction SilentlyContinue
+                        $usbs += [pscustomobject]@{ DeviceKey = $dev.PSChildName; FriendlyName = "$($ip.FriendlyName)"; Serial = $(if ($ip.ParentIdPrefix) { "$($ip.ParentIdPrefix)" } else { $inst.PSChildName }); LastWrite = $inst.LastWriteTime }
+                    }
+                }
+            }
+            Save-Rows -Name 'usb_devices' -Rows $usbs
+            $sap = Join-Path $env:SystemRoot 'INF\setupapi.dev.log'
+            if (Test-Path $sap) {
+                $d = Join-Path $RawDir 'usb'
+                if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+                Copy-Item -LiteralPath $sap -Destination (Join-Path $d 'setupapi.dev.log') -Force -ErrorAction SilentlyContinue
+            }
+            if ($usbs.Count -gt 0) { Write-CaseLog "    USB: $($usbs.Count) storage device(s) on record -> csv\usb_devices.csv" 'Gray' }
+            # Office File MRU (recent documents per user)
+            $mru = @()
+            foreach ($sid in @(Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-' })) {
+                foreach ($ver in @('16.0', '15.0')) {
+                    foreach ($app in @('Word', 'Excel', 'PowerPoint')) {
+                        $k = "$($sid.PSPath)\Software\Microsoft\Office\$ver\$app\File MRU"
+                        if (-not (Test-Path $k)) { continue }
+                        $t = (Get-Item $k).LastWriteTime
+                        foreach ($v in (Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue).PSObject.Properties) {
+                            if ($v.Name -notmatch '^Item \d+' -or $v.Value -isnot [byte[]]) { continue }
+                            $ascii = [Text.Encoding]::ASCII.GetString($v.Value)
+                            if ($ascii -match '(?i)([a-z]:\\[^\x00-\x1f]+?\.(docx?|xlsx?|pptx?|pdf|rtf))') {
+                                $mru += [pscustomobject]@{ Sid = $sid.PSChildName; App = $app; Document = $Matches[1]; LastWrite = $t }
+                            }
+                        }
+                    }
+                }
+            }
+            Save-Rows -Name 'office_mru' -Rows $mru
+            if ($mru.Count -gt 0) { Write-CaseLog "    Office MRU: $($mru.Count) recent document(s)" 'Gray' }
+            # User Access Logs (SMB/RDP source history - ESE format, preserved raw for analyst)
+            $sum = Join-Path $env:SystemRoot 'System32\LogFiles\Sum'
+            if (Test-Path $sum) {
+                $d = Join-Path $RawDir 'ual'
+                if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+                $mts = @(Get-ChildItem $sum -Filter '*.mts' -File -ErrorAction SilentlyContinue)
+                $mts | Copy-Item -Destination $d -Force -ErrorAction SilentlyContinue
+                Save-Rows -Name 'ual_files' -Rows @($mts | Select-Object Name, Length, LastWriteTime)
+                Write-CaseLog "    UAL: $($mts.Count) .mts file(s) copied to raw\ual (ESE - analyst-side parse)" 'Gray'
             }
         } }
 )
@@ -3069,7 +3236,7 @@ function Invoke-SelectedModules {
     $phaseOf = {
         param($m)
         if ($m.Cat -eq 'VOLATILE') { 'A' }
-        elseif ($m.Id -in @('7.1', '4.7', '4.8')) { 'CI' }
+        elseif ($m.Id -in @('7.1', '7.2', '4.7', '4.8')) { 'CI' }
         elseif ($m.Id -in @('4.6', '5.4', '5.5', '8.4')) { 'C' }
         else { 'B' }
     }
@@ -3213,6 +3380,8 @@ function New-HtmlReport {
     $yaraHits = @(Import-CaseCsv 'yara_hits.csv')
     $beacons = @(Import-CaseCsv 'beacon_candidates.csv')
     $dnsBeacons = @(Import-CaseCsv 'dns_beacon_candidates.csv')
+    $huntRows = @(Import-CaseCsv 'hunt_findings.csv')
+    $liveScan = @(Import-CaseCsv 'memory_live_scan.csv')
     $lolHits = @(Import-CaseCsv 'loldrivers_hits.csv')
     $psCmds = @(Import-CaseCsv 'ps_decoded_commands.csv')
     $entB = @(Import-CaseCsv 'entities_binaries.csv')
@@ -3282,7 +3451,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
     $null = $sb.AppendLine("<h1>OPHIRA COMPROMISE ASSESSMENT REPORT</h1>")
     $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' }) &nbsp;|&nbsp; Elevated: $(if (Test-IsAdmin) { 'yes' } else { 'NO' })</div>")
-    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#snapshot'>Snapshot</a><a href='#drivers'>Drivers</a><a href='#entities'>Connections</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
+    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#snapshot'>Snapshot</a><a href='#drivers'>Drivers</a><a href='#hunt'>Hunt</a><a href='#entities'>Connections</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
 
     # ---------- verdict banner ----------
     $null = $sb.AppendLine("<a name='verdict'></a><h2>Verdict</h2>")
@@ -3732,6 +3901,27 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         $null = $sb.AppendLine("<div class='meta'>No malicious/vulnerable driver matches (or tools\loldrivers datasets missing - run -Mode Setup, needs admin + module 1.6).</div>")
     }
 
+    # ---------- hunt findings ----------
+    $null = $sb.AppendLine("<a name='hunt'></a><h2>Hunt findings (technique-based detections)</h2>")
+    if ($huntRows.Count -gt 0) {
+        $null = $sb.AppendLine("<table><tr><th>Severity</th><th>Rule</th><th>ATT&amp;CK</th><th>Entity</th><th>Evidence</th></tr>")
+        foreach ($h2 in ($huntRows | Sort-Object { switch -Regex ("$($_.Severity)") { 'high' { 0 } 'medium' { 1 } default { 2 } } })) {
+            $sevCls = switch -Regex ("$($h2.Severity)") { 'high' { 'crit'; break } 'medium' { 'med'; break } default { 'info' } }
+            $null = $sb.AppendLine("<tr><td class='$sevCls'><b>$(ConvertTo-HtmlEsc $h2.Severity)</b></td><td>$(ConvertTo-HtmlEsc $h2.Rule)</td><td>$(ConvertTo-HtmlEsc $h2.Attck)</td><td class='path'>$(ConvertTo-HtmlEsc $h2.Entity)</td><td class='path'>$(ConvertTo-HtmlEsc $h2.Evidence)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>High-severity hunt rules are high-precision (version-info renames, side-loaded system DLLs, downloaded-then-executed) and contribute to the verdict. Verify against the cited raw evidence. Source: csv\hunt_findings.csv</div>")
+    } else {
+        $null = $sb.AppendLine("<div class='meta'>No hunt findings - all techniques clean.</div>")
+    }
+    if ($liveScan.Count -gt 0) {
+        $null = $sb.AppendLine("<h3>Live memory triage (flagged-process minidumps)</h3><table><tr><th>Process</th><th>PID</th><th>Verdict</th><th>Dump</th><th>MB</th><th>YARA hits in memory</th></tr>")
+        foreach ($l in $liveScan) {
+            $hCls = if ("$($l.YaraHits)") { 'crit' } else { 'info' }
+            $null = $sb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $l.Process)</td><td>$(ConvertTo-HtmlEsc $l.PID)</td><td>$(ConvertTo-HtmlEsc $l.Verdict)</td><td class='path'>$(ConvertTo-HtmlEsc $l.Dump)</td><td>$($l.DumpMB)</td><td class='$hCls'><b>$(ConvertTo-HtmlEsc $l.YaraHits)</b></td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Minidumps contain unpacked/injected code - YARA hits here mean the pattern lives in MEMORY even if disk scans missed it. Dumps ship in raw\minidumps\ and open in Volatility. Source: csv\memory_live_scan.csv</div>")
+    }
+
     # ---------- connections: correlated entities ----------
     $null = $sb.AppendLine("<a name='entities'></a><h2>Connections - correlated entities</h2>")
     $null = $sb.AppendLine("<div class='meta'>Each entity below joins evidence from multiple independent sources (processes, execution history, persistence, network, SRUM usage, YARA, Sigma...) into one story. More categories touching one binary = stronger signal. Full data: csv\entities_binaries.csv / entities_accounts.csv / entities_remotes.csv</div>")
@@ -3976,6 +4166,14 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'srum_usage'                      = 'SRUM: per-app resource/network usage over weeks'
         'logging_gaps'                    = 'Log clear/stop events + evtx coverage gaps'
         'parse_needed'                    = 'Artifacts not finished on the endpoint + exactly how to finish them (-Mode Parse)'
+        'hunt_findings'                   = 'Technique-based hunt detections (renamed binaries, side-loads, download-exec, account/RDP anomalies)'
+        'memory_live_scan'                = 'Flagged-process minidumps + YARA hits found in live memory'
+        'sysmon_image_load'               = 'Sysmon DLL loads (EID 7) - side-load data source'
+        'bam_lastexec'                    = 'BAM/DAM last-execution per user (survives Prefetch deletion)'
+        'usb_devices'                     = 'Every USB storage device ever connected (serials + dates)'
+        'office_mru'                      = 'Office recent documents per user'
+        'ual_files'                       = 'User Access Logs copied raw (SMB/RDP source history - ESE)'
+        'local_admins'                    = 'Local Administrators group members'
         'entities_binaries'               = 'Binaries joined across ALL evidence sources (execution/persistence/network/verdict...) with category counts'
         'entities_accounts'               = 'Accounts joined across logons/RDP/console history with failure counts'
         'entities_remotes'                = 'Remote endpoints joined across connections/beacons/brute-force/RDP targets'
@@ -4272,6 +4470,13 @@ function New-EntityCorrelation {
     foreach ($r in (& $rowsOf 'security_bruteforce_candidates')) { $e = & $remGet $r.SourceIp; if ($e) { $e.Brute = [int]"$($r.FailedLogons)"; $e.Evidence.Add("brute-force: $($r.FailedLogons) failed logons") | Out-Null } }
     foreach ($r in (& $rowsOf 'rdp_client_targets')) { $e = & $remGet $r.TargetServer; if ($e) { $e.RdpOut++; $e.Evidence.Add("rdp-out target (hint $($r.UsernameHint))") | Out-Null } }
 
+    foreach ($r in (& $rowsOf 'hunt_findings')) {
+        $ent = "$($r.Entity)"
+        $b = $null
+        if ($ent -match '^[a-z]:\\') { $b = & $binNew $ent } else { $b = & $binFromRow $r }
+        if ($b) { & $binAdd $b 'hunt' "[$($r.Severity)] $($r.Rule): $($r.Evidence)" '' }
+    }
+
     # ---------- emit ----------
     if ($env:OPHIRA_DBG_ENT) { foreach ($kv in $binsByPath.GetEnumerator()) { Write-Host ("DBG bin: {0} -> [{1}]" -f $kv.Key, ($kv.Value.Cats -join ",")) } }
     if ($env:OPHIRA_DBG_ENT) { foreach ($a2 in $accts.Values) { Write-Host ("DBG acct: {0} logons={1} failed={2}" -f $a2.Account, $a2.Logons, $a2.Failed) } }
@@ -4307,6 +4512,147 @@ function New-EntityCorrelation {
 
     $multi = @($binRows | Where-Object { $_.CatCount -ge 2 }).Count
     Write-CaseLog "    entity correlation: $($binRows.Count) binaries ($multi multi-source), $($acctRows.Count) accounts, $($remRows.Count) remotes -> csv\entities_*.csv" 'DarkGray'
+}
+
+function New-HuntFindings {
+    # Hunt techniques ported from Velociraptor-style detection logic + APT TTPs.
+    # Findings feed the report, entity correlation and (R1-R4) the verdict.
+    $out = New-Object System.Collections.Generic.List[object]
+    $find = {
+        param([string]$rule, [string]$sev, [string]$entity, [string]$evidence, [string]$attack)
+        $null = $out.Add([pscustomobject]@{ Found = (Get-Date).ToUniversalTime().ToString('o'); Rule = $rule; Severity = $sev; Entity = $entity; Attck = $attack; Evidence = $evidence })
+    }
+
+    # ---------- R1: renamed LOLBin (version-info identity vs filename, BinaryRename port) ----------
+    $lolBins = @('cmd.exe', 'powershell.exe', 'pwsh.exe', 'mshta.exe', 'regsvr32.exe', 'rundll32.exe', 'wmic.exe', 'wscript.exe', 'cscript.exe', 'certutil.exe', 'bitsadmin.exe', 'net.exe', 'net1.exe', 'netsh.exe', 'wevtutil.exe', 'psexec.exe', 'psexec64.exe', 'msiexec.exe', 'installutil.exe', 'schtasks.exe', 'curl.exe', 'wget.exe', '7z.exe', 'winrar.exe')
+    $r1Seen = @{}
+    foreach ($r in ((Import-CaseCsv 'processes') | Select-Object -First 400)) {
+        $p = "$($r.Path)"
+        if (-not $p -or -not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
+        $leaf = $null
+        try { $leaf = (Split-Path $p -Leaf).ToLower() } catch { continue }
+        if (-not $leaf -or $r1Seen.ContainsKey($p.ToLower())) { continue }
+        $r1Seen[$p.ToLower()] = $true
+        $vi = $null
+        try { $vi = (Get-Item -LiteralPath $p -ErrorAction Stop).VersionInfo } catch { continue }
+        $internal = "$($vi.InternalName)"; $original = "$($vi.OriginalFilename)"
+        $identities = @($internal, $original) | Where-Object { $_ } | ForEach-Object { (($_ -replace '\.mui$', '') -replace '\.exe$', '').ToLower().Trim() }
+        $idHit = @($identities | Where-Object { $lolBins -contains ($_ + '.exe') })
+        if ($idHit.Count -gt 0 -and ($leaf -replace '\.exe$', '') -ne $idHit[0]) {
+            & $find 'Renamed LOLBin (version-info mismatch)' 'high' $p "file '$leaf' but embedded identity '$($idHit[0])' (internal=$internal; original=$original)" 'T1036.003'
+        }
+    }
+
+    # ---------- R2: DLL side-load live - proxy DLL loaded from user-writable path (Sysmon EID 7) ----------
+    $proxyDlls = @('version.dll', 'winmm.dll', 'dbghelp.dll', 'd3d9.dll', 'd3d10.dll', 'd3d11.dll', 'dxgi.dll', 'cryptsp.dll', 'winhttp.dll', 'ualapi.dll', 'wlanapi.dll', 'wbemcomn.dll', 'actxprxy.dll', 'msdtcprx.dll', 'tspkg.dll', 'ntlmshared.dll', 'mfc42.dll', 'msvcp60.dll')
+    foreach ($r in (Import-CaseCsv 'sysmon_image_load')) {
+        $dll = "$($r.Dll)"
+        if (-not $dll) { continue }
+        $leaf = ''
+        try { $leaf = (Split-Path $dll -Leaf).ToLower() } catch { continue }
+        if (-not $leaf) { continue }
+        if ($proxyDlls -contains $leaf -and (Test-IsUserWritablePath $dll)) {
+            & $find 'DLL side-load - proxy DLL in user-writable path' 'high' $dll "loaded by $($r.Process) (signed=$($r.Signed); sig=$($r.Signature))" 'T1574.002'
+        } elseif ($proxyDlls -contains $leaf -and "$($r.Signed)" -eq 'false' -and $dll -notmatch '(?i)\\windows\\') {
+            & $find 'DLL side-load - unsigned proxy DLL outside Windows' 'medium' $dll "loaded by $($r.Process) from $dll" 'T1574.002'
+        }
+    }
+
+    # ---------- R3: same proxy-DLL/binary name in system dir AND user dir (static side-load) ----------
+    $namePaths = @{}
+    foreach ($src in @('amcache', 'mft_recent', 'sysmon_image_load')) {
+        foreach ($r in (Import-CaseCsv $src)) {
+            $p = $null
+            if ($src -eq 'sysmon_image_load') { $p = "$($r.Dll)" } else {
+                foreach ($pn in @('Path', 'Name')) { $p2 = $r.PSObject.Properties[$pn]; if ($p2 -and "$($p2.Value)" -match '\.(dll|exe)$') { $p = "$($p2.Value)"; break } }
+            }
+            if (-not $p) { continue }
+            $leaf = ''
+            try { $leaf = (Split-Path $p -Leaf).ToLower() } catch { continue }
+            if (-not $leaf -or $proxyDlls -notcontains $leaf) { continue }
+            if (-not $namePaths.ContainsKey($leaf)) { $namePaths[$leaf] = New-Object System.Collections.Generic.List[string] }
+            $null = $namePaths[$leaf].Add($p)
+        }
+    }
+    foreach ($kv in $namePaths.GetEnumerator()) {
+        $inSys = @($kv.Value | Where-Object { $_ -match '(?i)^c:\\windows\\(system32|syswow64|sysnative)\\' })
+        $inUser = @($kv.Value | Where-Object { Test-IsUserWritablePath $_ })
+        if ($inSys.Count -gt 0 -and $inUser.Count -gt 0) {
+            & $find 'DLL side-load - planted system DLL name in user path' 'high' $kv.Key "system: $($inSys[0]) | user: $($inUser[0])$(if ($inUser.Count -gt 1) { ' (+' + ($inUser.Count - 1) + ' more)' })" 'T1574.002'
+        }
+    }
+
+    # ---------- R4: downloaded then executed ----------
+    $execNames = @{}
+    foreach ($src in @('amcache', 'prefetch_parsed', 'execution_timeline', 'processes')) {
+        foreach ($r in (Import-CaseCsv $src)) {
+            foreach ($pn in @('Path', 'Executable', 'Name', 'App')) {
+                $p2 = $r.PSObject.Properties[$pn]
+                if ($p2 -and "$($p2.Value)") {
+                    $n = ''
+                    try { $n = (Split-Path "$($p2.Value)" -Leaf).ToLower() } catch { $n = "$($p2.Value)".ToLower() }
+                    if ($n -match '\.(exe|dll|ps1|bat|js|hta|scr|msi|lnk|vbs)$') { $execNames[$n] = $true }
+                    break
+                }
+            }
+        }
+    }
+    foreach ($r in (Import-CaseCsv 'browser_downloads')) {
+        $tp = ''
+        foreach ($pn in @('TargetFilePath', 'TargetPath', 'DownloadPath', 'FullPath', 'Path', 'URL')) {
+            $p2 = $r.PSObject.Properties[$pn]
+            if ($p2 -and "$($p2.Value)") { $tp = "$($p2.Value)"; break }
+        }
+        if (-not $tp) { continue }
+        $n = ''
+        try { $n = (Split-Path $tp -Leaf).ToLower() } catch { $n = $tp.ToLower() }
+        if ($n -and $n -match '\.(exe|dll|ps1|bat|js|hta|scr|msi|lnk|vbs)$' -and $execNames.ContainsKey($n)) {
+            & $find 'Downloaded then executed' 'high' $tp "'$n' downloaded via browser and later appears in execution evidence" 'T1105/T1204.002'
+        }
+    }
+
+    # ---------- R5: USB execution trail (report-only) ----------
+    $usb = @(Import-CaseCsv 'usb_devices')
+    if ($usb.Count -gt 0) {
+        $nonC = @()
+        foreach ($src in @('lnk_parsed', 'shellbags')) {
+            foreach ($r in (Import-CaseCsv $src)) {
+                foreach ($p2 in $r.PSObject.Properties) {
+                    $v = "$($p2.Value)"
+                    if ($v -match '(?i)^([d-z]):\\' -and $Matches[1].ToUpper() -ne 'C:') { $nonC += "$($src.Substring(0, 3))/$($p2.Name): $v"; break }
+                }
+                if ($nonC.Count -ge 3) { break }
+            }
+            if ($nonC.Count -ge 3) { break }
+        }
+        if ($nonC.Count -gt 0) {
+            & $find 'USB execution trail' 'info' "$($usb.Count) USB device(s) on record" "non-C: drive references: $(($nonC | Select-Object -First 3) -join ' | ')" 'T1091'
+        }
+    }
+
+    # ---------- R6: account created + privileged group change in window (report-only) ----------
+    $auth = Import-CaseCsv 'security_auth_events'
+    $created = @($auth | Where-Object { "$($_.EventId)" -eq '4720' } | ForEach-Object { "$($_.Account)" } | Sort-Object -Unique)
+    $grpAdds = @($auth | Where-Object { "$($_.EventId)" -in @('4728', '4732', '4756') })
+    if ($created.Count -gt 0 -and $grpAdds.Count -gt 0) {
+        & $find 'Account lifecycle - created + group change' 'info' (($created | Select-Object -First 5) -join ', ') "$($created.Count) account creation(s) + $($grpAdds.Count) privileged-group change(s) in window" 'T1136/T1098'
+    }
+
+    # ---------- R7: RDP logon from public internet IP (report-only) ----------
+    $rdpPub = @($auth | Where-Object { "$($_.EventId)" -eq '4624' -and "$($_.LogonType)" -eq '10' -and (Test-IsPublicIp "$($_.SourceIp)") })
+    foreach ($g in ($rdpPub | Group-Object SourceIp)) {
+        $accts = (@($g.Group | ForEach-Object { "$($_.Account)" } | Sort-Object -Unique | Select-Object -First 4)) -join ', '
+        & $find 'RDP logon from public internet IP' 'medium' "$($g.Name)" "$($g.Count) RDP logon(s): $accts" 'T1021.001'
+    }
+
+    Save-Rows -Name 'hunt_findings' -Rows $out.ToArray()
+    $hi = @($out | Where-Object { $_.Severity -eq 'high' }).Count
+    if ($out.Count -gt 0) {
+        Write-CaseLog "    hunt findings: $($out.Count) ($hi high) -> csv\hunt_findings.csv" $(if ($hi -gt 0) { 'Red' } else { 'Yellow' })
+        foreach ($f in ($out | Where-Object { $_.Severity -eq 'high' } | Select-Object -First 4)) { Write-CaseLog "      [$($f.Severity)] $($f.Rule) - $($f.Entity)" 'Red' }
+    } else {
+        Write-CaseLog '    hunt findings: none - all techniques clean' 'Gray'
+    }
 }
 
 function New-LoggingGaps {
@@ -4528,6 +4874,8 @@ function Get-CompromiseVerdict {
     $dnsHi = @($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' }).Count
     $dnsMed = @($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
     $lolMal = @($lol | Where-Object { $_.Status -eq 'malicious' }).Count
+    $hunt = Import-CaseCsv 'hunt_findings'
+    $huntHi = @($hunt | Where-Object { "$($_.Severity)" -eq 'high' -and "$($_.Rule)" -match 'Renamed LOLBin|side-load|Downloaded then executed' })
     $usnBurstN = @($usnBursts).Count
     $rExt = ((@($usnBursts) | Where-Object { "$($_.RansomExt)" } | ForEach-Object { "$($_.RansomExt)" } | Sort-Object -Unique) -join ',')
     # ponytail: COM hijacks + StartupApproved excluded from the signal (per-user COM has many legit users, e.g. Teams/OneDrive); they stay report-visible
@@ -4538,6 +4886,7 @@ function Get-CompromiseVerdict {
     Add-Signal 'C2 beaconing - highly regular callbacks' 3 $beaconHi (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp):$($_.Port) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'C2 DNS beaconing - highly regular domain queries' 3 $dnsHi (($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.Domain) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'Known-malicious driver on disk (LOLDrivers)' 2 $lolMal (($lol | Where-Object { $_.Status -eq 'malicious' } | Select-Object -First 3 | ForEach-Object { "$($_.Name): $($_.Path)" }) -join '; ')
+    Add-Signal 'Hunt technique - renamed binary / side-load / downloaded-exec' 2 $huntHi.Count (($huntHi | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'Ransomware-like mass file modification (USN journal)' 3 $usnBurstN ((($usnBursts | Select-Object -First 3 | ForEach-Object { "$($_.WindowStart): $($_.WriteEvents) writes / $($_.DistinctFiles) files" }) -join '; ') + $(if ($rExt) { " - RANSOM EXTENSIONS: $rExt" }))
     Add-Signal 'Uncommon persistence mechanism (IFEO/AppInit/Winlogon/netsh/LSA)' 2 $asepHotN (($asep | Where-Object { $_.Flags -match 'user-path|nondefault' -and "$($_.Category)" -notmatch 'ComHijack|StartupApproved' } | Select-Object -First 3 | ForEach-Object { "$($_.Category): $($_.Name) = $($_.Value)" }) -join '; ')
     Add-Signal 'Memory malfind indicators (injected code regions)' 2 @($memMf).Count (($memMf | Select-Object -First 3 | ForEach-Object { "$($_.Process)($($_.PID))" }) -join '; ')
@@ -4576,6 +4925,7 @@ function Get-CompromiseVerdict {
     Add-Cov 'YARA binary scan' (Test-Path (Join-Path $CsvDir 'yara_scanned.csv')) 5
     Add-Cov 'DNS query telemetry (Sysmon EID 22)' (Test-Path (Join-Path $CsvDir 'sysmon_dns.csv')) 4
     Add-Cov 'Entity correlation' (Test-Path (Join-Path $CsvDir 'entities_binaries.csv')) 3
+    Add-Cov 'Hunt rules' (Test-Path (Join-Path $CsvDir 'hunt_findings.csv')) 3
     Add-Cov 'LOLDrivers driver hash check' (Test-Path (Join-Path $CsvDir 'loldrivers_hits.csv')) 3
     Add-Cov 'Sysmon telemetry (bonus)' ([bool]$Sysmon) 5
     Add-Cov 'RAM capture (bonus)' (Test-Path $MemDir) 3
@@ -4620,6 +4970,7 @@ function Get-CompromiseVerdict {
         DefenderDetections = @($def).Count; TamperEvents = $gapTamper; BruteForceSources = @($brute).Count
         BeaconHigh = $beaconHi; BeaconMedium = $beaconMed
         DnsBeaconHigh = $dnsHi; DnsBeaconMedium = $dnsMed; LolDriversMalicious = $lolMal
+        HuntHighPrecision = $huntHi.Count; HuntTotal = @($hunt).Count
     }
 
     return [pscustomobject]@{
@@ -4643,6 +4994,7 @@ function Invoke-RegenerateOutputs {
     try { New-SuperTimeline } catch { Write-CaseLog "    supertimeline failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-SigmaRuleLogs } catch { Write-CaseLog "    sigma rule logs failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-EntityCorrelation } catch { Write-CaseLog "    entity correlation failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-HuntFindings } catch { Write-CaseLog "    hunt findings failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-LoggingGaps } catch { Write-CaseLog "    logging gaps failed: $($_.Exception.Message)" 'DarkYellow' }
     try { Get-ParseNeeds } catch { Write-CaseLog "    parse-needed check failed: $($_.Exception.Message)" 'DarkYellow' }
     $script:Verdict = $null
@@ -5523,4 +5875,10 @@ if ($script:SimpleUI) {
     Write-Host "Press any key to close..." -ForegroundColor DarkGray
     try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
 }
+
+
+
+
+
+
 

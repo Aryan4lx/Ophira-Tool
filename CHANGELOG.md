@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.19
+- **Hunt pack** (`New-HuntFindings`, R1-R7) - technique-based detections ported from Velociraptor-style logic → `hunt_findings.csv` (Rule/Severity/Entity/ATT&CK/Evidence) + report "Hunt findings" section:
+  - R1 **renamed LOLBin** (T1036.003): embedded version-info identity vs filename against the BinaryRename LOLBin table (cmd/powershell/mshta/regsvr32/rundll32/certutil/...)
+  - R2 **DLL side-load live** (T1574.002): Sysmon EID 7 proxy-DLLs (version.dll, winmm.dll, dbghelp.dll...) loaded from user-writable paths + unsigned-outside-Windows variant
+  - R3 **DLL side-load static** (T1574.002): system-DLL name planted in a user-writable path (amcache/MFT/EID 7 union)
+  - R4 **downloaded-then-executed** (T1105/T1204.002): browser downloads × execution evidence
+  - R5 USB execution trail, R6 account-created + group-change, R7 RDP-in from public IP (report-only)
+  - R1-R4 are high-precision → **floor-2 verdict signals**; all findings feed entity correlation as a `hunt` category
+- **New artifacts**: Sysmon EID 7 parse (`sysmon_image_load.csv`), BAM/DAM last-exec (`bam_lastexec.csv`), USB device history (`usb_devices.csv` + setupapi.dev.log raw), Office File MRU (`office_mru.csv`), local admins (`local_admins.csv`), audit policy → posture rows, UAL .mts raw copy
+- **Module 7.2 live memory triage** (opt-in, admin): minidumps of flagged processes only (cap 10, >1.5GB skipped, LSASS/security-critical excluded, 2GB/10GB-disk budgets) via `MiniDumpWriteDump` → YARA over the dumps → `memory_live_scan.csv` + report section (catches injected/unpacked code disk scans miss; dumps are Volatility-readable)
+- Coverage doc: README now maps Ophira vs Velociraptor's built-in Windows artifacts (full/partial/live-only/niche)
+- Fixed: `@($list)` around generic lists in hunt emit (PS 5.1 "Argument types do not match")
+
 ## v2.18
 - **Connections: cross-source entity correlation** (`New-EntityCorrelation`, runs at packaging + in `-Mode Parse`):
   - **Binaries** joined across ~16 artifacts (flash verdict, running processes, hashes, amcache+IOC, prefetch, services/tasks/autoruns/ASEP persistence, connections, beacons, SRUM usage, YARA, LOLDrivers, MFT created, sigma alerts) → `entities_binaries.csv` with evidence-category counts, first/last seen, hashes, SRUM bytes

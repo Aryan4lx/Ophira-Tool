@@ -1,4 +1,4 @@
-$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
+﻿$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
 # v2.14 - DNS beaconing (4.8), LOLDrivers xref (8.10), -Mode Tune, supertimeline dedupe, verdict wiring
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
@@ -65,7 +65,7 @@ Check "dns beacon: user-path flag set on beacon row" ("$(@($dnsB | Where-Object 
 # ============================================================================
 # PART 2 - module 8.10: LOLDrivers hash xref
 # ============================================================================
-$m810 = [regex]::Match($src, "(?s)Id = '8\.10';.*?Run = \{(.*?)\r?\n        \} \}\r?\n\)")
+$m810 = [regex]::Match($src, "(?s)Id = '8\.10';.*?Run = \{(.*?)\r?\n        \} \}\r?\n    \[pscustomobject\]@\{ Id = '8\.11'")
 if (-not $m810.Success) { throw 'module 8.10 extract failed' }
 $toolsTmp = Join-Path $env:TEMP ("ophira_lol_" + (Get-Date -Format 'HHmmss'))
 $lolDir = Join-Path $toolsTmp 'loldrivers'
@@ -199,3 +199,4 @@ Write-Host ""
 Write-Host "RESULT: $pass passed, $fail failed" -ForegroundColor $(if ($fail -eq 0) { 'Green' } else { 'Red' })
 foreach ($d in @($case, $toolsTmp, $hbDir, $kitTmp, $stCase, $vdCase)) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
 if ($fail -gt 0) { exit 1 } else { exit 0 }
+

@@ -226,8 +226,23 @@ while ($true) { try { (New-Object Net.Sockets.TcpClient('1.1.1.1', 443)).Close()
 - [x] Triage depth v2: sigma per-rule event logs + report drill-down, `-Mode Process` single-process pivot, Tune V/ED rule viewer/editor, endpoint/analyst tool split for PushTools (v2.16)
 - [x] Analyst-side completion: `-Mode Parse` (finish a case on your PC), `parse_needed.csv` + endpoint .NET inventory, Full-preset full-NTFS preservation (v2.15); hotfix helper scoping (v2.17)
 - [x] **Connections: cross-source entity correlation** - binaries/accounts/remotes joined across all artifacts with category-strength scoring, report drill-down + SRUM per-app network consumers; repo trim + long-path hardening (v2.18)
+- [x] **Hunt pack**: R1-R7 technique detections (renamed LOLBin, DLL side-loads live+static, download-exec, USB trail, account lifecycle, public RDP) with ATT&CK tags + verdict floors; BAM/DAM, USB history, UAL, Office MRU, local-admins, audit-policy artifacts; module 7.2 flagged-process minidumps + YARA (v2.19)
+- [ ] **APT depth (v2.20)**: structured parses (Sysmon EID 1/10/13, 4688/4698/5140/5145, Defender 5001/5007) + hunt rules for Office→interpreter chains, LSASS access, proxy-execution LOLBins, UAC bypass, timestomping, admin-share staging, discovery storms, fleet lateral-chain stitching
 - [ ] Real-host pilot run (validate hayabusa timing + MFTECmd on live volume)
 - [ ] Role-based presets (WebServer / DC / Workstation)
+
+## Coverage vs Velociraptor (built-in Windows artifacts)
+
+Ophira is a read-only single script (no resident agent, no driver), so Velociraptor's live-query artifacts are partially out of reach by design:
+
+| Bucket | Share of VR's ~98 Windows artifacts | Examples |
+|---|---|---|
+| Full equivalent | ~45 | Amcache, Prefetch, USN, SRUM, ShellBags, LNK, JumpLists, RecycleBin, Timeline, DNS cache, hosts, services, tasks, WMI, certs, logon/process events, memory acquisition, hunt detections (R1-R3) |
+| Partial | ~12 | SAM (hive saved, hashes not extracted), Signers, SVCHost anomalies, VAD (→ minidumps), FilenameSearch |
+| Live-only (VR's agent/driver moat) | ~10 | Handles, live DLL/Thread enumeration, Mutants, Impersonation, VBScript-in-proc, UEFI |
+| Niche/campaign-specific | ~12 | Notepad tabs, RDP bitmap cache, PST search, BulkExtractor, campaign one-offs |
+
+Everything in the "full" bucket produces parsed CSVs + verdict/report integration; partials preserve the raw evidence for analyst-side completion (`-Mode Parse`).
 
 ## License
 
