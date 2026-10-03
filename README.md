@@ -172,6 +172,16 @@ vol.exe -f memory\physmem.raw windows.pslist.PsList
 chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 ```
 
+## Deploy Sysmon (recommended config)
+
+`tools\sysmon\ophira-sysmon.xml` is a lean, commented Sysmon config that enables exactly the telemetry Ophira's hunt rules consume: process creations with hashes (1), file-creation-time changes (2), network connections (3), image loads (7), **ProcessAccess filtered to lsass targets** (10 - the LSASS-dump signal without the usual noise), **registry events filtered to hot keys** (Run/IFEO/ms-settings/services - UAC-bypass + persistence), and DNS queries (22).
+
+Ophira never installs anything (read-only by design) - deploy it yourself on hosts you want full telemetry from, elevated, once per endpoint:
+```
+sysmon64.exe -accepteula -i ophira-sysmon.xml
+```
+When a case shows Sysmon running but no ProcessAccess/registry telemetry arrives, the report's hunt section flags the config gap and points at this file. Stock Sysmon or a default-swift config also works - the filter above just keeps volume sane while preserving every event class Ophira parses.
+
 ## Design rules
 
 - Read-only; degrades gracefully without admin (logs what failed)
@@ -239,6 +249,7 @@ while ($true) { try { (New-Object Net.Sockets.TcpClient('1.1.1.1', 443)).Close()
 - [x] **Connections: cross-source entity correlation** - binaries/accounts/remotes joined across all artifacts with category-strength scoring, report drill-down + SRUM per-app network consumers; repo trim + long-path hardening (v2.18)
 - [x] **Hunt pack**: R1-R7 technique detections (renamed LOLBin, DLL side-loads live+static, download-exec, USB trail, account lifecycle, public RDP) with ATT&CK tags + verdict floors; BAM/DAM, USB history, UAL, Office MRU, local-admins, audit-policy artifacts; module 7.2 flagged-process minidumps + YARA (v2.19)
 - [x] **APT depth**: structured parses (4688 process-creation w/ cmdline, 4698 task installs, 5140/5145 share access, Sysmon EID 10/13/2, Defender 5001/5007) + hunt rules R8-R15 (LSASS access, Office→interpreter chains, proxy-exec LOLBin command lines, UAC bypass, timestomping, admin-share staging, discovery storms, Defender tamper); fleet lateral-chain stitching + SIEM hunt records (v2.20)
+- [x] **Sysmon config + timestamp forgery**: bundled `ophira-sysmon.xml` (config-gap detection + report hint), `CreatedFN` (FILE_NAME birth) in mft_recent, hunt rule R22 - future-birth / ran-before-born / $Si-vs-FILE_NAME skew checks on flagged binaries with EID 2 corroboration (v2.22)
 - [ ] Real-host pilot run (validate hayabusa timing + MFTECmd on live volume)
 - [x] **Role presets + correlation spine**: auto-detected host role (DC/WebServer/Workstation) + `DC`/`WebServer` presets with auto role-pack; module 4.9 Kerberos/DS parses (4768/4769/4771/4776, 4662 DCSync GUIDs, 5136), module 8.12 IIS/HTTPERR raw + W3C parse; hunt rules R16-R21 (DCSync, Kerberoasting, AS-REP, password spray, webshell chains, web anomalies); session attribution (4624 LogonId x 4688/5145), process-lineage chains for flagged binaries, new sources in entity correlation; Win7/PS2.0 parse-compat sweep (friendly gate fires everywhere) (v2.21)
 

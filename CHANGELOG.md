@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.22
+- **Bundled recommended Sysmon config** (`tools\sysmon\ophira-sysmon.xml`): lean commented config enabling exactly what Ophira parses - process creations w/ hashes (1), file-time changes (2), network (3), image loads (7), **ProcessAccess filtered to lsass targets** (10 - LSASS-dump signal without the noise), **registry hot keys** (Run/IFEO/ms-settings/services - UAC bypass + persistence), DNS queries (22). Install one-liner in the header (`sysmon64.exe -accepteula -i ophira-sysmon.xml`); Ophira itself stays read-only - you deploy it
+  - Setup kit inventory points at the file; README gains a "Deploy Sysmon" section
+  - Report hunt section flags the **config gap**: Sysmon present but no EID 10 telemetry -> hint to deploy the bundled config (the LSASS/registry/beacon rules run blind without it)
+- **Hunt rule R22 - timestamp forgery indicators** (T1070.006, medium, report-only): scans every executable in `mft_recent` with three O(1) checks:
+  - **future-birth** - $Si birth after collection time (+1d margin; backdated or clock-skewed)
+  - **ran-before-born** - amcache evidence predates the claimed birth by >24h (executed before it "existed")
+  - **$Si-vs-FILE_NAME skew** - Created0x10 vs Created0x30 disagree by >90 days (classic backdated-$Si signature)
+  - Sysmon EID 2 events for the same file cited as corroboration
+- Module 5.5 now projects `CreatedFN` (FILE_NAME birth, Created0x30) into `mft_recent` alongside the existing $Si `Created`
+- Tests: `tests\test_v221.ps1` unchanged; new `tests\test_v222.ps1` (15 checks) - R22 fixtures per check + negatives, config XML validity + filter sanity (lsass include, hot keys, unfiltered DNS)
+
 ## v2.21
 - **Role presets + correlation spine**
   - **Host role detection** (`Get-HostRole`, startup): DC (NTDS registry key), WebServer (InetStp/W3SVC), else Workstation; shown in the menu banner + collection log, recorded in `case.json` (`Role`) and `fleet_hosts.csv` (+ fleet-report host table)

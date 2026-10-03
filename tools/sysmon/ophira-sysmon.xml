@@ -1,0 +1,80 @@
+<!--
+  Ophira recommended Sysmon configuration (v2.22)
+  ===============================================
+  Lean config that enables exactly the telemetry Ophira's parsers and hunt rules consume.
+  Install (elevated, once per endpoint - Ophira itself never installs anything):
+
+      sysmon64.exe -accepteula -i ophira-sysmon.xml
+      (update later:  sysmon64.exe -c ophira-sysmon.xml)
+
+  Covered events and what Ophira uses them for:
+    1  ProcessCreate  (with hashes) - process inventory, R20 webshell chains
+    2  FileCreateTime                 - R15/R22 timestomping evidence
+    3  NetworkConnect                 - C2 beaconing (module 4.8), entity correlation
+    7  ImageLoad                      - R2/R3 DLL side-load detections
+    10 ProcessAccess  (FILTERED to lsass targets) - R8 LSASS access; the filter keeps volume sane
+    13 RegistryEvent  (FILTERED to hot keys)      - R11 UAC bypass + persistence sweep
+    22 DnsQuery                      - DNS beaconing (module 4.8)
+  Deliberately NOT enabled: clipboard, raw disk access, driver load spam - keep triage noise low.
+-->
+<Sysmon schemaversion="4.90">
+  <Hashes>*</Hashes>
+  <EventFiltering>
+
+    <!-- 1: all process creations with command line + hashes -->
+    <ProcessCreate onmatch="exclude">
+      <!-- noisy system noise -->
+      <Image condition="end with">\BgInfo.exe</Image>
+    </ProcessCreate>
+
+    <!-- 2: file creation time changed (timestomping evidence) -->
+    <FileCreateTime onmatch="exclude">
+      <Image condition="end with">\DotNetCLRInstaller.exe</Image>
+    </FileCreateTime>
+
+    <!-- 3: all network connections (beaconing engine needs volume) -->
+    <NetworkConnect onmatch="exclude">
+      <Image condition="is">C:\Windows\System32\smss.exe</Image>
+    </NetworkConnect>
+
+    <!-- 7: image loads (DLL side-load data source) -->
+    <ImageLoad onmatch="exclude">
+      <Signed condition="is">true</Signed>
+      <ImageLoaded condition="begin with">C:\Windows\</ImageLoaded>
+    </ImageLoad>
+
+    <!-- 10: process access, LSASS-focused - the credential-dump signal (R8).
+         Include narrows to lsass targets; exclude then drops the legit system/AV openers. -->
+    <ProcessAccess onmatch="include">
+      <TargetImage condition="is">C:\Windows\system32\lsass.exe</TargetImage>
+    </ProcessAccess>
+    <ProcessAccess onmatch="exclude">
+      <SourceImage condition="begin with">C:\Windows\System32\</SourceImage>
+      <SourceImage condition="end with">MsMpEng.exe</SourceImage>
+      <SourceImage condition="end with">NisSrv.exe</SourceImage>
+      <SourceImage condition="end with">Sense.exe</SourceImage>
+      <SourceImage condition="end with">vmtoolsd.exe</SourceImage>
+      <SourceImage condition="end with">VGAuthService.exe</SourceImage>
+    </ProcessAccess>
+
+    <!-- 13: registry set/delete, hot keys only (UAC-bypass + persistence data source) -->
+    <RegistryEvent onmatch="include">
+      <TargetObject condition="contains">\Microsoft\Windows\CurrentVersion\Run</TargetObject>
+      <TargetObject condition="contains">\Microsoft\Windows\CurrentVersion\RunOnce</TargetObject>
+      <TargetObject condition="contains">\CurrentVersion\Image File Execution Options\</TargetObject>
+      <TargetObject condition="contains">\Classes\exefile\shell\open\command</TargetObject>
+      <TargetObject condition="contains">\ms-settings\shell\open\command</TargetObject>
+      <TargetObject condition="contains">\Services\</TargetObject>
+      <TargetObject condition="contains">\AppInit_DLLs</TargetObject>
+      <TargetObject condition="contains">\Winlogon\</TargetObject>
+      <TargetObject condition="contains">\Session Manager\</TargetObject>
+      <TargetObject condition="contains">\Classes\ScriptletURL</TargetObject>
+    </RegistryEvent>
+
+    <!-- 22: DNS queries (DNS beaconing data source) - keep unfiltered, the beacon engine wants volume -->
+    <DnsQuery onmatch="exclude">
+      <Image condition="end with">OneDrive.exe</Image>
+    </DnsQuery>
+
+  </EventFiltering>
+</Sysmon>

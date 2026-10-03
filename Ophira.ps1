@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.21  -  Windows Incident Response Triage Toolkit
+Ophira v2.22  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -34,7 +34,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.21"
+$ScriptVersion = "2.22"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -2483,6 +2483,7 @@ $script:Modules = @(
                         }
                         $cName = & $colOf '^FileName$'; $cParent = & $colOf 'ParentPath'; $cExt = & $colOf '^Extension$'
                         $cCreated = & $colOf 'Created'; $cMod = & $colOf 'LastModified'; $cSize = & $colOf 'FileSize'; $cEntry = & $colOf 'EntryNumber'
+                        $cCreated30 = & $colOf 'Created0x30'
                         Import-Csv -LiteralPath $mftFull | ForEach-Object {
                             $mftTotal++
                             $name = "$($_.$cName)"
@@ -2496,7 +2497,7 @@ $script:Modules = @(
                             $recent = ($created -and $created -ge $cutoff)
                             if (-not ($userPath -or $recent)) { return }
                             $flags = @('exec'); if ($userPath) { $flags += 'user-path' }; if ($recent) { $flags += 'recent' }
-                            $keep.Add([pscustomobject]@{ Drive = $dl; Entry = "$($_.$cEntry)"; Created = "$($_.$cCreated)"; LastModified = "$($_.$cMod)"; Size = "$($_.$cSize)"; Name = $name; Path = $path; Flags = ($flags -join ';') })
+                            $keep.Add([pscustomobject]@{ Drive = $dl; Entry = "$($_.$cEntry)"; Created = "$($_.$cCreated)"; CreatedFN = $(if ($cCreated30) { "$($_.$cCreated30)" } else { '' }); LastModified = "$($_.$cMod)"; Size = "$($_.$cSize)"; Name = $name; Path = $path; Flags = ($flags -join ';') })
                         }
                         if ("$Preset" -eq 'Full') { & $keepFull $mftFull "mft_full_$($d.Name).csv" }
                         Remove-Item -LiteralPath $mftFull -Force -ErrorAction SilentlyContinue
@@ -4121,6 +4122,9 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
             $null = $sb.AppendLine("<tr><td class='$sevCls'><b>$(ConvertTo-HtmlEsc $h2.Severity)</b></td><td>$(ConvertTo-HtmlEsc $h2.Rule)</td><td>$(ConvertTo-HtmlEsc $h2.Attck)</td><td class='path'>$(ConvertTo-HtmlEsc $h2.Entity)</td><td class='path'>$(ConvertTo-HtmlEsc $h2.Evidence)</td></tr>")
         }
         $null = $sb.AppendLine("</table><div class='meta'>High-severity hunt rules are high-precision (version-info renames, side-loaded system DLLs, downloaded-then-executed, LSASS access, Office-to-interpreter chains, proxy-execution LOLBin command lines, admin-share staging, Defender tamper, DCSync, password spray, webshell chains) and contribute to the verdict. Medium rules (UAC bypass pattern, discovery storms, timestomping, Kerberoasting/AS-REP patterns, web anomalies, USB/account/RDP anomalies) are report-only leads. Verify against the cited raw evidence. Source: csv\hunt_findings.csv</div>")
+        if ($Sysmon -and @(Import-CaseCsv 'sysmon_process_access').Count -eq 0) {
+            $null = $sb.AppendLine("<div class='meta'><b>Sysmon config gap:</b> Sysmon is running but no ProcessAccess (EID 10) telemetry arrived - the installed config does not capture it, so the LSASS/registry/Beacon rules above run blind. Deploy <b>tools\sysmon\ophira-sysmon.xml</b> from the kit (<span style='font-family:Consolas,monospace'>sysmon64.exe -accepteula -i ophira-sysmon.xml</span>) and collect again.</div>")
+        }
     } else {
         $null = $sb.AppendLine("<div class='meta'>No hunt findings - all techniques clean.</div>")
     }
@@ -4378,7 +4382,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'prefetch_index'                  = 'Prefetch files copied (index)'
         'prefetch_parsed'                 = 'Prefetch parse: run counts + last run times'
         'userassist'                      = 'UserAssist GUI programs executed per user'
-        'mft_recent'                      = 'MFT: recently created / user-path executables'
+        'mft_recent'                      = 'MFT: recently created / user-path executables (both birth attributes: $Si Created + FILE_NAME CreatedFN - R22 timestamp-forgery checks)'
         'usn_write_bursts'                = 'USN journal: mass file-modification windows (ransomware)'
         'lnk_parsed'                      = 'LNK parse (Recent docs - what files were opened)'
         'jumplist_parsed*'                = 'Jump List parse (per-app recent files)'
@@ -5192,6 +5196,67 @@ function New-HuntFindings {
         & $find 'Web traffic anomaly' 'medium' "$($r.Kind)" "$($r.Detail) - $($r.Sample)" 'T1190'
     }
 
+    # ---------- R22: timestamp forgery indicators (MFT birth attributes x execution evidence) ----------
+    # Scans every executable in mft_recent (checks are O(1) per row):
+    #   future-birth    - $MFT $Si birth after collection time (+1d margin)
+    #   ran-before-born - amcache evidence predates the claimed birth by >24h
+    #   0x10-vs-0x30    - $Si and FILE_NAME birth attributes disagree by >90 days
+    # Sysmon EID 2 events for the same file are cited as corroboration. Medium, report-only.
+    $mftByLeaf = @{}
+    foreach ($r in (Import-CaseCsv 'mft_recent')) {
+        $lf = ''
+        try { $lf = (Split-Path "$($r.Path)" -Leaf).ToLower() } catch { }
+        if ($lf -and -not $mftByLeaf.ContainsKey($lf)) { $mftByLeaf[$lf] = $r }
+    }
+    $amcByLeaf = @{}
+    foreach ($r in (Import-CaseCsv 'amcache')) {
+        $lf = ''
+        foreach ($pn in @('Name', 'ApplicationName', 'SourceSimpleName')) {
+            $p2 = $r.PSObject.Properties[$pn]
+            if ($p2 -and "$($p2.Value)") { $lf = "$($p2.Value)".ToLower(); break }
+        }
+        if (-not $lf) { continue }
+        $t = $null
+        foreach ($pn in (@($r.PSObject.Properties.Name) | Where-Object { $_ -match '(?i)timestamp|time$' })) {
+            try { $t2 = [datetime]"$($r.$pn)"; if ($t2 -and (-not $t -or $t2 -lt $t)) { $t = $t2 } } catch { }
+        }
+        if (-not $amcByLeaf.ContainsKey($lf) -or ($t -and $amcByLeaf[$lf].T -and $t -lt $amcByLeaf[$lf].T)) { $amcByLeaf[$lf] = @{ T = $t; Src = 'amcache' } }
+    }
+    $eid2ByLeaf = @{}
+    foreach ($r in (Import-CaseCsv 'sysmon_file_time')) {
+        $lf = ''
+        try { $lf = (Split-Path "$($r.TargetFilename)" -Leaf).ToLower() } catch { }
+        if ($lf) { $eid2ByLeaf[$lf] = $true }
+    }
+    $now = (Get-Date).ToUniversalTime()
+    $tfSeen = @{}
+    foreach ($m in (@($mftByLeaf.Values) | Select-Object -First 200)) {
+        $lf = ''
+        try { $lf = (Split-Path "$($m.Path)" -Leaf).ToLower() } catch { }
+        if (-not $lf -or $tfSeen.ContainsKey($lf)) { continue }
+        $birth = $null; try { $birth = [datetime]"$($m.Created)" } catch { }
+        if (-not $birth) { continue }
+        $checks = New-Object System.Collections.Generic.List[string]
+        if (($birth - $now).TotalDays -gt 1) {
+            $null = $checks.Add("birth '$($m.Created)' is in the future (backdated or clock-skewed)")
+        }
+        if ("$($m.CreatedFN)") {
+            $bfn = $null; try { $bfn = [datetime]"$($m.CreatedFN)" } catch { }
+            if ($bfn -and ([math]::Abs(($birth - $bfn).TotalDays) -gt 90)) {
+                $null = $checks.Add("birth attributes disagree: `$Si $($m.Created) vs FILE_NAME $($m.CreatedFN) ($([math]::Abs([math]::Round(($birth - $bfn).TotalDays))) day skew - classic backdated `$Si)")
+            }
+        }
+        $am = $amcByLeaf[$lf]
+        if ($am -and $am.T -and (($birth - $am.T).TotalDays -gt 1)) {
+            $null = $checks.Add("execution evidence ($($am.Src)) at $($am.T.ToString('s')) predates claimed birth $($m.Created) (ran before it existed)")
+        }
+        if ($checks.Count -eq 0) { continue }
+        $tfSeen[$lf] = $true
+        if ($tfSeen.Count -gt 40) { break }
+        if ($eid2ByLeaf.ContainsKey($lf)) { $null = $checks.Add('Sysmon EID 2 file-creation-time changes observed for this file') }
+        & $find 'Timestamp forgery indicators' 'medium' "$($m.Path)" (($checks | Select-Object -First 4) -join ' | ') 'T1070.006'
+    }
+
     Save-Rows -Name 'hunt_findings' -Rows $out.ToArray()
     $hi = @($out | Where-Object { $_.Severity -eq 'high' }).Count
     if ($out.Count -gt 0) {
@@ -5777,6 +5842,7 @@ function Invoke-SetupWizard {
     Write-Host "=== Setup companion tools ===" -ForegroundColor Cyan
     Write-Host "Tools live in tools\ subfolders. Available:" -ForegroundColor Gray
     Write-Host "  winpmem  hayabusa  volatility3  chainsaw  AmcacheParser  RBCmd  MFTECmd  PECmd  LECmd  JLECmd  SBECmd  SQLECmd  loldrivers  yara" -ForegroundColor White
+    Write-Host "  plus tools\sysmon\ophira-sysmon.xml - recommended Sysmon config for full hunt-rule telemetry (deploy yourself, see README 'Deploy Sysmon')" -ForegroundColor Gray
     Write-Host "ENTER = walk through all tools (confirm each download)," 
     Write-Host "or give a comma-separated list (e.g. hayabusa,winpmem)."
     $inp = (Read-Host "Tools [all]").Trim()
