@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.25
+- **Analyst deep-dive pack**:
+  - **`-Mode Timeline` pivot** (menu [T]): `-Path <case> -TimelineStart 'yyyy-MM-dd HH:mm' -TimelineEnd ...` filters the master timeline (UTC) to a window -> `csv\timeline_<start>_<end>.csv` + console summary (by source, busiest minutes, top actors). The "someone reported weird activity at 14:00" workflow as a one-command mode
+  - **RECmd batch registry deep-dive** (Parse mode): new whitelisted-everywhere EZ tool (Setup catalog) runs the bundled **`tools\recmd\ophira-registry.bn`** batch (~30 curated keys: autoruns/persistence, IFEO/AppInit/Winlogon, services+drivers, USBSTOR, Lsa, RDP Terminal Server Client, TypedPaths/RunMRU/RecentApps, MuiCache/TrayNotify) over every saved hive -> `csv\registry_recmd.csv` (Hive/KeyPath/ValueName/Value/LastWrite)
+  - **EvtxECmd full evtx->CSV** (Parse mode, Setup catalog, analyst tools folder): converts every exported evtx into `csv\evtx_ecmd\<log>.csv` for timeframe deep-dives beyond the EID-filtered endpoint parses (stays out of the master timeline - it is the full-fidelity drill-down layer)
+  - Report case meta + evidence index updated; batch file ships in the kit and is AV-resilient (text only)
+- Tests: `tests\test_v225.ps1` (20 checks) - Timeline mode end-to-end (window edges, swapped range, empty case), Parse-mode RECmd/EvtxECmd execution with mapped output, structural wiring
+
 ## v2.24
 - **Master timeline** - `csv\supertimeline.csv` rebuilt as the one-file chronology of EVERYTHING (KAPE-timeline style): ~25 source adapters weave logons, 4688/4698/5140/5145, Kerberos/DS, all Sysmon structured telemetry (network/DNS/image-load/ProcessAccess/registry/file-time), prefetch, amcache, $MFT births, USN bursts, browser history/downloads, LNK, ShellBags, recycle bin, BAM, StartupInfo, WER, Office MRU, session activity, IIS requests, hunt findings and logging gaps into a normalized schema (`Timestamp, Source, Type, Actor, Entity, Detail`), UTC-normalized and sorted; per-source caps + 60k total cap; hayabusa sort-csv dedupe. Analyst opens ONE file and filters to any timeframe ("weird activity at 14:00")
 - **Correlation tightening**:

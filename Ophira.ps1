@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.24  -  Windows Incident Response Triage Toolkit
+Ophira v2.25  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -7,7 +7,7 @@ by a responder during early triage / threat hunting.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links', 'UpdateRules', 'Tune', 'Parse', 'Process')]
+    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links', 'UpdateRules', 'Tune', 'Parse', 'Process', 'Timeline')]
     [string]$Mode = 'Collect',
     [string]$CaseID = "",
     [string]$Analyst = "",
@@ -28,13 +28,15 @@ param(
     [string]$AnalyzePath = '.',
     [string]$ParsePath = '',
     [string]$ProcessName = '',
+    [string]$TimelineStart = '',
+    [string]$TimelineEnd = '',
     [string]$HayabusaPath = '',
     [string]$DeltaPath = '',
     [string[]]$SetupTools,
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.24"
+$ScriptVersion = "2.25"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -433,6 +435,8 @@ function Show-ToolLinks {
         [pscustomobject]@{ Tool = 'LECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.5 LNK parse (Recent docs)' }
         [pscustomobject]@{ Tool = 'JLECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.5 Jump List parse' }
         [pscustomobject]@{ Tool = 'SBECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.8 ShellBags (folder browsing history)' }
+        [pscustomobject]@{ Tool = 'RECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'Parse mode: batch registry deep-dive over saved hives (bundled batch: tools\recmd\ophira-registry.bn)' }
+        [pscustomobject]@{ Tool = 'EvtxECmd (EZ)'; Url = 'https://ericzimmerman.github.io/'; Use = 'Parse mode: FULL evtx->CSV conversion into csv\evtx_ecmd (timeframe deep-dives beyond the EID-filtered parses)' }
         [pscustomobject]@{ Tool = 'SQLECmd (EZ, .NET 9)'; Url = 'https://ericzimmerman.github.io/'; Use = 'module 8.7 browser SQLite parse (History/Downloads)' }
         [pscustomobject]@{ Tool = 'LOLDrivers datasets'; Url = 'https://github.com/magicsword-io/LOLDrivers'; Use = 'module 8.10 malicious/vulnerable driver hash lists into tools\loldrivers' }
         [pscustomobject]@{ Tool = 'velociraptor (enterprise)'; Url = 'https://github.com/Velocidex/velociraptor/releases'; Use = 'if you move to always-on agent-based DFIR' }
@@ -459,6 +463,8 @@ function Invoke-SetupMode {
         [pscustomobject]@{ Name = 'JLECmd';      Direct = 'https://download.ericzimmermanstools.com/JLECmd.zip'; Zip = $true; Target = 'endpoint' }
         [pscustomobject]@{ Name = 'SBECmd';      Direct = 'https://download.ericzimmermanstools.com/SBECmd.zip'; Zip = $true; Target = 'endpoint' }
         [pscustomobject]@{ Name = 'SQLECmd';     Direct = 'https://download.ericzimmermanstools.com/net9/SQLECmd.zip'; Zip = $true; Target = 'analyst' }
+        [pscustomobject]@{ Name = 'RECmd';       Direct = 'https://download.ericzimmermanstools.com/RECmd.zip'; Zip = $true; Target = 'endpoint' }
+        [pscustomobject]@{ Name = 'EvtxECmd';    Direct = 'https://download.ericzimmermanstools.com/EvtxECmd.zip'; Zip = $true; Target = 'analyst' }
         [pscustomobject]@{ Name = 'loldrivers';  Raw = @('https://raw.githubusercontent.com/magicsword-io/LOLDrivers/main/detections/hashes/samples_malicious.sha256', 'https://raw.githubusercontent.com/magicsword-io/LOLDrivers/main/detections/hashes/samples_vulnerable.sha256'); Zip = $false; Target = 'endpoint' }
         [pscustomobject]@{ Name = 'yara';        Repo = 'VirusTotal/yara-x';                 Pattern = '^yara-x-v[\d\.]+-x86_64-pc-windows-msvc\.zip$'; Zip = $true; Target = 'endpoint' }
     )
@@ -4591,6 +4597,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'startup_info'                    = 'StartupInfo per-session app launches (WDI XMLs) - execution evidence that survives Prefetch deletion'
         'wer_reports'                     = 'Windows Error Reporting crash reports (faulting app/module) - evidence of failed attacker tooling'
         'server_logs'                     = 'Inventory of copied server-role logs (DNS/DHCP audit, SYSVOL policies, NTDS.dit on Full+DC)'
+        'registry_recmd'                  = 'RECmd batch registry deep-dive (persistence/execution/lateral keys across all saved hives) - analyst-side enrichment'
         'usn_write_bursts'                = 'USN journal: mass file-modification windows (ransomware)'
         'lnk_parsed'                      = 'LNK parse (Recent docs - what files were opened)'
         'jumplist_parsed*'                = 'Jump List parse (per-app recent files)'
@@ -4645,7 +4652,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         $null = $sb.AppendLine("<tr><td>csv\$(ConvertTo-HtmlEsc $f.Name)</td><td>$rows</td><td>$(ConvertTo-HtmlEsc $d)</td></tr>")
     }
     $null = $sb.AppendLine("</table>")
-    $null = $sb.AppendLine("<div class='meta'>Also in the case: <b>supertimeline.csv</b> (master chronology), <b>siem_export.ndjson</b> (Splunk/Elastic-ready records), <b>verdict.json</b>, <b>attack_layer.json</b> (MITRE ATT&CK Navigator layer - load at navigator.mitre.org), <b>case.json</b> (run metadata + module timings), raw evidence under <b>raw\</b> (evtx, registry hives, prefetch, recent/jumplists, browser DBs, firewall log), collection.log</div>")
+    $null = $sb.AppendLine("<div class='meta'>Also in the case: <b>supertimeline.csv</b> (MASTER chronology - every artifact, filter by time), <b>csv\evtx_ecmd\</b> (full event-log CSVs for deep-dives, when EvtxECmd ran in Parse mode), <b>siem_export.ndjson</b> (Splunk/Elastic-ready records), <b>verdict.json</b>, <b>attack_layer.json</b> (MITRE ATT&amp;CK Navigator layer - load at navigator.mitre.org), <b>case.json</b> (run metadata + module timings), raw evidence under <b>raw\</b> (evtx, registry hives, prefetch, recent/jumplists, browser DBs, firewall log), collection.log</div>")
 
     $null = $sb.AppendLine("<div class='foot'>Generated $(Get-Date -Format u) by Ophira v$ScriptVersion - all verdicts are correlation heuristics; verify against raw CSV/evtx evidence before acting.</div>")
     $null = $sb.AppendLine("</body></html>")
@@ -6110,6 +6117,7 @@ function Show-TaskMenu {
         Write-Host "   [7]  Tool links" -ForegroundColor Yellow
         Write-Host "   [8]  Finish a collected case (parse evidence analyst-side)" -ForegroundColor Yellow
         Write-Host "   [9]  Analyze a single process (pivot on a case)" -ForegroundColor Yellow
+        Write-Host "   [T]  Timeline pivot (filter the master timeline to a window)" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "   [Q]  Quit" -ForegroundColor DarkGray
         Write-Host ""
@@ -6125,6 +6133,7 @@ function Show-TaskMenu {
             '^(?i)7$' { return 'Links' }
             '^(?i)8$' { return 'Parse' }
             '^(?i)9$' { return 'Process' }
+            '^(?i)t$' { return 'Timeline' }
             '^(?i)q$' { return $null }
             default { }
         }
@@ -6384,6 +6393,48 @@ function Invoke-ParseMode {
             Invoke-BrowserIocXref
         }
     }
+    # RECmd batch registry deep-dive over saved hives (v2.25: bundled ophira-registry.bn)
+    $regDir2 = Join-Path $script:RawDir 'registry'
+    if (Test-Path $regDir2) {
+        $reExe = & $findTool 'RECmd*.exe'
+        $bn = $null
+        try { $bn = Join-Path (Get-KitRoot) 'tools\recmd\ophira-registry.bn' } catch { }
+        if ($reExe -and $bn -and (Test-Path $bn) -and -not (Test-Path (Join-Path $script:CsvDir 'registry_recmd.csv'))) {
+            Write-Host "  RECmd: batch registry deep-dive..." -ForegroundColor Cyan
+            $outDir = Join-Path $script:CsvDir 'recmd_out'
+            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+            $hives = @(Get-ChildItem -LiteralPath $regDir2 -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.(hiv|hive|dat)$' })
+            foreach ($h in $hives) {
+                $null = Invoke-NativeTool -ExePath $reExe.FullName -ToolArgs @('--bn', $bn, '-f', $h.FullName, '--csv', $outDir, '--csvf', "$($h.BaseName).csv") -WorkingDirectory $reExe.DirectoryName
+            }
+            $all = @()
+            foreach ($f2 in @(Get-ChildItem -Path $outDir -Filter '*.csv' -File -ErrorAction SilentlyContinue)) {
+                try { $rows2 = @(Import-Csv -LiteralPath $f2.FullName -ErrorAction Stop) } catch { continue }
+                foreach ($r2 in $rows2) {
+                    $all += [pscustomobject]@{ Hive = $f2.BaseName; KeyPath = "$($r2.'Key Path')"; ValueName = "$($r2.'Value Name')"; ValueType = "$($r2.'Value Type')"; Value = ("$($r2.'Value')" -replace '\s+', ' '); LastWrite = "$($r2.'Last Write Timestamp')" }
+                }
+            }
+            Save-Rows -Name 'registry_recmd' -Rows $all
+            Remove-Item -LiteralPath $outDir -Recurse -Force -ErrorAction SilentlyContinue
+            if ($all.Count -gt 0) { Write-Host "  RECmd: $($all.Count) registry value(s) via batch -> csv\registry_recmd.csv" -ForegroundColor Gray }
+        }
+    }
+    # EvtxECmd: FULL evtx->CSV conversion for timeframe deep-dives (v2.25)
+    $evSrc = Join-Path $script:RawDir 'evtx'
+    if (Test-Path $evSrc) {
+        $evExe = & $findTool 'EvtxECmd*.exe'
+        if ($evExe -and -not (Test-Path (Join-Path $script:CsvDir 'evtx_ecmd'))) {
+            Write-Host "  EvtxECmd: full evtx->CSV conversion..." -ForegroundColor Cyan
+            $outDir = Join-Path $script:CsvDir 'evtx_ecmd'
+            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+            $n2 = 0
+            foreach ($ev in @(Get-ChildItem -LiteralPath $evSrc -Filter '*.evtx' -File -ErrorAction SilentlyContinue)) {
+                $null = Invoke-NativeTool -ExePath $evExe.FullName -ToolArgs @('-f', $ev.FullName, '--csv', $outDir, '--csvf', "$($ev.BaseName).csv") -WorkingDirectory $evExe.DirectoryName
+                $n2++
+            }
+            if ($n2 -gt 0) { Write-Host "  EvtxECmd: $n2 log file(s) fully converted -> csv\evtx_ecmd\ (filter EventTime for deep-dives)" -ForegroundColor Gray }
+        }
+    }
 
     # 3) regenerate everything derived from csv\
     Invoke-RegenerateOutputs -Case $meta
@@ -6483,6 +6534,54 @@ function Invoke-ProcessPivot {
     }
     Write-Host ""
     Write-Host "Full pivot -> csv\process_pivot.csv (in the case folder). Timeline view: csv\supertimeline.csv" -ForegroundColor Gray
+    return $true
+}
+
+function Invoke-TimelineMode {
+    # v2.25 analyst-side timeframe pivot: filter the case's MASTER TIMELINE to a window and
+    # summarize what happened - the "someone reported weird activity around 14:00" workflow.
+    # Timestamps in supertimeline.csv are UTC; enter the window in UTC.
+    param([string]$Path, [string]$Start, [string]$End)
+    Write-Host ""
+    Write-Host "=== Timeline pivot (filter the master timeline to a window) ===" -ForegroundColor Cyan
+    if (-not $Path) { $Path = (Read-Host "  Case folder or OPHIRA_*.zip path").Trim(' "') }
+    $meta = Open-CaseSession -Path $Path
+    if (-not $meta) { return $false }
+    if (-not $Start) { $Start = (Read-Host "  Window START (yyyy-MM-dd HH:mm, UTC)").Trim() }
+    if (-not $End) { $End = (Read-Host "  Window END   (yyyy-MM-dd HH:mm, UTC)").Trim() }
+    $t0 = $null; $t1 = $null
+    try { $t0 = [datetime]$Start } catch { }
+    try { $t1 = [datetime]$End } catch { }
+    if (-not $t0 -or -not $t1 -or ($t1 -eq [datetime]::MinValue)) { Write-Host "  invalid start/end - use 'yyyy-MM-dd HH:mm'" -ForegroundColor Red; return $false }
+    if ($t1 -lt $t0) { $tmp = $t0; $t0 = $t1; $t1 = $tmp }
+    $tlPath = Join-Path $script:CsvDir 'supertimeline.csv'
+    if (-not (Test-Path $tlPath)) { Write-Host "  no supertimeline.csv in this case (collect first, or run -Mode Parse)" -ForegroundColor Red; return $false }
+    $tl = @(Import-Csv -LiteralPath $tlPath -ErrorAction SilentlyContinue)
+    $sel = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $tl) {
+        $t = $null
+        try { $t = [datetime]$r.Timestamp } catch { }
+        if ($t -and $t -ge $t0 -and $t -le $t1) { $null = $sel.Add($r) }
+    }
+    if ($sel.Count -eq 0) {
+        Write-Host "  no rows in $t0 -> $t1 UTC. Timeline coverage: $(@($tl)[0].Timestamp) -> $(@($tl)[-1].Timestamp)" -ForegroundColor Yellow
+        return $true
+    }
+    $out = Join-Path $script:CsvDir ("timeline_" + $t0.ToString('yyyyMMdd_HHmm') + "_" + $t1.ToString('yyyyMMdd_HHmm') + ".csv")
+    $sel.ToArray() | Export-Csv -LiteralPath $out -NoTypeInformation -Encoding UTF8
+    Write-Host ""
+    Write-Host "  Window: $t0 -> $t1 UTC   rows: $($sel.Count) of $($tl.Count)  ->  $(Split-Path $out -Leaf)" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  By source:" -ForegroundColor White
+    foreach ($g in (@($sel | Group-Object Source | Sort-Object Count -Descending))) { Write-Host ("    {0,-28} x{1}" -f $g.Name, $g.Count) -ForegroundColor Gray }
+    Write-Host ""
+    Write-Host "  Busiest minutes:" -ForegroundColor White
+    foreach ($g in (@($sel | Group-Object { "$($_.Timestamp)".PadRight(16).Substring(0, 16) } | Sort-Object Count -Descending | Select-Object -First 5))) { Write-Host ("    {0}  x{1}" -f $g.Name, $g.Count) -ForegroundColor Gray }
+    Write-Host ""
+    Write-Host "  Top actors:" -ForegroundColor White
+    foreach ($g in (@($sel | Where-Object { "$($_.Actor)" } | Group-Object Actor | Sort-Object Count -Descending | Select-Object -First 5))) { Write-Host ("    {0,-24} x{1}" -f $g.Name, $g.Count) -ForegroundColor Gray }
+    Write-Host ""
+    Write-Host "  Open the CSV in Excel/Timeline Explorer (sorted, filterable). Report refresh: -Mode Parse." -ForegroundColor Gray
     return $true
 }
 
@@ -6639,6 +6738,7 @@ if ($bareLaunch -and [Environment]::UserInteractive) {
                 'Tune' { Invoke-TuneMode | Out-Null }
                 'Parse' { Invoke-ParseMode | Out-Null }
                 'Process' { Invoke-ProcessPivot | Out-Null }
+                'Timeline' { Invoke-TimelineMode | Out-Null }
                 'Links' { Show-ToolLinks }
             }
             Write-Host ""
@@ -6664,6 +6764,7 @@ if ($Mode -ne 'Collect') {
         'Tune' { Invoke-TuneMode | Out-Null }
         'Parse' { Invoke-ParseMode -Path $ParsePath | Out-Null }
         'Process' { Invoke-ProcessPivot -Path $ParsePath -Indicator $ProcessName | Out-Null }
+        'Timeline' { Invoke-TimelineMode -Path $ParsePath -Start $TimelineStart -End $TimelineEnd | Out-Null }
     }
     exit 0
 }

@@ -1,0 +1,53 @@
+Description: "Ophira registry deep-dive batch - persistence, execution and lateral-movement keys across SYSTEM/SOFTWARE/NTUSER/UsrClass hives"
+Author: "Ophira IR toolkit"
+# RECmd batch: non-matching keys are skipped per-hive, so one batch serves all hives.
+# Run via -Mode Parse against a case's raw\registry hives -> csv\registry_recmd.csv
+
+# ---- autoruns / persistence (SOFTWARE + NTUSER) ----
+Software\Microsoft\Windows\CurrentVersion\Run,*
+Software\Microsoft\Windows\CurrentVersion\RunOnce,*
+Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run,*
+Software\Wow6432Node\Microsoft\Windows\CurrentVersion\RunOnce,*
+Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run,*
+Software\Microsoft\Windows\CurrentVersion\RunOnceEx,*
+NTUSER\Software\Microsoft\Windows\CurrentVersion\Run,*
+NTUSER\Software\Microsoft\Windows\CurrentVersion\RunOnce,*
+NTUSER\Software\Microsoft\Windows NT\CurrentVersion\Winlogon,*
+NTUSER\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags,*
+
+# ---- classic persistence / hijack spots ----
+Software\Microsoft\Windows NT\CurrentVersion\Winlogon,*
+Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\*
+Software\Microsoft\Windows NT\CurrentVersion\Windows,*
+Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags,*
+Software\Microsoft\Active Setup\Installed Components\*
+Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders,*
+Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders,*
+
+# ---- services + drivers (SYSTEM) ----
+ControlSet001\Services\*
+ControlSet002\Services\*
+ControlSet001\Control\Session Manager,*
+ControlSet001\Control\Session Manager\Executive,*
+ControlSet001\Control\SafeBoot\*
+ControlSet001\Enum\USBSTOR\*
+ControlSet001\Control\TimeZoneInformation,*
+ControlSet001\Control\ComputerName,*
+Select,*
+
+# ---- network / lateral (SYSTEM + NTUSER) ----
+ControlSet001\Services\Tcpip\Parameters,*
+ControlSet001\Control\Lsa,*
+Software\Microsoft\Windows NT\CurrentVersion\Terminal Server\Install\Software\Microsoft\Windows\CurrentVersion\Run,*
+NTUSER\Software\Microsoft\Terminal Server Client\Default,*
+NTUSER\Software\Microsoft\Terminal Server Client\Servers\*
+
+# ---- execution evidence (NTUSER + UsrClass) ----
+NTUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths,*
+NTUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU,*
+NTUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\LastVisitedPidlMRU,*
+NTUSER\Software\Microsoft\Windows\CurrentVersion\Search\RecentApps,*
+NTUSER\Software\Microsoft\Office\16.0\Word\Reading Locations\*
+UsrClass\Local Settings\Software\Microsoft\Windows\Shell\MuiCache,*
+UsrClass\Local Settings\Software\Microsoft\Windows\CurrentVersion\TrayNotify,*
+UsrClass\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders,*
