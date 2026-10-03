@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.23
+- **KAPE parity pack** - closes the meaningful gaps vs [kapefiles](https://github.com/ericzimmerman/kapefiles) targets (bulk folder copies, raw NTFS internals and consumer artifacts deliberately not taken):
+  - **Module 4.10 Application log**: crashes (1000/1001/1002), MSI installs (1033/11707/11724) -> `application_events.csv` + `Application.evtx`; merged into the supertimeline. Crashed attacker tooling surfaces here
+  - **Module 8.13 Host extras**: **StartupInfo** per-session app launches (`System32\WDI\LogFiles\StartupInfo` XML parse -> `startup_info.csv` + raw), **WER crash reports** (ProgramData + per-user, Report.wer parse -> `wer_reports.csv`), **QuickAssist/RemoteHelp** temp artifacts (AitM/scam tradecraft marker), **PCA** (`Windows\appcompat\pca` - Win11 last-exec evidence), **RecentFileCache.bcf**, **MOF** dir, **local GroupPolicy/GroupPolicyUsers** dirs (GPO-script persistence surface), **WSL dotfiles** (.bash_history etc.) -> `raw\extras\`
+  - **Module 8.14 Server logs**: DNS + DHCP audit logs raw copy, **SYSVOL Policies** (capped), **NTDS.dit VSS copy** gated on DC role + Full preset (esentutl /vss, same pattern as SRUM; hash extraction is analyst-side only) -> `raw\server\` + `server_logs.csv` inventory
+  - **ASEP sweep (2.6) gains SDB check**: custom shim databases (`AppCompatFlags\Custom` / `InstalledSDB`, HKLM+HKCU) - classic rare-legit persistence
+  - parse_needed gains RecentFileCache -> AppCompatParser row; coverage row for host extras; whitelisted parsers `Get-StartupInfoRows` / `Get-WerReportRows`
+- Tests: `tests\test_v223.ps1` (17 checks) - StartupInfo/WER parser fixtures, live 4.10 Run block, structural wiring incl. NTDS gate
+
 ## v2.22
 - **Bundled recommended Sysmon config** (`tools\sysmon\ophira-sysmon.xml`): lean commented config enabling exactly what Ophira parses - process creations w/ hashes (1), file-time changes (2), network (3), image loads (7), **ProcessAccess filtered to lsass targets** (10 - LSASS-dump signal without the noise), **registry hot keys** (Run/IFEO/ms-settings/services - UAC bypass + persistence), DNS queries (22). Install one-liner in the header (`sysmon64.exe -accepteula -i ophira-sysmon.xml`); Ophira itself stays read-only - you deploy it
   - Setup kit inventory points at the file; README gains a "Deploy Sysmon" section

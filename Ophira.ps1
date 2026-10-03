@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.22  -  Windows Incident Response Triage Toolkit
+Ophira v2.23  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -34,7 +34,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.22"
+$ScriptVersion = "2.23"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -1448,6 +1448,7 @@ function Get-ParseNeeds {
         @{ Artifact = 'hayabusa_timeline.csv';  Parser = 'hayabusa';      Net = 'none'; Input = 'evtx';                 Live = $false }
         @{ Artifact = 'shellbags.csv';          Parser = 'SBECmd';        Net = 'net4'; Input = 'live C:\Users';        Live = $true }
         @{ Artifact = 'mft_recent.csv';         Parser = 'MFTECmd';       Net = 'net4'; Input = 'live volume (admin)';  Live = $true }
+        @{ Artifact = 'recentfilecache.csv';    Parser = 'AppCompatParser'; Net = 'net4'; Input = 'extras\appcompat';   Live = $false }
     )
     $rows = @()
     foreach ($c in $caps) {
@@ -1467,7 +1468,7 @@ $script:SharedFunctions = @(
     'Save-Rows', 'Out-RawText', 'Invoke-ExeCapture', 'Invoke-NativeTool', 'Get-WmiOrCim', 'Convert-WmiDate',
     'Test-IsPublicIp', 'Test-IsUserWritablePath', 'Get-SignatureInfo', 'Get-SysmonState',
     'Get-UserProfileList', 'Get-UserAssistRows', 'ConvertTo-Rot13', 'Get-FilteredEvents', 'Export-Evtx',
-    'Import-CaseCsv', 'Invoke-BrowserIocXref', 'Get-EventDataRows', 'Get-IisW3cRows'
+    'Import-CaseCsv', 'Invoke-BrowserIocXref', 'Get-EventDataRows', 'Get-IisW3cRows', 'Get-StartupInfoRows', 'Get-WerReportRows'
 )
 
 $script:ModuleWorkerText = @'
@@ -1844,6 +1845,17 @@ $script:Modules = @(
                         }
                         Add-Asep 'StartupApproved' $k $prop.Name $state @()
                     }
+                }
+            }
+            # Custom shim databases (SDB) - classic persistence, rare legit (v2.23 KAPE parity)
+            foreach ($sdb in @('HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Custom', 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\InstalledSDB', 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Custom')) {
+                if (-not (Test-Path $sdb)) { continue }
+                foreach ($k in (Get-ChildItem -Path $sdb -Recurse -ErrorAction SilentlyContinue)) {
+                    $p = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+                    $v = ''
+                    if ($p -and $p.PSObject.Properties['FullPath']) { $v = "$($p.FullPath)" }
+                    if (-not $v) { foreach ($prop in ($p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) { if ("$($prop.Value)" -match '\.sdb$') { $v = "$($prop.Value)"; break } } }
+                    if ($v) { Add-Asep 'Sdb' $k.PSPath $k.PSChildName $v (& $flagFor $v) }
                 }
             }
             $rows = $asepList.ToArray()
@@ -2344,6 +2356,16 @@ $script:Modules = @(
             } else {
                 Write-CaseLog "    Kerberos events: $($ker.Count), directory-service events: $($ds.Count)" 'Gray'
             }
+        } }
+    [pscustomobject]@{ Id = '4.10'; Cat = 'LOGS'; Name = 'Application log (crashes 1000/1001/1002, MSI installs 1033/11707/11724) + evtx export'; Default = $true; Quick = $false;
+        Run = {
+            $start = Get-LogStart
+            $ev = Get-FilteredEvents -LogName 'Application' -Ids @(1000, 1001, 1002, 1004, 1033, 11707, 11724) -Start $start -MaxMsg 300
+            Save-Rows -Name 'application_events' -Rows $ev
+            if ($ev.Count -gt 0) {
+                Write-CaseLog "    application events: $($ev.Count) (crashes/installs - crashed attacker tools show up here) -> csv\application_events.csv" 'Gray'
+            }
+            Export-Evtx -LogName 'Application' -FileName 'Application.evtx'
         } }
     [pscustomobject]@{ Id = '5.1'; Cat = 'ARTIFACTS'; Name = 'Prefetch files'; Default = $true; Quick = $false;
         Run = {
@@ -3282,6 +3304,116 @@ public class OphiraDump {
                 Write-CaseLog "    IIS: no logs found (no IIS role or logs elsewhere)" 'DarkGray'
             }
         } }
+    [pscustomobject]@{ Id = '8.13'; Cat = 'CONTEXT'; Name = 'Host extras (StartupInfo launches, WER crash reports, QuickAssist, PCA, RecentFileCache, MOF, local GPO, WSL dotfiles)'; Default = $true; Quick = $false;
+        Run = {
+            $siPath = "$env:SystemRoot\System32\WDI\LogFiles\StartupInfo"
+            if (Test-Path $siPath) {
+                $si = Get-StartupInfoRows -Path $siPath
+                Save-Rows -Name 'startup_info' -Rows $si
+                if ($si.Count -gt 0) { Write-CaseLog "    StartupInfo: $($si.Count) app-launch record(s) (per-session, survives Prefetch deletion)" 'Gray' }
+                $d = Join-Path $RawDir 'extras\startupinfo'
+                New-Item -ItemType Directory -Path $d -Force | Out-Null
+                Get-ChildItem -LiteralPath $siPath -Filter '*.xml' -File -ErrorAction SilentlyContinue | Copy-Item -Destination $d -Force -ErrorAction SilentlyContinue
+            }
+            $werRows = @()
+            foreach ($w in @("$env:ProgramData\Microsoft\Windows\WER")) {
+                if (Test-Path $w) { $werRows += @(Get-WerReportRows -Path $w) }
+            }
+            $udirs = @(Get-ChildItem "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Public|Default|Default User|All Users' })
+            foreach ($u in $udirs) {
+                $w = Join-Path $u.FullName 'AppData\Local\Microsoft\Windows\WER'
+                if (Test-Path $w) { $werRows += @(Get-WerReportRows -Path $w) }
+            }
+            Save-Rows -Name 'wer_reports' -Rows $werRows
+            if ($werRows.Count -gt 0) { Write-CaseLog "    WER: $($werRows.Count) crash report(s) -> csv\wer_reports.csv (crashed attacker tools leave these)" 'Gray' }
+            $d = Join-Path $RawDir 'extras'
+            foreach ($pair in @(@('quickassist', "$env:SystemDrive\Users\*\AppData\Local\Temp\QuickAssist"), @('remotehelp', "$env:SystemDrive\Users\*\AppData\Local\Temp\RemoteHelp"))) {
+                $srcs = @(Get-ChildItem -Path $pair[1] -Directory -ErrorAction SilentlyContinue)
+                foreach ($s in $srcs) {
+                    $dd = Join-Path $d $pair[0]
+                    New-Item -ItemType Directory -Path $dd -Force | Out-Null
+                    Copy-Item -LiteralPath $s.FullName -Destination (Join-Path $dd $s.Name) -Recurse -Force -ErrorAction SilentlyContinue
+                    Write-CaseLog "    $($pair[0]): remote-support session artifacts copied (AitM/scam tradecraft marker) -> raw\extras\$($pair[0])" 'Yellow'
+                }
+            }
+            foreach ($pair in @(@('pca', "$env:SystemRoot\appcompat\pca", '*'), @('mof', "$env:SystemRoot\System32\wbem\MOF", '*.mof'))) {
+                if (-not (Test-Path $pair[1])) { continue }
+                $dd = Join-Path $d $pair[0]
+                New-Item -ItemType Directory -Path $dd -Force | Out-Null
+                Get-ChildItem -LiteralPath $pair[1] -Filter $pair[2] -File -ErrorAction SilentlyContinue | Copy-Item -Destination $dd -Force -ErrorAction SilentlyContinue
+            }
+            $rfc = "$env:SystemRoot\AppCompat\Programs\RecentFileCache.bcf"
+            if (Test-Path $rfc) {
+                $dd = Join-Path $d 'appcompat'
+                New-Item -ItemType Directory -Path $dd -Force | Out-Null
+                Copy-Item -LiteralPath $rfc -Destination $dd -Force -ErrorAction SilentlyContinue
+            }
+            foreach ($g in @("$env:SystemRoot\System32\GroupPolicy", "$env:SystemRoot\System32\GroupPolicyUsers")) {
+                if (-not (Test-Path $g)) { continue }
+                $dd = Join-Path $d ("gpo\" + (Split-Path $g -Leaf))
+                New-Item -ItemType Directory -Path $dd -Force | Out-Null
+                $files = @(Get-ChildItem -LiteralPath $g -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 300)
+                foreach ($f in $files) {
+                    $rel = ''
+                    try { $rel = $f.FullName.Substring($g.Length).TrimStart('\') } catch { }
+                    $pd = Join-Path $dd $(if ($rel) { Split-Path $rel -Parent } else { '' })
+                    if ($pd -and -not (Test-Path $pd)) { New-Item -ItemType Directory -Path $pd -Force | Out-Null }
+                    Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $pd $f.Name) -Force -ErrorAction SilentlyContinue
+                }
+            }
+            $hist = @(Get-ChildItem -Path "$env:SystemDrive\Users\*\AppData\Local\Packages\*\LocalState\rootfs\home" -Recurse -Force -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\.(bash_history|sh_history|profile|bashrc)$' } | Select-Object -First 20)
+            foreach ($h in $hist) {
+                $dd = Join-Path $d 'wsl'
+                New-Item -ItemType Directory -Path $dd -Force | Out-Null
+                Copy-Item -LiteralPath $h.FullName -Destination (Join-Path $dd ("wsl_" + $h.Name)) -Force -ErrorAction SilentlyContinue
+            }
+            Write-CaseLog "    host extras copied -> raw\extras\ (startupinfo/wer-source/quickassist/pca/mof/appcompat/gpo/wsl)" 'Gray'
+        } }
+    [pscustomobject]@{ Id = '8.14'; Cat = 'CONTEXT'; Name = 'Server logs raw (DNS/DHCP audit logs, SYSVOL policies; NTDS.dit VSS copy on Full preset + DC)'; Default = $true; Quick = $false;
+        Run = {
+            $inv = @()
+            foreach ($pair in @(@('dns', "$env:SystemRoot\System32\DNS"), @('dhcp', "$env:SystemRoot\System32\dhcp"))) {
+                if (-not (Test-Path $pair[1])) { continue }
+                $files = @(Get-ChildItem -LiteralPath $pair[1] -Filter '*.log' -File -ErrorAction SilentlyContinue)
+                if ($files.Count -eq 0) { continue }
+                $d = Join-Path $RawDir ("server\" + $pair[0])
+                New-Item -ItemType Directory -Path $d -Force | Out-Null
+                $files | Copy-Item -Destination $d -Force -ErrorAction SilentlyContinue
+                foreach ($f in $files) { $inv += [pscustomobject]@{ Type = $pair[0].ToUpper(); File = $f.Name; SizeMB = [math]::Round($f.Length / 1MB, 2); LastWrite = $f.LastWriteTime } }
+                Write-CaseLog "    $($pair[0]): $($files.Count) audit log file(s) -> raw\server\$($pair[0])" 'Gray'
+            }
+            $sysvol = "$env:SystemRoot\SYSVOL\domain\Policies"
+            if (Test-Path $sysvol) {
+                $d = Join-Path $RawDir 'server\sysvol'
+                New-Item -ItemType Directory -Path $d -Force | Out-Null
+                $files = @(Get-ChildItem -LiteralPath $sysvol -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 400)
+                foreach ($f in $files) {
+                    $rel = ''
+                    try { $rel = $f.FullName.Substring($sysvol.Length).TrimStart('\') } catch { }
+                    $pd = Join-Path $d $(if ($rel) { Split-Path $rel -Parent } else { '' })
+                    if ($pd -and -not (Test-Path $pd)) { New-Item -ItemType Directory -Path $pd -Force | Out-Null }
+                    Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $pd $f.Name) -Force -ErrorAction SilentlyContinue
+                }
+                $inv += [pscustomobject]@{ Type = 'SYSVOL'; File = "$($files.Count) policy file(s)"; SizeMB = [math]::Round((($files | Measure-Object Length -Sum).Sum) / 1MB, 2); LastWrite = '' }
+                Write-CaseLog "    SYSVOL: $($files.Count) policy file(s) (GPO persistence surface) -> raw\server\sysvol" 'Gray'
+            }
+            $isDc = (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters')
+            if ($isDc -and "$Preset" -eq 'Full') {
+                $ntds = Join-Path $env:SystemRoot 'NTDS\ntds.dit'
+                if (Test-Path $ntds) {
+                    $d = Join-Path $RawDir 'server\ntds'
+                    New-Item -ItemType Directory -Path $d -Force | Out-Null
+                    & esentutl.exe /y "$ntds" /vss /d (Join-Path $d 'ntds.dit') 2>&1 | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        $inv += [pscustomobject]@{ Type = 'NTDS'; File = 'ntds.dit'; SizeMB = [math]::Round((Get-Item (Join-Path $d 'ntds.dit')).Length / 1MB, 2); LastWrite = (Get-Item (Join-Path $d 'ntds.dit')).LastWriteTime }
+                        Write-CaseLog '    NTDS.dit VSS-copied (read-only copy; hash extraction is analyst-side only) -> raw\server\ntds' 'Yellow'
+                    } else { Write-CaseLog '    NTDS.dit VSS copy failed (needs admin + VSS)' 'DarkYellow' }
+                }
+            } elseif ($isDc) {
+                Write-CaseLog '    DC detected - NTDS.dit copy available with Full preset (module 8.14)' 'DarkGray'
+            }
+            Save-Rows -Name 'server_logs' -Rows $inv
+        } }
 )
 
 function Get-FilteredEvents {
@@ -3356,6 +3488,56 @@ function Get-IisW3cRows {
                 $null = $rows.Add([pscustomobject]$o)
                 if ($rows.Count -ge $Cap) { return $rows.ToArray() }
             }
+        }
+    } catch { }
+    return $rows.ToArray()
+}
+
+function Get-StartupInfoRows {
+    # StartupInfo XMLs (System32\WDI\LogFiles\StartupInfo\*.xml): per-session user app launches.
+    param([string]$Path)
+    $rows = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($f in @(Get-ChildItem -LiteralPath $Path -Filter '*.xml' -File -ErrorAction SilentlyContinue)) {
+            $x = $null
+            try { $x = [xml](Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop) } catch { continue }
+            $apps = @()
+            try { $apps = @($x.SelectNodes('//*[local-name()="Application"]')) } catch { }
+            foreach ($a in $apps) {
+                $p2 = $a.Attributes.GetNamedItem('Path')
+                if (-not $p2) { continue }
+                $cnt = $a.Attributes.GetNamedItem('ExecutionCount')
+                $lt = $a.Attributes.GetNamedItem('LastExecutionTime')
+                $null = $rows.Add([pscustomobject]@{ File = $f.Name; App = "$($p2.Value)"; Count = $(if ($cnt) { "$($cnt.Value)" } else { '' }); LastRun = $(if ($lt) { "$($lt.Value)" } else { '' }) })
+            }
+        }
+    } catch { }
+    return $rows.ToArray()
+}
+
+function Get-WerReportRows {
+    # Report.wer text files (UTF-16 key=value): faulting app/module + event time (FILETIME ticks).
+    param([string]$Path)
+    $rows = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($f in @(Get-ChildItem -LiteralPath $Path -Filter 'Report.wer' -File -Recurse -ErrorAction SilentlyContinue)) {
+            $kv = @{}
+            try {
+                foreach ($line in (Get-Content -LiteralPath $f.FullName -ErrorAction SilentlyContinue)) {
+                    if ($line -match '^([A-Za-z0-9\[\]\.]+)=(.*)$') { $kv[$Matches[1]] = $Matches[2] }
+                }
+            } catch { continue }
+            $app = ''
+            foreach ($k in @('AppPath', 'TargetAppPath', 'Sig[0].Value')) { if ($kv.ContainsKey($k) -and $kv[$k]) { $app = $kv[$k]; break } }
+            $mod = ''
+            foreach ($k in @('FaultingModule', 'Sig[1].Value', 'Sig[3].Value')) { if ($kv.ContainsKey($k) -and $kv[$k]) { $mod = $kv[$k]; break } }
+            $t = ''
+            if ($kv.ContainsKey('EventTime') -and $kv['EventTime']) {
+                try { $t = [datetime]::FromFileTimeUtc([long]$kv['EventTime']).ToString('s') } catch { }
+            }
+            $rel = $f.FullName
+            try { $rel = $f.FullName.Substring($Path.Length).TrimStart('\') } catch { }
+            $null = $rows.Add([pscustomobject]@{ Time = $t; App = $app; Module = $mod; File = $rel })
         }
     } catch { }
     return $rows.ToArray()
@@ -4383,6 +4565,10 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'prefetch_parsed'                 = 'Prefetch parse: run counts + last run times'
         'userassist'                      = 'UserAssist GUI programs executed per user'
         'mft_recent'                      = 'MFT: recently created / user-path executables (both birth attributes: $Si Created + FILE_NAME CreatedFN - R22 timestamp-forgery checks)'
+        'application_events'              = 'Application log: app crashes (1000/1001/1002) + MSI installs (1033/11707/11724) - crashed attacker tools'
+        'startup_info'                    = 'StartupInfo per-session app launches (WDI XMLs) - execution evidence that survives Prefetch deletion'
+        'wer_reports'                     = 'Windows Error Reporting crash reports (faulting app/module) - evidence of failed attacker tooling'
+        'server_logs'                     = 'Inventory of copied server-role logs (DNS/DHCP audit, SYSVOL policies, NTDS.dit on Full+DC)'
         'usn_write_bursts'                = 'USN journal: mass file-modification windows (ransomware)'
         'lnk_parsed'                      = 'LNK parse (Recent docs - what files were opened)'
         'jumplist_parsed*'                = 'Jump List parse (per-app recent files)'
@@ -4449,7 +4635,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
 
 function New-SuperTimeline {
     $rows = New-Object System.Collections.Generic.List[object]
-    foreach ($name in @('security_events', 'powershell_events', 'sysmon_events', 'system_events', 'defender_events', 'rdp_localsession', 'rdp_connections')) {
+    foreach ($name in @('security_events', 'powershell_events', 'sysmon_events', 'system_events', 'defender_events', 'rdp_localsession', 'rdp_connections', 'application_events')) {
         foreach ($r in (Import-CaseCsv $name)) {
             if ($r.PSObject.Properties['TimeCreated']) {
                 $rows.Add([pscustomobject]@{ Timestamp = "$($r.TimeCreated)"; Source = $name; Type = "EID $($r.Id)"; Detail = (("$($r.Message)") -replace '\s+', ' ').Trim() })
@@ -5547,6 +5733,7 @@ function Get-CompromiseVerdict {
     Add-Cov 'Kerberos/DS telemetry (DC role)' ((Test-Path (Join-Path $CsvDir 'security_kerberos.csv')) -or (Test-Path (Join-Path $CsvDir 'security_ds_access.csv'))) 3
     Add-Cov 'Web telemetry (IIS)' (Test-Path (Join-Path $CsvDir 'iis_requests.csv')) 2
     Add-Cov 'Session attribution + process lineage' ((Test-Path (Join-Path $CsvDir 'session_activity.csv')) -or (Test-Path (Join-Path $CsvDir 'process_chains.csv'))) 2
+    Add-Cov 'Host extras (WER/StartupInfo/QuickAssist/GPO)' ((Test-Path (Join-Path $CsvDir 'wer_reports.csv')) -or (Test-Path (Join-Path $CsvDir 'startup_info.csv'))) 2
     Add-Cov 'LOLDrivers driver hash check' (Test-Path (Join-Path $CsvDir 'loldrivers_hits.csv')) 3
     Add-Cov 'Sysmon telemetry (bonus)' ([bool]$Sysmon) 5
     Add-Cov 'RAM capture (bonus)' (Test-Path $MemDir) 3
