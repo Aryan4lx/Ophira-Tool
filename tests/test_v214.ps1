@@ -161,7 +161,7 @@ $null = New-SuperTimeline
 $stRows = @(Import-Csv (Join-Path $CsvDir 'supertimeline.csv'))
 Check "supertimeline: sort-csv invoked" $script:sortCsvCalled
 Check "supertimeline: duplicate hayabusa row deduped (4 rows)" ($stRows.Count -eq 4)
-Check "supertimeline: sources merged (hayabusa + security)" (@($stRows | Where-Object Source -eq 'hayabusa').Count -eq 2 -and @($stRows | Where-Object Source -eq 'security_events').Count -eq 2)
+Check "supertimeline: sources merged (hayabusa + security)" (@($stRows | Where-Object Source -eq 'hayabusa_timeline').Count -eq 2 -and @($stRows | Where-Object Source -eq 'security_events').Count -eq 2)
 
 # ============================================================================
 # PART 5 - verdict wiring for DNS beacons + LOLDrivers

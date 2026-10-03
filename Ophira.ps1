@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.23  -  Windows Incident Response Triage Toolkit
+Ophira v2.24  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -34,7 +34,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.23"
+$ScriptVersion = "2.24"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -2513,7 +2513,7 @@ $script:Modules = @(
                             $ext = ("$($_.$cExt)").ToLower()
                             if ($exeExt -notcontains $ext) { return }
                             $parent = "$($_.$cParent)"
-                            $path = if ($parent) { "$parent\$name" } else { $name }
+                            $path = if ($parent) { "$dl$parent\$name" } else { "$dl\$name" }
                             $userPath = Test-IsUserWritablePath $path
                             $created = $null; try { $created = [datetime]"$($_.$cCreated)" } catch { }
                             $recent = ($created -and $created -ge $cutoff)
@@ -4324,6 +4324,11 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     $null = $sb.AppendLine("<div class='meta'>Each entity below joins evidence from multiple independent sources (processes, execution history, persistence, network, SRUM usage, YARA, Sigma...) into one story. More categories touching one binary = stronger signal. Full data: csv\entities_binaries.csv / entities_accounts.csv / entities_remotes.csv</div>")
     $entTop = @($entB | Where-Object { [int]"$($_.CatCount)" -ge 2 } | Select-Object -First 8)
     if ($entTop.Count -gt 0) {
+        # master-timeline context for the top cards: rows within +/-15 min of the entity's first seen
+        $tlPre = @()
+        try {
+            $tlPre = @(Import-CaseCsv 'supertimeline' | ForEach-Object { $t = $null; try { $t = [datetime]$_.Timestamp } catch { }; if ($t) { [pscustomobject]@{ T = $t; Row = $_ } } })
+        } catch { }
         foreach ($e in $entTop) {
             $vCls = switch -Regex ("$($e.Verdict)") { 'HIGH' { 'crit'; break } 'MEDIUM' { 'med'; break } default { 'info' } }
             $vTxt = if ("$($e.Verdict)") { ", verdict <span class='$vCls'>$($e.Verdict)</span>" } else { '' }
@@ -4336,7 +4341,24 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
                 $parts = "$ev" -split ': ', 2
                 $null = $sb.AppendLine("<tr><td><b>$(ConvertTo-HtmlEsc $parts[0])</b></td><td class='path'>$(ConvertTo-HtmlEsc ($parts[1..($parts.Length-1)] -join ': '))</td></tr>")
             }
-            $null = $sb.AppendLine("</table></details>")
+            $null = $sb.AppendLine("</table>")
+            # +/-15 min context window around first seen, pulled from the master timeline
+            $fs = $null
+            try { $fs = ([datetime]$e.FirstSeen).ToUniversalTime() } catch { }
+            if ($fs -and $tlPre.Count -gt 0) {
+                $lo = $fs.AddMinutes(-15); $hi = $fs.AddMinutes(15)
+                $ctx = @($tlPre | Where-Object { $_.T -ge $lo -and $_.T -le $hi } | Select-Object -First 8)
+                if ($ctx.Count -gt 0) {
+                    $null = $sb.AppendLine("<div class='meta'><b>Context: everything else happening &plusmn;15 min around first seen $($fs.ToString('yyyy-MM-dd HH:mm:ss'))</b> (full window: csv\supertimeline.csv)</div>")
+                    $null = $sb.AppendLine("<table><tr><th>Time</th><th>Type</th><th>Actor</th><th>Detail</th></tr>")
+                    foreach ($c2 in $ctx) {
+                        $r2 = $c2.Row
+                        $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $r2.Timestamp)</td><td>$(ConvertTo-HtmlEsc $r2.Type)</td><td>$(ConvertTo-HtmlEsc $r2.Actor)</td><td class='path'>$(ConvertTo-HtmlEsc ("$($r2.Entity) $($r2.Detail)".Trim()))</td></tr>")
+                    }
+                    $null = $sb.AppendLine("</table>")
+                }
+            }
+            $null = $sb.AppendLine("</details>")
         }
     } else {
         $null = $sb.AppendLine("<div class='meta'>No multi-source binary correlations in this case (a binary must appear in 2+ independent evidence sources to be listed here).</div>")
@@ -4609,7 +4631,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'entities_accounts'               = 'Accounts joined across logons/RDP/console history with failure counts'
         'entities_remotes'                = 'Remote endpoints joined across connections/beacons/brute-force/RDP targets'
         'delta_new'                       = 'Findings NEW since the previous collection'
-        'supertimeline'                   = 'All event sources merged chronologically - the master timeline'
+        'supertimeline'                   = 'MASTER TIMELINE: every artifact source woven chronologically (logons, 4688/5145, Kerberos, Sysmon, prefetch, $MFT births, browser, WER, StartupInfo, hunt findings...) with Timestamp/Source/Type/Actor/Entity/Detail - filter to any timeframe in Excel/Timeline Explorer'
     }
     $null = $sb.AppendLine("<table><tr><th>Artifact</th><th>Rows</th><th>What it is / what to look for</th></tr>")
     foreach ($f in @(Get-ChildItem -Path $CsvDir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
@@ -4634,37 +4656,122 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
 }
 
 function New-SuperTimeline {
+    # v2.24 MASTER TIMELINE: every artifact source woven into ONE chronological CSV with a
+    # normalized schema (Timestamp, Source, Type, Actor, Entity, Detail) so the analyst can
+    # open a single file and filter to any timeframe ("weird activity at 14:00" checks).
+    # Per-source caps + a total cap keep the file bounded; hayabusa sort-csv dedupes overlaps.
     $rows = New-Object System.Collections.Generic.List[object]
-    foreach ($name in @('security_events', 'powershell_events', 'sysmon_events', 'system_events', 'defender_events', 'rdp_localsession', 'rdp_connections', 'application_events')) {
+    $add = {
+        param($ts, [string]$source, [string]$type, [string]$actor, [string]$entity, [string]$detail)
+        if (-not $ts) { return }
+        $iso = "$ts"
+        try { $iso = ([datetime]$ts).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') } catch { }
+        $d = ("$detail" -replace '\s+', ' ').Trim()
+        if ($d.Length -gt 240) { $d = $d.Substring(0, 240) + '...' }
+        $null = $rows.Add([pscustomobject]@{ Timestamp = $iso; Source = $source; Type = "$type"; Actor = "$actor"; Entity = "$entity"; Detail = $d })
+    }
+    $weave = {
+        param([string]$name, [int]$cap, [scriptblock]$map)
+        $n = 0
         foreach ($r in (Import-CaseCsv $name)) {
-            if ($r.PSObject.Properties['TimeCreated']) {
-                $rows.Add([pscustomobject]@{ Timestamp = "$($r.TimeCreated)"; Source = $name; Type = "EID $($r.Id)"; Detail = (("$($r.Message)") -replace '\s+', ' ').Trim() })
-            }
+            if ($n -ge $cap) { break }
+            $m = $null
+            try { $m = & $map $r } catch { }
+            if ($m -and "$($m[0])") { $n++; & $add $m[0] $name $m[1] $m[2] $m[3] $m[4] }
         }
     }
-    foreach ($r in (Import-CaseCsv 'hayabusa_timeline')) {
-        if ($r.PSObject.Properties['Timestamp']) {
-            $rule = if ($r.PSObject.Properties['RuleTitle']) { $r.RuleTitle } elseif ($r.PSObject.Properties['Alert']) { $r.Alert } else { $r.RuleFile }
-            $rows.Add([pscustomobject]@{ Timestamp = "$($r.Timestamp)"; Source = 'hayabusa'; Type = "$($r.Level): $rule"; Detail = "$($r.Details)" })
+    $leaf = { param($p) try { if ("$p") { (Split-Path "$p" -Leaf) } else { '' } } catch { "$p" } }
+
+    # generic event-log CSVs (Get-FilteredEvents shape: TimeCreated/Id/Message)
+    foreach ($name in @('security_events', 'powershell_events', 'sysmon_events', 'system_events', 'defender_events', 'rdp_localsession', 'rdp_connections', 'application_events')) {
+        $n = 0
+        foreach ($r in (Import-CaseCsv $name)) {
+            if ($n -ge 5000 -or -not $r.PSObject.Properties['TimeCreated']) { continue }
+            $n++
+            & $add $r.TimeCreated $name "EID $($r.Id)" '' '' $r.Message
         }
     }
+    # structured security telemetry
+    & $weave 'security_auth_events' 5000 { param($r) $t = $(if ("$($r.EventId)" -eq '4625') { 'failed logon' } else { 'logon' }); if ("$($r.LogonType)") { $t = "$t (type $($r.LogonType))" } @("$($r.Time)", $t, "$($r.Account)", "$($r.SourceIp)", "LogonId $($r.LogonId)") }
+    & $weave 'security_proc_events' 5000 { param($r) @("$($r.Time)", 'process created (4688)', "$($r.Account)", (& $leaf $r.NewProcess), "parent $(& $leaf $r.ParentProcess) | $($r.CommandLine)") }
+    & $weave 'security_share_access' 5000 { param($r) @("$($r.Time)", "share access (EID $($r.EventId))", "$($r.Account)", "$("$($r.ShareName)" -replace '^[\*\\\s]+', '')\$("$($r.RelativeTargetName)" -replace '\\', '/')", "from $($r.SourceIp) [$(("$($r.AccessList)" -replace '%%', ''))]") }
+    & $weave 'security_task_install' 500 { param($r) @("$($r.Time)", 'scheduled task installed (4698)', "$($r.Account)", "$($r.TaskName)", "$($r.Command)") }
+    & $weave 'security_kerberos' 3000 { param($r) @("$($r.Time)", "kerberos (EID $($r.EventId))", "$($r.Account)", "$($r.IpAddress)", "svc=$($r.Service) enc=$($r.TicketEnc) preauth=$($r.PreAuth)") }
+    & $weave 'security_ds_access' 3000 { param($r) @("$($r.Time)", "directory service (EID $($r.EventId))", "$($r.Account)", "$($r.Object)$("$($r.ObjectDN)")", "$("$($r.Properties)" -replace '\s+', ' ') | $($r.Attribute)=$($r.Value)") }
+    & $weave 'defender_config_events' 500 { param($r) @("$($r.Time)", "defender config (EID $($r.EventId))", '', '', "$($r.Detail)") }
+    # sysmon structured
+    & $weave 'sysmon_network' 5000 { param($r) @("$($r.Time)", 'network connection (Sysmon 3)', (& $leaf $r.Image), "$($r.DestIp):$($r.DestPort)", "proto $($r.Protocol)") }
+    & $weave 'sysmon_dns' 5000 { param($r) @("$($r.Time)", 'DNS query (Sysmon 22)', (& $leaf $r.Image), "$($r.QueryName)", "resolved $($r.QueryResults)") }
+    & $weave 'sysmon_image_load' 3000 { param($r) @("$($r.Time)", 'image load (Sysmon 7)', (& $leaf $r.Process), (& $leaf $r.Dll), "signed=$($r.Signed) $($r.Signature)") }
+    & $weave 'sysmon_process_access' 3000 { param($r) @("$($r.Time)", 'process access (Sysmon 10)', (& $leaf $r.SourceImage), (& $leaf $r.TargetImage), "granted=$($r.GrantedAccess) trace=$(("$($r.CallTrace)" -replace '\+.*', ''))") }
+    & $weave 'sysmon_registry' 3000 { param($r) @("$($r.Time)", "registry event (Sysmon 13)", (& $leaf $r.Image), "$($r.TargetObject)", "$($r.EventType)") }
+    & $weave 'sysmon_file_time' 1000 { param($r) @("$($r.Time)", 'file creation time changed (Sysmon 2)', (& $leaf $r.Image), (& $leaf $r.TargetFilename), "$($r.PreviousCreationUtcTime) -> $($r.CreationUtcTime)") }
+    # execution evidence
+    & $weave 'hayabusa_timeline' 5000 { param($r) @("$($r.Timestamp)", "$($r.Level): $(if ($r.PSObject.Properties['RuleTitle']) { $r.RuleTitle } elseif ($r.PSObject.Properties['Alert']) { $r.Alert } else { $r.RuleFile })", '', '', "$($r.Details)") }
     $exec = Import-CaseCsv 'execution_timeline'
     if ($exec.Count -gt 0) {
         $tCol = ($exec[0].PSObject.Properties.Name | Select-Object -First 1)
+        $n = 0
         foreach ($r in $exec) {
+            if ($n -ge 3000) { break }
             $line = ($r.PSObject.Properties | ForEach-Object { "$($_.Value)" }) -join ' '
-            $rows.Add([pscustomobject]@{ Timestamp = "$($r.$tCol)"; Source = 'execution'; Type = 'shimcache/amcache'; Detail = $line })
+            $n++
+            & $add $r.$tCol 'execution_timeline' 'shimcache/amcache entry' '' '' $line
         }
     }
+    $pfT = { param($r) $c = @($r.PSObject.Properties.Name | Where-Object { $_ -match '(?i)lastrun' } | Select-Object -First 1)[0]; if ($c) { "$($r.$c)" } else { '' } }
+    $pfE = { param($r) $c = @($r.PSObject.Properties.Name | Where-Object { $_ -match '(?i)executable|^name$' } | Select-Object -First 1)[0]; if ($c) { "$($r.$c)" } else { '' } }
+    & $weave 'prefetch_parsed' 2000 { param($r) $rc = ''; foreach ($pn in @($r.PSObject.Properties.Name)) { if ($pn -match '(?i)runcount|^run') { $rc = "$($r.$pn)"; break } } @((& $pfT $r), 'prefetch run', (& $leaf (& $pfE $r)), (& $pfE $r), "run count $rc") }
+    & $weave 'amcache' 2000 {
+        param($r)
+        $t = $null
+        foreach ($pn in (@($r.PSObject.Properties.Name) | Where-Object { $_ -match '(?i)timestamp|time$' })) {
+            try { $t2 = [datetime]"$($r.$pn)"; if ($t2 -and (-not $t -or $t2 -lt $t)) { $t = $t2 } } catch { }
+        }
+        $nm = ''; foreach ($pn in @('Name', 'ApplicationName', 'SourceSimpleName')) { $p2 = $r.PSObject.Properties[$pn]; if ($p2 -and "$($p2.Value)") { $nm = "$($p2.Value)"; break } }
+        @($(if ($t) { $t.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }), 'amcache entry', $nm, $nm, "source $($r.SourceFile)")
+    }
+    & $weave 'mft_recent' 3000 { param($r) @("$($r.Created)", 'file created ($MFT $Si)', '', "$($r.Path)", "FILE_NAME birth $($r.CreatedFN) | $($r.Flags)") }
+    & $weave 'usn_write_bursts' 200 { param($r) @("$($r.WindowStart)", 'mass file modification (USN burst)', '', "$($r.Drive)", "$($r.WriteEvents) writes / $($r.DistinctFiles) files$(if ("$($r.RansomExt)") { " RANSOM-EXT $($r.RansomExt)" })") }
+    & $weave 'bam_lastexec' 2000 { param($r) @("$($r.LastWrite)", "last exec ($($r.Source))", (& $leaf $r.Executable), "$($r.Executable)", "sid $($r.Sid)") }
+    & $weave 'startup_info' 1000 { param($r) @("$($r.LastRun)", 'app launch (StartupInfo)', (& $leaf $r.App), "$($r.App)", "count $($r.Count)") }
+    & $weave 'wer_reports' 1000 { param($r) @("$($r.Time)", 'app crash (WER)', "$($r.App)", "$($r.Module)", "$($r.File)") }
+    & $weave 'session_activity' 3000 { param($r) @("$($r.Time)", "session activity [$($r.Activity)]", "$($r.SessionAccount)", "$($r.SourceIp)", "$($r.Detail)") }
+    & $weave 'office_mru' 500 { param($r) @("$($r.LastWrite)", 'office document (MRU)', "$($r.App)", (& $leaf $r.Document), "$($r.Document)") }
+    $anyT = {
+        param($r, $fallback)
+        foreach ($pn in (@($r.PSObject.Properties.Name) | Where-Object { $_ -match '(?i)time|date' })) {
+            if ("$($r.$pn)") { return "$($r.$pn)" }
+        }
+        $fallback
+    }
+    & $weave 'lnk_parsed' 1000 { param($r) @((& $anyT $r ''), 'LNK opened', '', (& $leaf $r.Target), "$($r.Path) -> $($r.Target)") }
+    & $weave 'shellbags' 1000 { param($r) @((& $anyT $r ''), 'folder accessed (ShellBag)', '', (& $leaf ($r.PSObject.Properties['Path'].Value)), "$($r.PSObject.Properties['Path'].Value)") }
+    & $weave 'recyclebin_index' 1000 { param($r) @((& $anyT $r ''), 'file deleted (recycle bin)', '', (& $leaf ($r.PSObject.Properties['OriginalPath'].Value)), "$($r.PSObject.Properties['OriginalPath'].Value)") }
+    & $weave 'browser_history' 2000 {
+        param($r)
+        $u = ''; foreach ($pn in @('URL', 'Url', 'url')) { $p2 = $r.PSObject.Properties[$pn]; if ($p2 -and "$($p2.Value)") { $u = "$($p2.Value)"; break } }
+        @((& $anyT $r ''), 'browser visit', '', $u, ("$($r.PSObject.Properties['Title'].Value)"))
+    }
+    & $weave 'browser_downloads' 1000 {
+        param($r)
+        $tp = ''; foreach ($pn in @('TargetFilePath', 'TargetPath', 'DownloadPath', 'FullPath', 'Path')) { $p2 = $r.PSObject.Properties[$pn]; if ($p2 -and "$($p2.Value)") { $tp = "$($p2.Value)"; break } }
+        @((& $anyT $r ''), 'browser download', '', (& $leaf $tp), "$($r.PSObject.Properties['URL'].Value)")
+    }
+    & $weave 'iis_requests' 1000 { param($r) @("$($r.Time)", "web request (IIS) $("$($r.Method)")", '', "$($r.ClientIp) -> $("$($r.Uri)")", "status $($r.Status) ua=$("$($r.UserAgent)")") }
+    & $weave 'hunt_findings' 500 { param($r) @("$($r.Found)", "hunt finding [$($r.Severity)]", '', "$($r.Entity)", "$($r.Rule): $($r.Evidence) ($($r.Attck))") }
+    & $weave 'logging_gaps' 100 { param($r) @("$($r.Time)", 'logging gap', '', "$($r.Source)", "$($r.Meaning) $($r.Message)") }
+
     if ($rows.Count -eq 0) { return }
-    $sorted = $rows | Sort-Object { try { [datetime]::Parse($_.Timestamp, [System.Globalization.CultureInfo]::InvariantCulture) } catch { [datetime]::MinValue } }
+    $sorted = @($rows | Sort-Object { $t = [datetime]::MinValue; try { $t = [datetime]::Parse($_.Timestamp, [System.Globalization.CultureInfo]::InvariantCulture) } catch { }; $t })
+    if ($sorted.Count -gt 60000) { $sorted = @($sorted | Select-Object -Last 60000) }
     $out = Join-Path $CsvDir 'supertimeline.csv'
     $sorted | Export-Csv -LiteralPath $out -NoTypeInformation -Encoding UTF8
     # hayabusa sort-csv: dedupe same-event rows coming from overlapping/backup evtx (PS sort above already orders by time)
     $hS = Get-HayabusaExe
     if ($hS) { $null = Invoke-NativeTool -ExePath $hS.FullName -ToolArgs @('sort-csv', '-f', $out, '-o', $out, '-C', '-q', '-K') -WorkingDirectory $hS.DirectoryName -QuietLog }
     $nFinal = @(Get-Content -LiteralPath $out | Select-Object -Skip 1).Count
-    Write-CaseLog "    supertimeline: $($rows.Count) events merged, $nFinal after dedupe -> csv\supertimeline.csv" 'DarkGray'
+    Write-CaseLog "    MASTER TIMELINE: $($sorted.Count) events from every artifact source, $nFinal after dedupe -> csv\supertimeline.csv (filter by Timestamp in Excel/Timeline Explorer)" 'DarkGray'
 }
 
 function New-SigmaRuleLogs {

@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.24
+- **Master timeline** - `csv\supertimeline.csv` rebuilt as the one-file chronology of EVERYTHING (KAPE-timeline style): ~25 source adapters weave logons, 4688/4698/5140/5145, Kerberos/DS, all Sysmon structured telemetry (network/DNS/image-load/ProcessAccess/registry/file-time), prefetch, amcache, $MFT births, USN bursts, browser history/downloads, LNK, ShellBags, recycle bin, BAM, StartupInfo, WER, Office MRU, session activity, IIS requests, hunt findings and logging gaps into a normalized schema (`Timestamp, Source, Type, Actor, Entity, Detail`), UTC-normalized and sorted; per-source caps + 60k total cap; hayabusa sort-csv dedupe. Analyst opens ONE file and filters to any timeframe ("weird activity at 14:00")
+- **Correlation tightening**:
+  - Module 5.5 now prefixes the drive letter on MFT paths (`\Users\...` -> `c:\Users\...`) so entity correlation joins on full paths instead of falling back to leaf names
+  - Report Connections: top entity cards gain a **context window** - everything happening +/-15 min around the binary's first seen, pulled from the master timeline (capped 8 rows; entity FirstSeen converted to UTC to align with the timeline - timezone-skew bug caught by test on a UTC+3:30 host)
+- Evidence index: supertimeline description upgraded to the master-timeline role
+- Tests: `tests\test_v224.ps1` (15 checks) - 9-source weave fixtures (schema, sort, normalization, per-type adapter output), MFT drive fix, context-window rendering incl. out-of-window exclusion
+
 ## v2.23
 - **KAPE parity pack** - closes the meaningful gaps vs [kapefiles](https://github.com/ericzimmerman/kapefiles) targets (bulk folder copies, raw NTFS internals and consumer artifacts deliberately not taken):
   - **Module 4.10 Application log**: crashes (1000/1001/1002), MSI installs (1033/11707/11724) -> `application_events.csv` + `Application.evtx`; merged into the supertimeline. Crashed attacker tooling surfaces here
