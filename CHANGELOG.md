@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.21
+- **Role presets + correlation spine**
+  - **Host role detection** (`Get-HostRole`, startup): DC (NTDS registry key), WebServer (InetStp/W3SVC), else Workstation; shown in the menu banner + collection log, recorded in `case.json` (`Role`) and `fleet_hosts.csv` (+ fleet-report host table)
+  - **`-Preset DC` / `-Preset WebServer`** force the role modules on; Standard/Full **auto-enable** the role pack on a detected DC/IIS host (menu can untick, Quick/Flash never carry it)
+  - **Module 4.9** (DC role): Kerberos + directory events via `Get-EventDataRows` - 4768 (PreAuthType), 4769 (TicketEncryptionType), 4771, 4776, 4662 (replication GUIDs), 5136 (AD object changes) -> `security_kerberos.csv` + `security_ds_access.csv`; honest skip-note when audit policy is off
+  - **Module 8.12** (web role): inetpub LogFiles + HTTPERR + applicationHost.config raw copy; new whitelisted `Get-IisW3cRows` W3C parser -> `iis_requests.csv` + `iis_anomalies.csv` (500 bursts, suspicious URIs, POSTs to upload paths, headless POSTs)
+  - **Hunt rules R16-R21**: R16 **DCSync** - 4662 Get-Changes by a user account (high, floor 2); R17 **Kerberoasting** - >=10 RC4 TGS to distinct SPNs per source (medium); R18 **AS-REP roast** - 4768 without pre-auth (medium); R19 **password spray** - >=10 distinct accounts failing from one source across 4771+4625 (high, floor 2); R20 **webshell chain** - w3wp/tomcat/httpd spawning interpreters (high, floor 2); R21 **web anomalies** (medium, report-only)
+  - **Session attribution** (`New-SessionAttribution`): 4624 LogonId x 4688/5145 SubjectLogonId joins -> `session_activity.csv` - process creations and admin-share writes attributed to the logon session (account + source IP + logon type); report "Attributed activity" table + account-entity evidence
+  - **Process lineage** (`New-ProcessChains`): parent-child graph from 4688 + live PPID map; ancestry chains for flagged binaries (HIGH/MEDIUM verdicts + high hunt findings) -> `process_chains.csv` + report "Process lineage" table (`explorer.exe -> winword.exe -> powershell.exe` style stories)
+  - **Entity correlation grows**: 4688 executions, admin-share staged files, IIS anomalies as new binary categories; Kerberos/DS/attributed activity as new account evidence; **fixed v2.19 ordering bug** - hunt findings now run BEFORE entity correlation, so the `hunt` category is fresh in a single pass
+  - Coverage rows (Kerberos/DS, Web, session/lineage), SIEM unchanged, evidence index documents all 6 new CSVs
+- **Win7/PS 2.0 parse-compat sweep**: removed every PS3+ operator (`-in`/`-notin` -> `-contains`/`-notcontains`, 18 sites) and PS5-only `::new()` (5 sites) - the whole script now PARSES under stock Win7's PowerShell 2.0, so the friendly PS<5 gate + WMF 5.1 guidance renders everywhere instead of parser errors; regression-checked in `test_v221.ps1`; README gains an OS support matrix
+- Tests: `tests\test_v221.ps1` (36 checks) - role detection via cmdlet shadowing, preset role packs, R16-R21 fixtures, session attribution, lineage reconstruction, W3C parser, compat greps
+
 ## v2.20
 - **APT depth**: structured event parses + hunt rules R8-R15
   - **Structured parses** via new `Get-EventDataRows` helper (named EventData fields from the event XML, newest-first, capped; added to the worker whitelist):

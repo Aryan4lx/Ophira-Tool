@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.20  -  Windows Incident Response Triage Toolkit
+Ophira v2.21  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -12,7 +12,7 @@ param(
     [string]$CaseID = "",
     [string]$Analyst = "",
     [string]$OutputPath = "",
-    [ValidateSet('Flash', 'Quick', 'Standard', 'Full', 'Custom')]
+    [ValidateSet('Flash', 'Quick', 'Standard', 'Full', 'Custom', 'DC', 'WebServer')]
     [string]$Preset = 'Standard',
     [switch]$NoMenu,
     [switch]$SimpleUI,
@@ -34,7 +34,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.20"
+$ScriptVersion = "2.21"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -57,6 +57,18 @@ function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
+
+function Get-HostRole {
+    # v2.21 lightweight role fingerprint: DC (NTDS present), WebServer (IIS installed), else Workstation.
+    try {
+        if (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters') { return 'DC' }
+    } catch { }
+    try {
+        if ((Test-Path 'HKLM:\SOFTWARE\Microsoft\InetStp') -or (Get-Service W3SVC -ErrorAction SilentlyContinue)) { return 'WebServer' }
+    } catch { }
+    return 'Workstation'
+}
+$script:HostRole = Get-HostRole
 
 function Get-ArgString {
     $parts = @()
@@ -452,7 +464,7 @@ function Invoke-SetupMode {
     )
     $installed = @()
     foreach ($t in $catalog) {
-        if ($Wanted -and $Wanted.Count -gt 0 -and $t.Name -notin $Wanted) { continue }
+        if ($Wanted -and $Wanted.Count -gt 0 -and $Wanted -notcontains $t.Name) { continue }
         Write-Host ""
         Write-Host "=== $($t.Name) ===" -ForegroundColor Cyan
         try {
@@ -647,7 +659,7 @@ function Invoke-DeployMode {
         param([string[]]$Batch)
         $pool = [runspacefactory]::CreateRunspacePool(1, [Math]::Max(1, $Threads))
         $pool.Open()
-        $jobs = [System.Collections.ArrayList]::new()
+        $jobs = New-Object System.Collections.ArrayList
         foreach ($c in $Batch) {
             $ps = [powershell]::Create()
             $null = $ps.AddScript($worker.ToString()).AddArgument($c).AddArgument($scriptPath).AddArgument($toolsDir).AddArgument($DeployPreset).AddArgument($DeployCaseID).AddArgument($DeploySharePath).AddArgument($Cred).AddArgument($outFolder).AddArgument($binZip).AddArgument($DeployLogHours)
@@ -737,7 +749,7 @@ function Invoke-AnalyzeMode {
         [IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $tmp)
         return $tmp
     }
-    $extractJobs = [System.Collections.ArrayList]::new()
+    $extractJobs = New-Object System.Collections.ArrayList
     $pool = [runspacefactory]::CreateRunspacePool(1, 4)
     $pool.Open()
     foreach ($src in $sources) {
@@ -787,6 +799,7 @@ function Invoke-AnalyzeMode {
         if (Test-Path $verdictJson) { try { $vd = Get-Content $verdictJson -Raw | ConvertFrom-Json } catch { } }
         $hosts += [pscustomobject]@{
             Host = $host_; Source = $src.Name; CaseID = $meta.CaseID
+            Role = $(if ($meta -and $meta.Role) { "$($meta.Role)" } else { '' })
             Collected = $meta.StartedUTC; Admin = $meta.AdminElevated; Sysmon = $meta.SysmonPresent
             Verdict = "$(if ($vd) { $vd.Level } else { '' })"
             VerdictRank = $(if ($vd) { [int]$vd.LevelRank } else { -1 })
@@ -880,13 +893,13 @@ function Invoke-AnalyzeMode {
         }
         if ($hosts.Count -gt $withVerdict.Count) { Write-Host "    ($($hosts.Count - $withVerdict.Count) legacy case(s) without verdict - rerun those hosts with Ophira v2.6+)" -ForegroundColor DarkGray }
     }
-    $highRisk = @($findings | Where-Object { $_.Type -in @('IOC-HIT', 'AVDetection', 'HuntHit') })
+    $highRisk = @($findings | Where-Object { @('IOC-HIT', 'AVDetection', 'HuntHit') -contains $_.Type })
     if ($highRisk.Count) {
         Write-Host "`n  *** HIGH-PRIORITY (IOC hits / AV detections / hunt hits) ***" -ForegroundColor Red
         $highRisk | Group-Object Host | ForEach-Object { Write-Host "    $($_.Name): $($_.Count)" -ForegroundColor Red }
     }
     $crossHost = @()
-    foreach ($g in ($findings | Where-Object { $_.Type -in @('ProcAnomaly', 'IOC-HIT', 'TaskFlagged', 'ServiceFlagged', 'FileHash') } | Group-Object { ($_.Detail -split ' ')[0] })) {
+    foreach ($g in ($findings | Where-Object { @('ProcAnomaly', 'IOC-HIT', 'TaskFlagged', 'ServiceFlagged', 'FileHash') -contains $_.Type } | Group-Object { ($_.Detail -split ' ')[0] })) {
         $hs = @($g.Group | Select-Object -ExpandProperty Host -Unique)
         if ($hs.Count -gt 1) { $crossHost += [pscustomobject]@{ Indicator = $g.Name; Hosts = ($hs -join ', '); HostCount = $hs.Count } }
     }
@@ -959,7 +972,7 @@ function Invoke-AnalyzeMode {
     $reportCsv = Join-Path $OutFolder 'fleet_report.csv'
     $findings | Sort-Object Host, Type | Export-Csv -LiteralPath $reportCsv -NoTypeInformation -Encoding UTF8
     $hostsCsv = Join-Path $OutFolder 'fleet_hosts.csv'
-    $hosts | Sort-Object Host | Select-Object Host, Verdict, VerdictRank, Confidence, Signals, Caveats, Collected, Admin, Sysmon, Source, CaseID | Export-Csv -LiteralPath $hostsCsv -NoTypeInformation -Encoding UTF8
+    $hosts | Sort-Object Host | Select-Object Host, Verdict, VerdictRank, Confidence, Role, Signals, Caveats, Collected, Admin, Sysmon, Source, CaseID | Export-Csv -LiteralPath $hostsCsv -NoTypeInformation -Encoding UTF8
 
     $fleetHtml = Join-Path $OutFolder 'fleet_report.html'
     $css = @'
@@ -988,16 +1001,16 @@ a{color:#8ab4f8}.foot{margin-top:40px;color:#565e6b;font-size:11px}
         if ($leg -gt 0) { $chipParts += "<span class='chip VN'>no verdict: $leg</span>" }
         $null = $fsb.AppendLine("<div class='chips'>$($chipParts -join '')</div>")
     }
-    $null = $fsb.AppendLine("<h2>Host summary (worst verdict first)</h2><table><tr><th>Host</th><th>Verdict</th><th>Conf</th><th>High-priority</th><th>Proc anomalies</th><th>Brute force</th><th>Collected</th></tr>")
+    $null = $fsb.AppendLine("<h2>Host summary (worst verdict first)</h2><table><tr><th>Host</th><th>Verdict</th><th>Conf</th><th>Role</th><th>High-priority</th><th>Proc anomalies</th><th>Brute force</th><th>Collected</th></tr>")
     foreach ($h in ($hosts | Sort-Object -Property @{Expression='VerdictRank';Descending=$true}, 'Host')) {
         $hf = @($findings | Where-Object Host -eq $h.Host)
-        $hp = @($hf | Where-Object { $_.Type -in @('IOC-HIT', 'AVDetection') }).Count
+        $hp = @($hf | Where-Object { @('IOC-HIT', 'AVDetection') -contains $_.Type }).Count
         $pa = @($hf | Where-Object { $_.Type -eq 'ProcAnomaly' -and $_.Detail -match '^\[HIGH' }).Count
         $bf = @($hf | Where-Object Type -eq 'BruteForce').Count
         $rowClass = if ($hp -gt 0 -or $pa -gt 0) { 'HIGH' } else { '' }
         $vCell = if ($h.VerdictRank -ge 0) { "<span class='V$($h.VerdictRank)'>$(ConvertTo-HtmlEsc $h.Verdict)</span>" } else { "<span class='VN'>n/a</span>" }
         $cCell = if ($h.VerdictRank -ge 0) { "$($h.Confidence)%" } else { '' }
-        $null = $fsb.AppendLine("<tr><td class='$rowClass'>$(ConvertTo-HtmlEsc $h.Host)</td><td>$vCell</td><td>$cCell</td><td>$hp</td><td>$pa</td><td>$bf</td><td>$(ConvertTo-HtmlEsc $h.Collected)</td></tr>")
+        $null = $fsb.AppendLine("<tr><td class='$rowClass'>$(ConvertTo-HtmlEsc $h.Host)</td><td>$vCell</td><td>$cCell</td><td>$(ConvertTo-HtmlEsc $h.Role)</td><td>$hp</td><td>$pa</td><td>$bf</td><td>$(ConvertTo-HtmlEsc $h.Collected)</td></tr>")
     }
     $null = $fsb.AppendLine("</table><div class='meta'>Per-host verdict details: each case zip's verdict.json + report.html. Host list CSV: fleet_hosts.csv</div>")
     if ($highRisk.Count -gt 0) {
@@ -1454,7 +1467,7 @@ $script:SharedFunctions = @(
     'Save-Rows', 'Out-RawText', 'Invoke-ExeCapture', 'Invoke-NativeTool', 'Get-WmiOrCim', 'Convert-WmiDate',
     'Test-IsPublicIp', 'Test-IsUserWritablePath', 'Get-SignatureInfo', 'Get-SysmonState',
     'Get-UserProfileList', 'Get-UserAssistRows', 'ConvertTo-Rot13', 'Get-FilteredEvents', 'Export-Evtx',
-    'Import-CaseCsv', 'Invoke-BrowserIocXref', 'Get-EventDataRows'
+    'Import-CaseCsv', 'Invoke-BrowserIocXref', 'Get-EventDataRows', 'Get-IisW3cRows'
 )
 
 $script:ModuleWorkerText = @'
@@ -1522,7 +1535,7 @@ function Invoke-ModuleBatch {
     }
     $pool = [runspacefactory]::CreateRunspacePool(1, $Workers)
     $pool.Open()
-    $jobs = [System.Collections.ArrayList]::new()
+    $jobs = New-Object System.Collections.ArrayList
     foreach ($m in $Batch) {
         $wlog = Join-Path $CaseDir ("worker_{0}.log" -f $m.Id)
         $ps = [powershell]::Create()
@@ -1827,7 +1840,7 @@ $script:Modules = @(
                         $bytes = $null; try { $bytes = $prop.Value } catch { }
                         $state = 'unknown'
                         if ($bytes -is [byte[]] -and $bytes.Count -gt 0) {
-                            if ($bytes[0] -in @(2, 3)) { $state = 'enabled' } elseif ($bytes[0] -in @(6, 7, 13)) { $state = 'disabled' }
+                            if (@(2, 3) -contains $bytes[0]) { $state = 'enabled' } elseif (@(6, 7, 13) -contains $bytes[0]) { $state = 'disabled' }
                         }
                         Add-Asep 'StartupApproved' $k $prop.Name $state @()
                     }
@@ -1975,12 +1988,13 @@ $script:Modules = @(
             $ids = @(4624, 4625, 4648, 4672, 4720, 4722, 4724, 4726, 4728, 4732, 4735, 4756, 4688, 4698, 5140, 5145, 1102)
             $ev = Get-FilteredEvents -LogName 'Security' -Ids $ids -Start $start
             Save-Rows -Name 'security_events' -Rows $ev
-            $auth = @($ev | Where-Object { $_.Id -in @(4624, 4625) } | ForEach-Object {
+            $auth = @($ev | Where-Object { @(4624, 4625) -contains $_.Id } | ForEach-Object {
                 $msg = "$($_.Message)"
                 $acct = if ($msg -match 'Account Name:\s+(\S+)') { $Matches[1] } else { '' }
                 $ip = if ($msg -match 'Source Network Address:\s+(\S+)') { $Matches[1] } else { '' }
                 $lt = if ($msg -match 'Logon Type:\s+(\d+)') { $Matches[1] } else { '' }
-                [pscustomobject]@{ Time = $_.TimeCreated; EventId = $_.Id; Account = $acct; SourceIp = $ip; LogonType = $lt }
+                $lid = if ($msg -match 'Logon ID:\s+(0x[0-9A-Fa-f]+)') { $Matches[1] } else { '' }
+                [pscustomobject]@{ Time = $_.TimeCreated; EventId = $_.Id; Account = $acct; SourceIp = $ip; LogonType = $lt; LogonId = $lid }
             })
             Save-Rows -Name 'security_auth_events' -Rows $auth
             $brute = @($auth | Where-Object { $_.EventId -eq 4625 } | Group-Object SourceIp |
@@ -1991,7 +2005,7 @@ $script:Modules = @(
                 ForEach-Object { [pscustomobject]@{ AccountSource = $_.Name; Count = $_.Count } })
             Save-Rows -Name 'security_auth_summary' -Rows $sum
             # v2.20 structured parses (fields need audit policy: 4688 cmdline needs "Include Command Line")
-            $procEv = Get-EventDataRows -LogName 'Security' -Id @(4688) -Start $start -Cap 4000 -Fields ([ordered]@{ Account = 'SubjectUserName'; NewProcess = 'NewProcessName'; CommandLine = 'CommandLine'; ParentProcess = 'ParentProcessName' })
+            $procEv = Get-EventDataRows -LogName 'Security' -Id @(4688) -Start $start -Cap 4000 -Fields ([ordered]@{ Account = 'SubjectUserName'; LogonId = 'SubjectLogonId'; NewProcess = 'NewProcessName'; CommandLine = 'CommandLine'; ParentProcess = 'ParentProcessName' })
             Save-Rows -Name 'security_proc_events' -Rows $procEv
             if ($procEv.Count -gt 0) { Write-CaseLog "    4688 process creations: $($procEv.Count) (empty CommandLine = cmdline audit off)" 'Gray' }
             $taskEv = Get-EventDataRows -LogName 'Security' -Id @(4698) -Start $start -Cap 500 -Fields ([ordered]@{ Account = 'SubjectUserName'; TaskName = 'TaskName'; TaskContent = 'TaskContent' })
@@ -2003,7 +2017,7 @@ $script:Modules = @(
             }
             Save-Rows -Name 'security_task_install' -Rows $taskEv
             if ($taskEv.Count -gt 0) { Write-CaseLog "    4698 scheduled task installs: $($taskEv.Count)" 'Gray' }
-            $shareEv = Get-EventDataRows -LogName 'Security' -Id @(5140, 5145) -Start $start -Cap 8000 -Fields ([ordered]@{ Account = 'SubjectUserName'; ShareName = 'ShareName'; RelativeTargetName = 'RelativeTargetName'; SourceIp = 'IpAddress'; AccessList = 'AccessList' })
+            $shareEv = Get-EventDataRows -LogName 'Security' -Id @(5140, 5145) -Start $start -Cap 8000 -Fields ([ordered]@{ Account = 'SubjectUserName'; LogonId = 'SubjectUserLogonId'; ShareName = 'ShareName'; RelativeTargetName = 'RelativeTargetName'; SourceIp = 'IpAddress'; AccessList = 'AccessList' })
             Save-Rows -Name 'security_share_access' -Rows $shareEv
             if ($shareEv.Count -ge 8000) { Write-CaseLog "    share access: capped at 8000 rows - wide file-share activity (file server?)" 'DarkGray' }
             Export-Evtx -LogName 'Security' -FileName 'Security.evtx'
@@ -2312,6 +2326,25 @@ $script:Modules = @(
                 Write-CaseLog "    beaconing: no periodic outbound patterns detected in Sysmon network/DNS events" 'Gray'
             }
         } }
+    [pscustomobject]@{ Id = '4.9'; Cat = 'LOGS'; Name = 'Kerberos + directory events (DC: 4768/4769/4771/4776, 4662 DCSync, 5136 changes)'; Default = $false; Quick = $false;
+        Run = {
+            $start = Get-LogStart
+            $ker = @()
+            $ker += Get-EventDataRows -LogName 'Security' -Id @(4768) -Start $start -Cap 3000 -Fields ([ordered]@{ Account = 'TargetUserName'; Service = 'ServiceName'; IpAddress = 'IpAddress'; PreAuth = 'PreAuthType'; Status = 'Status' })
+            $ker += Get-EventDataRows -LogName 'Security' -Id @(4769) -Start $start -Cap 3000 -Fields ([ordered]@{ Account = 'TargetUserName'; Service = 'ServiceName'; IpAddress = 'IpAddress'; TicketEnc = 'TicketEncryptionType'; Status = 'Status' })
+            $ker += Get-EventDataRows -LogName 'Security' -Id @(4771) -Start $start -Cap 2000 -Fields ([ordered]@{ Account = 'TargetUserName'; IpAddress = 'IpAddress'; Status = 'Status' })
+            $ker += Get-EventDataRows -LogName 'Security' -Id @(4776) -Start $start -Cap 2000 -Fields ([ordered]@{ Account = 'TargetUserName'; Workstation = 'WorkstationName' })
+            Save-Rows -Name 'security_kerberos' -Rows $ker
+            $ds = @()
+            $ds += Get-EventDataRows -LogName 'Security' -Id @(4662) -Start $start -Cap 3000 -Fields ([ordered]@{ Account = 'SubjectUserName'; Object = 'ObjectName'; OpType = 'OperationType'; Properties = 'Properties' })
+            $ds += Get-EventDataRows -LogName 'Security' -Id @(5136) -Start $start -Cap 2000 -Fields ([ordered]@{ Account = 'SubjectUserName'; ObjectDN = 'ObjectDN'; OpType = 'OperationType'; Attribute = 'AttributeLDAPDisplayName'; Value = 'AttributeValue' })
+            Save-Rows -Name 'security_ds_access' -Rows $ds
+            if ($ker.Count -eq 0 -and $ds.Count -eq 0) {
+                Write-CaseLog "    no Kerberos/DS events - not a DC, or 'Audit Directory Service Access' audit policy off" 'DarkGray'
+            } else {
+                Write-CaseLog "    Kerberos events: $($ker.Count), directory-service events: $($ds.Count)" 'Gray'
+            }
+        } }
     [pscustomobject]@{ Id = '5.1'; Cat = 'ARTIFACTS'; Name = 'Prefetch files'; Default = $true; Quick = $false;
         Run = {
             $pf = Join-Path $env:SystemRoot 'Prefetch'
@@ -2564,7 +2597,7 @@ $script:Modules = @(
             $start = Get-LogStart
             $ev = Get-FilteredEvents -LogName 'Microsoft-Windows-Windows Defender/Operational' -Ids @(1116, 1117, 5001, 5007) -Start $start -MaxMsg 500
             Save-Rows -Name 'defender_events' -Rows $ev
-            $dconf = @($ev | Where-Object { $_.Id -in @(5001, 5007) } | ForEach-Object {
+            $dconf = @($ev | Where-Object { @(5001, 5007) -contains $_.Id } | ForEach-Object {
                 [pscustomobject]@{ Time = $_.TimeCreated; EventId = $_.Id; Detail = ("$($_.Message)" -replace '\s+', ' ').Trim() }
             })
             Save-Rows -Name 'defender_config_events' -Rows $dconf
@@ -3141,7 +3174,7 @@ public class OphiraDump {
                 foreach ($sid in (Get-ChildItem $base -ErrorAction SilentlyContinue)) {
                     $t = $sid.LastWriteTime
                     foreach ($v in (Get-ItemProperty -LiteralPath $sid.PSPath -ErrorAction SilentlyContinue).PSObject.Properties) {
-                        if ($v.Name -in @('Version', 'SequenceNumber') -or $v.Name -match '^PS') { continue }
+                        if (@('Version', 'SequenceNumber') -contains $v.Name -or $v.Name -match '^PS') { continue }
                         if ("$($v.Value)" -and "$($v.Value)" -notmatch '^(Version|SequenceNumber)$') {
                             $bam += [pscustomobject]@{ Source = $svc.ToUpper(); Sid = $sid.PSChildName; Executable = "$($v.Value)"; LastWrite = $t }
                         }
@@ -3198,6 +3231,54 @@ public class OphiraDump {
                 $mts | Copy-Item -Destination $d -Force -ErrorAction SilentlyContinue
                 Save-Rows -Name 'ual_files' -Rows @($mts | Select-Object Name, Length, LastWriteTime)
                 Write-CaseLog "    UAL: $($mts.Count) .mts file(s) copied to raw\ual (ESE - analyst-side parse)" 'Gray'
+            }
+        } }
+    [pscustomobject]@{ Id = '8.12'; Cat = 'CONTEXT'; Name = 'Web server artifacts (IIS/HTTPERR logs raw + W3C parse, app pool config)'; Default = $false; Quick = $false;
+        Run = {
+            $copied = 0
+            foreach ($src in @(@('web\iis', "$env:SystemDrive\inetpub\logs\LogFiles"), @('web\httperr', "$env:SystemRoot\System32\LogFiles\HTTPERR"))) {
+                if (-not (Test-Path $src[1])) { continue }
+                $d = Join-Path $RawDir $src[0]
+                if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+                $logs = @(Get-ChildItem -LiteralPath $src[1] -Filter '*.log' -File -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 20)
+                foreach ($f in $logs) { Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $d $f.Name) -Force -ErrorAction SilentlyContinue; $copied++ }
+            }
+            $ahc = Join-Path $env:SystemRoot 'System32\inetsrv\config\applicationHost.config'
+            if (Test-Path $ahc) {
+                $d = Join-Path $RawDir 'web'
+                if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+                Copy-Item -LiteralPath $ahc -Destination (Join-Path $d 'applicationHost.config') -Force -ErrorAction SilentlyContinue
+                $copied++
+            }
+            $req = Get-IisW3cRows -Path "$env:SystemDrive\inetpub\logs\LogFiles" -Cap 10000
+            $norm = @($req | Where-Object { "$($_.'cs-method')" } | ForEach-Object {
+                [pscustomobject]@{
+                    Time = ("$($_.date) $($_.time)").Trim(); Method = "$($_.'cs-method')"; Uri = "$($_.'cs-uri-stem')"
+                    Query = "$($_.'cs-uri-query')"; Status = "$($_.'sc-status')"; ClientIp = "$($_.'c-ip')"; UserAgent = "$($_.'cs(User-Agent)')"
+                }
+            })
+            Save-Rows -Name 'iis_requests' -Rows $norm
+            $anom = New-Object System.Collections.Generic.List[object]
+            foreach ($g in (@($norm | Where-Object { $_.Status -eq '500' } | Group-Object ClientIp | Where-Object { $_.Count -ge 10 }))) {
+                $null = $anom.Add([pscustomobject]@{ Kind = 'server-errors'; Detail = "$($g.Count) x HTTP 500 from $($g.Name)"; Sample = ((@($g.Group | Select-Object -First 3 | ForEach-Object { $_.Uri })) -join ' | ') })
+            }
+            foreach ($r in (@($norm | Where-Object { $_.Uri -match '(?i)(\.\./|%2e%2e|%00|/cmd\.|webshell|\.jsp;|eval\()' }) | Select-Object -First 20)) {
+                $null = $anom.Add([pscustomobject]@{ Kind = 'suspicious-uri'; Detail = "$($_.Uri) (status $($_.Status))"; Sample = "query=$($_.Query) ip=$($_.ClientIp) ua=$($_.UserAgent)" })
+            }
+            foreach ($r in (@($norm | Where-Object { $_.Method -eq 'POST' -and $_.Status -match '^2' -and $_.Uri -match '(?i)(upload|filemanager|editor|import)' }) | Select-Object -First 20)) {
+                $null = $anom.Add([pscustomobject]@{ Kind = 'post-to-upload-path'; Detail = "$($_.Uri) (status $($_.Status))"; Sample = "ip=$($_.ClientIp) ua=$($_.UserAgent)" })
+            }
+            $noUa = @($norm | Where-Object { -not $_.UserAgent -and $_.Method -eq 'POST' })
+            if ($noUa.Count -ge 10) {
+                $null = $anom.Add([pscustomobject]@{ Kind = 'headless-posts'; Detail = "$($noUa.Count) POST requests with no User-Agent"; Sample = ((@($noUa | Select-Object -First 3 | ForEach-Object { $_.Uri })) -join ' | ') })
+            }
+            Save-Rows -Name 'iis_anomalies' -Rows $anom.ToArray()
+            if ($norm.Count -gt 0) {
+                Write-CaseLog "    IIS: $($norm.Count) parsed request(s), $($anom.Count) anomaly row(s), $copied log file(s) -> raw\web\" 'Gray'
+            } elseif ($copied -gt 0) {
+                Write-CaseLog "    IIS: $copied log file(s) copied raw (no W3C fields parsed - check format)" 'Gray'
+            } else {
+                Write-CaseLog "    IIS: no logs found (no IIS role or logs elsewhere)" 'DarkGray'
             }
         } }
 )
@@ -3257,6 +3338,28 @@ function Get-EventDataRows {
     return $rows.ToArray()
 }
 
+function Get-IisW3cRows {
+    # Minimal IIS W3C log parser: fields from the #Fields directive, newest files first, rows capped.
+    param([string]$Path, [int]$Cap = 10000)
+    $rows = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($f in @(Get-ChildItem -LiteralPath $Path -Filter '*.log' -File -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 10)) {
+            $fields = $null
+            foreach ($line in (Get-Content -LiteralPath $f.FullName -ErrorAction SilentlyContinue)) {
+                if ($line -match '^#Fields:\s*(.+)$') { $fields = ($Matches[1] -split '\s+'); continue }
+                if (-not $fields -or $line -match '^#') { continue }
+                $p = $line -split ' '
+                if ($p.Count -lt $fields.Count) { continue }
+                $o = [ordered]@{ }
+                for ($i = 0; $i -lt $fields.Count; $i++) { $o[$fields[$i]] = $p[$i] }
+                $null = $rows.Add([pscustomobject]$o)
+                if ($rows.Count -ge $Cap) { return $rows.ToArray() }
+            }
+        }
+    } catch { }
+    return $rows.ToArray()
+}
+
 function Get-PresetSelection {
     param([string]$P)
     $sel = @{}
@@ -3266,11 +3369,19 @@ function Get-PresetSelection {
         'Quick' { foreach ($m in $script:Modules) { $sel[$m.Id] = [bool]$m.Quick } }
         'Standard' { foreach ($m in $script:Modules) { $sel[$m.Id] = [bool]$m.Default } }
         'Full' {
-            foreach ($m in $script:Modules) { $sel[$m.Id] = ($m.Id -notin @('3.2', '7.1')) }
+            foreach ($m in $script:Modules) { $sel[$m.Id] = (@('3.2', '7.1') -notcontains $m.Id) }
         }
         default { foreach ($m in $script:Modules) { $sel[$m.Id] = [bool]$m.Default } }
     }
     if ($IncludeMemory) { $sel['7.1'] = $true }
+    # v2.21 role packs: explicit DC/WebServer presets force role modules on; Standard/Full auto-enable on the detected role
+    $rolePack = ''
+    if ($P -eq 'DC') { $rolePack = '4.9' }
+    elseif ($P -eq 'WebServer') { $rolePack = '8.12' }
+    elseif (($P -eq 'Standard' -or $P -eq 'Full') -and $script:HostRole -ne 'Workstation') {
+        $rolePack = if ($script:HostRole -eq 'DC') { '4.9' } else { '8.12' }
+    }
+    if ($rolePack -and $sel.ContainsKey($rolePack)) { $sel[$rolePack] = $true }
     return $sel
 }
 
@@ -3284,7 +3395,7 @@ function Show-Menu {
     while ($true) {
         Clear-Host
         Write-Host "================================================================" -ForegroundColor Cyan
-        Write-Host "  OPHIRA v$ScriptVersion   |   $Computer   |   Log range: $range" -ForegroundColor Cyan
+        Write-Host "  OPHIRA v$ScriptVersion   |   $Computer   |   Role: $script:HostRole   |   Log range: $range" -ForegroundColor Cyan
         Write-Host "================================================================" -ForegroundColor Cyan
         $n = 0
         foreach ($cat in $cats) {
@@ -3293,7 +3404,7 @@ function Show-Menu {
             foreach ($m in ($script:Modules | Where-Object { $_.Cat -eq $cat })) {
                 $mark = if ($Selection[$m.Id]) { '[X]' } else { '[ ]' }
                 $color = if ($Selection[$m.Id]) { 'Yellow' } else { 'Gray' }
-                $note = if ($m.Id -in @('3.2')) { '  <-- ACTIVE traffic' } elseif ($m.Id -eq '7.1') { '  <-- GB-size' } else { '' }
+                $note = if (@('3.2') -contains $m.Id) { '  <-- ACTIVE traffic' } elseif ($m.Id -eq '7.1') { '  <-- GB-size' } else { '' }
                 Write-Host ("   $mark {0,-4} {1}{2}" -f $m.Id, $m.Name, $note) -ForegroundColor $color
             }
         }
@@ -3336,8 +3447,8 @@ function Invoke-SelectedModules {
     $phaseOf = {
         param($m)
         if ($m.Cat -eq 'VOLATILE') { 'A' }
-        elseif ($m.Id -in @('7.1', '7.2', '4.7', '4.8')) { 'CI' }
-        elseif ($m.Id -in @('4.6', '5.4', '5.5', '8.4')) { 'C' }
+        elseif (@('7.1', '7.2', '4.7', '4.8') -contains $m.Id) { 'CI' }
+        elseif (@('4.6', '5.4', '5.5', '8.4') -contains $m.Id) { 'C' }
         else { 'B' }
     }
     $runInline = {
@@ -4009,7 +4120,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
             $sevCls = switch -Regex ("$($h2.Severity)") { 'high' { 'crit'; break } 'medium' { 'med'; break } default { 'info' } }
             $null = $sb.AppendLine("<tr><td class='$sevCls'><b>$(ConvertTo-HtmlEsc $h2.Severity)</b></td><td>$(ConvertTo-HtmlEsc $h2.Rule)</td><td>$(ConvertTo-HtmlEsc $h2.Attck)</td><td class='path'>$(ConvertTo-HtmlEsc $h2.Entity)</td><td class='path'>$(ConvertTo-HtmlEsc $h2.Evidence)</td></tr>")
         }
-        $null = $sb.AppendLine("</table><div class='meta'>High-severity hunt rules are high-precision (version-info renames, side-loaded system DLLs, downloaded-then-executed, LSASS access, Office-to-interpreter chains, proxy-execution LOLBin command lines, admin-share staging, Defender tamper) and contribute to the verdict. Medium rules (UAC bypass pattern, discovery storms, timestomping, USB/account/RDP anomalies) are report-only leads. Verify against the cited raw evidence. Source: csv\hunt_findings.csv</div>")
+        $null = $sb.AppendLine("</table><div class='meta'>High-severity hunt rules are high-precision (version-info renames, side-loaded system DLLs, downloaded-then-executed, LSASS access, Office-to-interpreter chains, proxy-execution LOLBin command lines, admin-share staging, Defender tamper, DCSync, password spray, webshell chains) and contribute to the verdict. Medium rules (UAC bypass pattern, discovery storms, timestomping, Kerberoasting/AS-REP patterns, web anomalies, USB/account/RDP anomalies) are report-only leads. Verify against the cited raw evidence. Source: csv\hunt_findings.csv</div>")
     } else {
         $null = $sb.AppendLine("<div class='meta'>No hunt findings - all techniques clean.</div>")
     }
@@ -4075,6 +4186,23 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
             }
             $null = $sb.AppendLine("</table><div class='meta'>SRUM records ~30 days of per-application network/resource usage. High sustained upload from a user-path binary = exfiltration candidate. Source: csv\srum_usage.csv</div>")
         }
+    }
+    # v2.21: process lineage + session-attributed activity
+    $chains = @(Import-CaseCsv 'process_chains')
+    if ($chains.Count -gt 0) {
+        $null = $sb.AppendLine("<h3>Process lineage (how flagged binaries got there)</h3><table><tr><th>Flagged binary</th><th>Hops</th><th>Ancestry chain</th></tr>")
+        foreach ($c in ($chains | Sort-Object { [int]"$($_.Steps)" } -Descending | Select-Object -First 15)) {
+            $null = $sb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $c.Entity)</td><td>$($c.Steps)</td><td class='path'><b>$(ConvertTo-HtmlEsc $c.Chain)</b>$(if ("$($c.Evidence)") { "<br>$(ConvertTo-HtmlEsc $c.Evidence)" })</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>Rebuilt from 4688 parent-child + live PPID map. A user-path binary whose ancestry runs through office/browser/interpreter processes is a phishing/exploit story; ancestry from services.exe with no matching install event is suspicious. Source: csv\process_chains.csv</div>")
+    }
+    $sessAct = @(Import-CaseCsv 'session_activity')
+    if ($sessAct.Count -gt 0) {
+        $null = $sb.AppendLine("<h3>Attributed activity (which session did what)</h3><table><tr><th>Time</th><th>Session account</th><th>Source IP</th><th>Type</th><th>Logon</th><th>Activity</th></tr>")
+        foreach ($s2 in ($sessAct | Select-Object -First 30)) {
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $s2.Time)</td><td><b>$(ConvertTo-HtmlEsc $s2.SessionAccount)</b></td><td>$(ConvertTo-HtmlEsc $s2.SourceIp)</td><td>$(ConvertTo-HtmlEsc $s2.Activity)</td><td>$(ConvertTo-HtmlEsc $s2.LogonType)</td><td class='path'>$(ConvertTo-HtmlEsc $s2.Detail)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>4624 LogonId joined to 4688/5145 SubjectLogonId: even service/shared accounts are tied back to the interactive/RDP/network session that created them. Source: csv\session_activity.csv</div>")
     }
 
     # ---------- host snapshot ----------
@@ -4266,7 +4394,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'srum_usage'                      = 'SRUM: per-app resource/network usage over weeks'
         'logging_gaps'                    = 'Log clear/stop events + evtx coverage gaps'
         'parse_needed'                    = 'Artifacts not finished on the endpoint + exactly how to finish them (-Mode Parse)'
-        'hunt_findings'                   = 'Technique-based hunt detections (renamed binaries, side-loads, download-exec, LSASS access, Office chains, proxy-exec, share staging, UAC bypass, discovery storms, Defender tamper, timestomping)'
+        'hunt_findings'                   = 'Technique-based hunt detections (renamed binaries, side-loads, download-exec, LSASS access, Office chains, proxy-exec, share staging, UAC bypass, discovery storms, Defender tamper, timestomping, DCSync, Kerberoasting, spray, webshells)'
         'security_proc_events'            = '4688 process creations with parent + command line (needs cmdline audit) - Office chains, proxy-exec, discovery storms'
         'security_task_install'           = '4698 scheduled task installs with the task action - remote/atexec-style persistence'
         'security_share_access'           = '5140/5145 share access incl. admin-share writes - lateral movement + staging data source'
@@ -4274,6 +4402,12 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'sysmon_registry'                 = 'Sysmon EID 13 RegistryEvent - UAC bypass / persistence data source'
         'sysmon_file_time'                = 'Sysmon EID 2 file creation-time changes - timestomping evidence'
         'defender_config_events'          = 'Defender 5001/5007 - real-time protection disabled / exclusion changes (tamper)'
+        'security_kerberos'               = 'Kerberos events (DC: 4768/4769/4771/4776) - Kerberoasting/spray/AS-REP data source'
+        'security_ds_access'              = 'Directory-service access (DC: 4662/5136) - DCSync + AD object changes'
+        'iis_requests'                    = 'Parsed IIS W3C requests (web role) - what hit this server'
+        'iis_anomalies'                   = 'IIS anomalies: error bursts, suspicious URIs, POSTs to upload paths, headless POSTs'
+        'session_activity'                = '4624 LogonId x 4688/5145 joins - which logon session (human/IP) did what'
+        'process_chains'                  = 'Ancestry chains for flagged binaries (4688 lineage + live PPID) - how it got there'
         'memory_live_scan'                = 'Flagged-process minidumps + YARA hits found in live memory'
         'sysmon_image_load'               = 'Sysmon DLL loads (EID 7) - side-load data source'
         'bam_lastexec'                    = 'BAM/DAM last-execution per user (survives Prefetch deletion)'
@@ -4310,7 +4444,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
 }
 
 function New-SuperTimeline {
-    $rows = [System.Collections.Generic.List[object]]::new()
+    $rows = New-Object System.Collections.Generic.List[object]
     foreach ($name in @('security_events', 'powershell_events', 'sysmon_events', 'system_events', 'defender_events', 'rdp_localsession', 'rdp_connections')) {
         foreach ($r in (Import-CaseCsv $name)) {
             if ($r.PSObject.Properties['TimeCreated']) {
@@ -4427,7 +4561,7 @@ function New-EntityCorrelation {
     }
     $binFromRow = {
         param($r)
-        foreach ($pn in @('Binary', 'Image', 'ProcessPath', 'Process', 'Executable', 'Application', 'AppPath', 'App')) {
+        foreach ($pn in @('Binary', 'Image', 'ProcessPath', 'Process', 'Executable', 'Application', 'AppPath', 'App', 'NewProcess')) {
             $p2 = $r.PSObject.Properties[$pn]
             if ($p2 -and "$($p2.Value)") { return (& $binNew $p2.Value) }
         }
@@ -4484,13 +4618,22 @@ function New-EntityCorrelation {
     foreach ($r in ((& $rowsOf 'hayabusa_timeline') | Where-Object { (Get-LvlRank "$($_.Level)") -ge 3 })) {
         if ("$($r.Details)" -match '(?i)([a-z0-9_\-]+\.(exe|dll|ps1|js|vbs|hta))') { & $binAdd (& $binNew $Matches[1]) 'sigma' "[$($r.Level)] $($r.RuleTitle)" "$($r.Timestamp)" }
     }
+    # v2.21 structured telemetry joins: 4688 execution, admin-share staging, IIS anomalies
+    foreach ($r in (& $rowsOf 'security_proc_events')) { & $binAdd (& $binFromRow $r) '4688-exec' "child of $($r.ParentProcess)" "$($r.Time)" }
+    foreach ($r in (& $rowsOf 'security_share_access')) {
+        $tn = "$($r.RelativeTargetName)"
+        if ($tn -match '\.(exe|dll|ps1|bat|js|vbs|hta|msi)$') { & $binAdd (& $binNew $tn) 'share-staging' "$("$($r.ShareName)" -replace '^[\*\\\s]+', '') by $($r.Account) from $($r.SourceIp)" '' }
+    }
+    foreach ($r in (& $rowsOf 'iis_anomalies')) {
+        if ("$($r.Sample)" -match '(?i)([a-z]:\\[^\s"|]+\.(exe|dll|ps1|aspx|jsp|ashx))') { & $binAdd (& $binNew $Matches[1]) 'web-anomaly' "[$($r.Kind)] $($r.Detail)" '' }
+    }
 
     # ---------- accounts ----------
     $accts = @{}
     $acctGet = {
         param([string]$name)
         $a2 = ("$name").Trim()
-        if (-not $a2 -or $a2 -match '^(-|\$|DWM-|UMFD-)$' -or $a2 -in @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE', 'ANONYMOUS LOGON')) { return $null }
+        if (-not $a2 -or $a2 -match '^(-|\$|DWM-|UMFD-)$' -or @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE', 'ANONYMOUS LOGON') -contains $a2) { return $null }
         $lk = $a2.ToLower()
         if (-not $accts.ContainsKey($lk)) {
             $accts[$lk] = [pscustomobject]@{
@@ -4540,6 +4683,23 @@ function New-EntityCorrelation {
     foreach ($r in (& $rowsOf 'powershell_console_history')) {
         $a2 = & $acctFromRow $r
         if ($a2) { $a2.ConsoleKB = [math]::Round($a2.ConsoleKB + [double]"$($r.KB)", 1); $a2.Evidence.Add("console history: $($r.KB) KB (raw\useractivity\$($a2.Account))") | Out-Null }
+    }
+    # v2.21: Kerberos + directory-service + session-attributed activity evidence
+    foreach ($r in (& $rowsOf 'security_kerberos')) {
+        $a2 = & $acctFromRow $r
+        if (-not $a2 -or $a2.Evidence.Count -ge 14) { continue }
+        if ("$($r.EventId)" -eq '4769') { $null = $a2.Evidence.Add("kerberos TGS for $($r.Service) from $($r.IpAddress) (enc $($r.TicketEnc))") }
+        elseif ("$($r.EventId)" -eq '4771') { $null = $a2.Evidence.Add("kerberos pre-auth FAILED from $($r.IpAddress)") }
+    }
+    foreach ($r in (& $rowsOf 'security_ds_access')) {
+        $a2 = & $acctFromRow $r
+        if ($a2 -and $a2.Evidence.Count -lt 14 -and "$($r.Properties)" -match '(?i)e3514235|1131f6a') { $null = $a2.Evidence.Add("directory replication access (4662 Get-Changes) on $($r.Object)") }
+    }
+    foreach ($r in (& $rowsOf 'session_activity')) {
+        $pn = $r.PSObject.Properties['SessionAccount']
+        if (-not $pn -or -not "$($pn.Value)") { continue }
+        $a2 = & $acctGet "$($pn.Value)"
+        if ($a2 -and $a2.Evidence.Count -lt 14) { $null = $a2.Evidence.Add("session activity [$($r.Activity)]: $($r.Detail)$(if ("$($r.SourceIp)") { " from $($r.SourceIp)" })") }
     }
 
     # ---------- remote endpoints ----------
@@ -4619,6 +4779,109 @@ function New-EntityCorrelation {
 
     $multi = @($binRows | Where-Object { $_.CatCount -ge 2 }).Count
     Write-CaseLog "    entity correlation: $($binRows.Count) binaries ($multi multi-source), $($acctRows.Count) accounts, $($remRows.Count) remotes -> csv\entities_*.csv" 'DarkGray'
+}
+
+function New-SessionAttribution {
+    # v2.21: join 4624 logon sessions (LogonId -> account/source IP/logon type) to 4688/5140/5145
+    # SubjectLogonId - attributes process creations and share writes to the human session that made them.
+    $sess = @{}
+    foreach ($r in ((Import-CaseCsv 'security_auth_events') | Where-Object { "$($_.EventId)" -eq '4624' -and "$($_.LogonId)" })) {
+        $sess["$($r.LogonId)"] = $r
+    }
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($r in (Import-CaseCsv 'security_proc_events')) {
+        $s = $sess["$($r.LogonId)"]
+        if (-not $s) { continue }
+        $cmd = "$($r.CommandLine)"; if ($cmd.Length -gt 160) { $cmd = $cmd.Substring(0, 160) + '...' }
+        $null = $out.Add([pscustomobject]@{ Time = $r.Time; SessionAccount = "$($s.Account)"; SourceIp = "$($s.SourceIp)"; LogonType = "$($s.LogonType)"; Activity = 'process'; Detail = "$($r.NewProcess) $cmd".Trim() })
+    }
+    foreach ($r in (Import-CaseCsv 'security_share_access')) {
+        $s = $sess["$($r.LogonId)"]
+        if (-not $s) { continue }
+        $sh = "$($r.ShareName)" -replace '^[\*\\\s]+', ''
+        $srcIp = "$($r.SourceIp)"
+        if (-not $srcIp -or $srcIp -eq '-') { $srcIp = "$($s.SourceIp)" }
+        $null = $out.Add([pscustomobject]@{ Time = $r.Time; SessionAccount = "$($s.Account)"; SourceIp = $srcIp; LogonType = "$($s.LogonType)"; Activity = 'share'; Detail = "$sh -> $($r.RelativeTargetName)" })
+    }
+    $rows = @($out.ToArray() | Sort-Object Time)
+    Save-Rows -Name 'session_activity' -Rows $rows
+    $n = $rows.Count
+    if ($n -gt 0) {
+        Write-CaseLog "    session attribution: $n activity row(s) joined to logon sessions (4624 LogonId x 4688/5145) -> csv\session_activity.csv" 'Gray'
+    } else {
+        Write-CaseLog "    session attribution: no joins (4624 without LogonId in this case, or no 4688/5145 activity)" 'DarkGray'
+    }
+}
+
+function New-ProcessChains {
+    # v2.21: reconstruct parent->child ancestry for flagged processes from 4688 lineage + live PPID map.
+    # Chains answer "how did this get here": explorer.exe -> winword.exe -> powershell.exe -> beacon.exe.
+    $edges = @{}
+    foreach ($r in (Import-CaseCsv 'security_proc_events')) {
+        $c = ''; $p = ''
+        try { $c = (Split-Path "$($r.NewProcess)" -Leaf).ToLower() } catch { }
+        try { $p = (Split-Path "$($r.ParentProcess)" -Leaf).ToLower() } catch { }
+        if (-not $c -or -not $p -or $c -eq $p) { continue }
+        if (-not $edges.ContainsKey($c)) { $edges[$c] = New-Object System.Collections.Generic.List[object] }
+        $null = $edges[$c].Add([pscustomobject]@{ Parent = $p; ParentPath = "$($r.ParentProcess)"; Time = "$($r.Time)"; Cmd = "$($r.CommandLine)"; Src = '4688' })
+    }
+    $pidMap = @{}
+    $live = @(Import-CaseCsv 'processes')
+    foreach ($r in $live) { if ("$($r.PID)") { $pidMap["$($r.PID)"] = $r } }
+    foreach ($r in $live) {
+        $c = ''
+        try { $c = (Split-Path "$($r.Path)" -Leaf).ToLower() } catch { }
+        if (-not $c -or -not "$($r.PPID)" -or -not $pidMap.ContainsKey("$($r.PPID)")) { continue }
+        $par = $pidMap["$($r.PPID)"]
+        $p = ''
+        try { $p = (Split-Path "$($par.Path)" -Leaf).ToLower() } catch { }
+        if (-not $p -or $c -eq $p) { continue }
+        if (-not $edges.ContainsKey($c)) { $edges[$c] = New-Object System.Collections.Generic.List[object] }
+        $null = $edges[$c].Add([pscustomobject]@{ Parent = $p; ParentPath = "$($par.Path)"; Time = ''; Cmd = "$($par.Path)"; Src = 'live' })
+    }
+    if ($edges.Count -eq 0) { Write-CaseLog '    process lineage: no parent-child edges (4688 off, no live map)' 'DarkGray'; return }
+
+    $flagged = New-Object System.Collections.Generic.List[string]
+    foreach ($r in ((Import-CaseCsv 'flash_process_scored') | Where-Object { "$($_.Verdict)" -match '^(HIGH|MEDIUM)$' -and "$($_.Path)" })) {
+        $null = $flagged.Add("$($r.Path)")
+    }
+    foreach ($r in ((Import-CaseCsv 'hunt_findings') | Where-Object { "$($_.Severity)" -eq 'high' })) {
+        $e = "$($r.Entity)"
+        if ($e -match '^[a-z]:\\' -or $e -match '\.(exe|dll|ps1|bat|js|vbs)$') { $null = $flagged.Add($e) }
+    }
+    $out = New-Object System.Collections.Generic.List[object]
+    $seenChains = @{}
+    foreach ($f in (@($flagged | Select-Object -Unique) | Select-Object -First 40)) {
+        $leaf = ''
+        try { $leaf = (Split-Path $f -Leaf).ToLower() } catch { }
+        if (-not $leaf -or -not $edges.ContainsKey($leaf)) { continue }
+        # walk ancestors, widest evidence per hop, cap depth 8
+        $steps = New-Object System.Collections.Generic.List[string]
+        $notes = New-Object System.Collections.Generic.List[string]
+        $cur = $leaf
+        $depth = 0
+        $visited = @{}
+        while ($edges.ContainsKey($cur) -and $depth -lt 8) {
+            if ($visited.ContainsKey($cur)) { break }
+            $visited[$cur] = $true
+            $e = $edges[$cur][0]
+            $null = $steps.Insert(0, $e.Parent)
+            if ("$($e.Cmd)" -or "$($e.Time)") { $null = $notes.Insert(0, "$($e.Parent): $(if ("$($e.Cmd)") { "$($e.Cmd)" } else { '?' })$(if ("$($e.Time)") { " @ $($e.Time)" })") }
+            $cur = $e.Parent
+            $depth++
+        }
+        $null = $steps.Add($leaf)
+        $chain = $steps -join ' -> '
+        if ($steps.Count -lt 2 -or $seenChains.ContainsKey($chain)) { continue }
+        $seenChains[$chain] = $true
+        $null = $out.Add([pscustomobject]@{ Entity = $f; Steps = $steps.Count; Chain = $chain; Evidence = (($notes | Select-Object -First 8) -join ' | ') })
+    }
+    Save-Rows -Name 'process_chains' -Rows $out.ToArray()
+    if ($out.Count -gt 0) {
+        Write-CaseLog "    process lineage: $($out.Count) ancestry chain(s) for flagged binaries -> csv\process_chains.csv" 'Gray'
+    } else {
+        Write-CaseLog '    process lineage: flagged binaries have no parent edges in this case' 'DarkGray'
+    }
 }
 
 function New-HuntFindings {
@@ -4740,7 +5003,7 @@ function New-HuntFindings {
     # ---------- R6: account created + privileged group change in window (report-only) ----------
     $auth = Import-CaseCsv 'security_auth_events'
     $created = @($auth | Where-Object { "$($_.EventId)" -eq '4720' } | ForEach-Object { "$($_.Account)" } | Sort-Object -Unique)
-    $grpAdds = @($auth | Where-Object { "$($_.EventId)" -in @('4728', '4732', '4756') })
+    $grpAdds = @($auth | Where-Object { @('4728', '4732', '4756') -contains "$($_.EventId)" })
     if ($created.Count -gt 0 -and $grpAdds.Count -gt 0) {
         & $find 'Account lifecycle - created + group change' 'info' (($created | Select-Object -First 5) -join ', ') "$($created.Count) account creation(s) + $($grpAdds.Count) privileged-group change(s) in window" 'T1136/T1098'
     }
@@ -4868,6 +5131,67 @@ function New-HuntFindings {
         & $find 'File creation time changed (timestomping candidate)' 'medium' "$($r.TargetFilename)" "by $($r.Image): $($r.PreviousCreationUtcTime) -> $($r.CreationUtcTime)" 'T1070.006'
     }
 
+    # ---------- R16: DCSync - replication Get-Changes by a user account (4662) ----------
+    $dcSeen = @{}
+    foreach ($r in (@(Import-CaseCsv 'security_ds_access') | Where-Object { "$($_.Properties)" -match '(?i)e3514235-4b06-11d1-ab04-00c04fc2dcd2|1131f6a[ad]-' -and "$($_.Account)" -notmatch '\$$' })) {
+        $a = "$($r.Account)"
+        if (-not $a -or $dcSeen.ContainsKey($a)) { continue }
+        $dcSeen[$a] = $true
+        if ($dcSeen.Count -gt 10) { break }
+        & $find 'DCSync - replication access by user account' 'high' $a "4662 Get-Changes on $($r.Object) at $($r.Time)" 'T1003.006'
+    }
+
+    # ---------- R17: Kerberoasting pattern - RC4 TGS burst per source (4769) ----------
+    $ker = @(Import-CaseCsv 'security_kerberos')
+    $tgs = @($ker | Where-Object { "$($_.EventId)" -eq '4769' -and "$($_.TicketEnc)" -eq '0x17' })
+    foreach ($g in ($tgs | Group-Object IpAddress)) {
+        $svc = @(@($g.Group | ForEach-Object { "$($_.Service)" }) | Sort-Object -Unique)
+        if ($svc.Count -ge 10) {
+            & $find 'Kerberoasting pattern - RC4 TGS burst' 'medium' "$($g.Name)" "$($g.Count) TGS requests for $($svc.Count) distinct SPNs over RC4" 'T1558.003'
+        }
+    }
+
+    # ---------- R18: AS-REP roast pattern - TGT without pre-auth (4768 PreAuthType 0) ----------
+    $asrepSeen = @{}
+    foreach ($r in (@($ker | Where-Object { "$($_.EventId)" -eq '4768' -and "$($_.PreAuth)" -eq '0' }) | Select-Object -First 5)) {
+        $a = "$($r.Account)"
+        if ($asrepSeen.ContainsKey($a)) { continue }
+        $asrepSeen[$a] = $true
+        & $find 'AS-REP roast pattern - TGT requested without pre-auth' 'medium' $a "from $($r.IpAddress) at $($r.Time)" 'T1558.004'
+    }
+
+    # ---------- R19: password spray - many distinct accounts failing from one source (4771/4625) ----------
+    $sprayFails = @()
+    $sprayFails += (@($ker | Where-Object { "$($_.EventId)" -eq '4771' }) | ForEach-Object { [pscustomobject]@{ Account = "$($_.Account)"; Ip = "$($_.IpAddress)" } })
+    $sprayFails += (@(Import-CaseCsv 'security_auth_events') | Where-Object { "$($_.EventId)" -eq '4625' } | ForEach-Object { [pscustomobject]@{ Account = "$($_.Account)"; Ip = "$($_.SourceIp)" } })
+    foreach ($g in ($sprayFails | Where-Object { $_.Ip -and $_.Ip -ne '-' -and $_.Ip -ne '::1' -and $_.Account } | Group-Object Ip)) {
+        $accts = @(@($g.Group | ForEach-Object { $_.Account }) | Sort-Object -Unique)
+        if ($accts.Count -ge 10) {
+            & $find 'Password spray - many accounts from one source' 'high' "$($g.Name)" "$($g.Count) failures across $($accts.Count) accounts: $(($accts | Select-Object -First 5) -join ', ')" 'T1110.003'
+        }
+    }
+
+    # ---------- R20: web server spawned interpreter (4688: w3wp/tomcat/httpd parent) ----------
+    $webParents = @('w3wp.exe', 'tomcat8.exe', 'tomcat9.exe', 'httpd.exe', 'nginx.exe', 'php-cgi.exe')
+    $webKids = @('cmd.exe', 'powershell.exe', 'pwsh.exe', 'wscript.exe', 'cscript.exe', 'mshta.exe', 'rundll32.exe', 'regsvr32.exe', 'certutil.exe', 'bitsadmin.exe', 'csc.exe', 'vbc.exe', 'msbuild.exe', 'curl.exe', 'net.exe')
+    $r20Seen = @{}
+    foreach ($r in (Import-CaseCsv 'security_proc_events')) {
+        $par = ''; $kid = ''
+        try { $par = (Split-Path "$($r.ParentProcess)" -Leaf).ToLower() } catch { }
+        try { $kid = (Split-Path "$($r.NewProcess)" -Leaf).ToLower() } catch { }
+        if (-not $par -or -not $kid -or $webParents -notcontains $par -or $webKids -notcontains $kid) { continue }
+        $k = "$par>$kid"
+        if ($r20Seen.ContainsKey($k)) { $r20Seen[$k]++ ; continue }
+        $r20Seen[$k] = 1
+        $cmd = "$($r.CommandLine)"; if ($cmd.Length -gt 200) { $cmd = $cmd.Substring(0, 200) + '...' }
+        & $find 'Web server spawned interpreter' 'high' "$par -> $kid" "$($r.Time): $cmd" 'T1505.003'
+    }
+
+    # ---------- R21: web traffic anomalies (report-only leads from the IIS parse) ----------
+    foreach ($r in ((@(Import-CaseCsv 'iis_anomalies') | Where-Object { @('suspicious-uri', 'post-to-upload-path', 'headless-posts') -contains $_.Kind }) | Select-Object -First 5)) {
+        & $find 'Web traffic anomaly' 'medium' "$($r.Kind)" "$($r.Detail) - $($r.Sample)" 'T1190'
+    }
+
     Save-Rows -Name 'hunt_findings' -Rows $out.ToArray()
     $hi = @($out | Where-Object { $_.Severity -eq 'high' }).Count
     if ($out.Count -gt 0) {
@@ -4883,7 +5207,7 @@ function New-LoggingGaps {
     $meanings = @{ 6005 = 'Event logging STARTED'; 6006 = 'Event logging STOPPED (shutdown)'; 104 = 'Event log CLEARED'; 1102 = 'Security audit log CLEARED' }
     foreach ($name in @('system_events', 'security_events')) {
         foreach ($r in (Import-CaseCsv $name)) {
-            if ($r.Id -in @(6005, 6006, 104, 1102)) {
+            if (@(6005, 6006, 104, 1102) -contains $r.Id) {
                 $rows += [pscustomobject]@{ Time = $r.TimeCreated; EventId = $r.Id; Meaning = $meanings[[int]$r.Id]; Source = $name; Message = $r.Message }
             }
         }
@@ -4893,12 +5217,12 @@ function New-LoggingGaps {
         $rows += [pscustomobject]@{ Time = ''; EventId = ''; Meaning = 'chronological gaps detected in evtx (see raw\analysis\evtx_gaps.txt)'; Source = 'chainsaw'; Message = '' }
     }
     Save-Rows -Name 'logging_gaps' -Rows $rows
-    $bad = @($rows | Where-Object { $_.EventId -in @(104, 1102) })
+    $bad = @($rows | Where-Object { @(104, 1102) -contains $_.EventId })
     if ($bad.Count -gt 0) { Write-CaseLog "    LOGGING GAPS: $($bad.Count) clear/down events - check csv\logging_gaps.csv" 'Red' }
 }
 
 function New-SiemExport {
-    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines = New-Object System.Collections.Generic.List[string]
     $base = @{ host = $Computer; tool = "Ophira v$ScriptVersion"; caseid = $script:CurrentCaseID }
     foreach ($p in (Import-CaseCsv 'flash_process_scored')) {
         $o = [ordered]@{}; $o['ts'] = "$($StartTime.ToString('o'))"; $o['kind'] = 'proc_verdict'; $o['host'] = $base.host; $o['name'] = $p.Name; $o['verdict'] = $p.Verdict; $o['score'] = [int]$p.Score; $o['path'] = $p.Path; $o['evidence'] = $p.Evidence; $o['caseid'] = $base.caseid
@@ -4948,7 +5272,7 @@ function New-SiemExport {
         $lines.Add(($o | ConvertTo-Json -Compress))
     }
     foreach ($h in (Import-CaseCsv 'hunt_findings')) {
-        if ("$($h.Severity)" -notin @('high', 'medium')) { continue }
+        if (@('high', 'medium') -notcontains "$($h.Severity)") { continue }
         $o = [ordered]@{}; $o['ts'] = "$($h.Found)"; $o['kind'] = 'hunt_finding'; $o['host'] = $base.host; $o['severity'] = $h.Severity; $o['rule'] = $h.Rule; $o['entity'] = $h.Entity; $o['attack'] = $h.Attck; $o['evidence'] = $h.Evidence; $o['caseid'] = $base.caseid
         $lines.Add(($o | ConvertTo-Json -Compress))
     }
@@ -5103,7 +5427,7 @@ function Get-CompromiseVerdict {
     $dnsMed = @($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
     $lolMal = @($lol | Where-Object { $_.Status -eq 'malicious' }).Count
     $hunt = Import-CaseCsv 'hunt_findings'
-    $huntHi = @($hunt | Where-Object { "$($_.Severity)" -eq 'high' -and "$($_.Rule)" -match 'Renamed LOLBin|side-load|Downloaded then executed|LSASS access|Office app spawned|proxy-execution|Admin-share staging|Defender (real-time|exclusion)' })
+    $huntHi = @($hunt | Where-Object { "$($_.Severity)" -eq 'high' -and "$($_.Rule)" -match 'Renamed LOLBin|side-load|Downloaded then executed|LSASS access|Office app spawned|proxy-execution|Admin-share staging|Defender (real-time|exclusion)|DCSync|Password spray|Web server spawned' })
     $usnBurstN = @($usnBursts).Count
     $rExt = ((@($usnBursts) | Where-Object { "$($_.RansomExt)" } | ForEach-Object { "$($_.RansomExt)" } | Sort-Object -Unique) -join ',')
     # ponytail: COM hijacks + StartupApproved excluded from the signal (per-user COM has many legit users, e.g. Teams/OneDrive); they stay report-visible
@@ -5114,7 +5438,7 @@ function Get-CompromiseVerdict {
     Add-Signal 'C2 beaconing - highly regular callbacks' 3 $beaconHi (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp):$($_.Port) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'C2 DNS beaconing - highly regular domain queries' 3 $dnsHi (($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.Domain) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'Known-malicious driver on disk (LOLDrivers)' 2 $lolMal (($lol | Where-Object { $_.Status -eq 'malicious' } | Select-Object -First 3 | ForEach-Object { "$($_.Name): $($_.Path)" }) -join '; ')
-    Add-Signal 'Hunt technique - renamed binary / side-load / download-exec / LSASS access / Office chain / proxy-exec / share staging / Defender tamper' 2 $huntHi.Count (($huntHi | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
+    Add-Signal 'Hunt technique - renamed binary / side-load / download-exec / LSASS access / Office chain / proxy-exec / share staging / Defender tamper / DCSync / spray / webshell' 2 $huntHi.Count (($huntHi | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'Ransomware-like mass file modification (USN journal)' 3 $usnBurstN ((($usnBursts | Select-Object -First 3 | ForEach-Object { "$($_.WindowStart): $($_.WriteEvents) writes / $($_.DistinctFiles) files" }) -join '; ') + $(if ($rExt) { " - RANSOM EXTENSIONS: $rExt" }))
     Add-Signal 'Uncommon persistence mechanism (IFEO/AppInit/Winlogon/netsh/LSA)' 2 $asepHotN (($asep | Where-Object { $_.Flags -match 'user-path|nondefault' -and "$($_.Category)" -notmatch 'ComHijack|StartupApproved' } | Select-Object -First 3 | ForEach-Object { "$($_.Category): $($_.Name) = $($_.Value)" }) -join '; ')
     Add-Signal 'Memory malfind indicators (injected code regions)' 2 @($memMf).Count (($memMf | Select-Object -First 3 | ForEach-Object { "$($_.Process)($($_.PID))" }) -join '; ')
@@ -5155,6 +5479,9 @@ function Get-CompromiseVerdict {
     Add-Cov 'Entity correlation' (Test-Path (Join-Path $CsvDir 'entities_binaries.csv')) 3
     Add-Cov 'Hunt rules' (Test-Path (Join-Path $CsvDir 'hunt_findings.csv')) 3
     Add-Cov 'Structured telemetry (4688 / Sysmon 10-13)' ((Test-Path (Join-Path $CsvDir 'security_proc_events.csv')) -or (Test-Path (Join-Path $CsvDir 'sysmon_process_access.csv'))) 3
+    Add-Cov 'Kerberos/DS telemetry (DC role)' ((Test-Path (Join-Path $CsvDir 'security_kerberos.csv')) -or (Test-Path (Join-Path $CsvDir 'security_ds_access.csv'))) 3
+    Add-Cov 'Web telemetry (IIS)' (Test-Path (Join-Path $CsvDir 'iis_requests.csv')) 2
+    Add-Cov 'Session attribution + process lineage' ((Test-Path (Join-Path $CsvDir 'session_activity.csv')) -or (Test-Path (Join-Path $CsvDir 'process_chains.csv'))) 2
     Add-Cov 'LOLDrivers driver hash check' (Test-Path (Join-Path $CsvDir 'loldrivers_hits.csv')) 3
     Add-Cov 'Sysmon telemetry (bonus)' ([bool]$Sysmon) 5
     Add-Cov 'RAM capture (bonus)' (Test-Path $MemDir) 3
@@ -5222,8 +5549,10 @@ function Invoke-RegenerateOutputs {
     param([pscustomobject]$Case)
     try { New-SuperTimeline } catch { Write-CaseLog "    supertimeline failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-SigmaRuleLogs } catch { Write-CaseLog "    sigma rule logs failed: $($_.Exception.Message)" 'DarkYellow' }
-    try { New-EntityCorrelation } catch { Write-CaseLog "    entity correlation failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-HuntFindings } catch { Write-CaseLog "    hunt findings failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-EntityCorrelation } catch { Write-CaseLog "    entity correlation failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-SessionAttribution } catch { Write-CaseLog "    session attribution failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-ProcessChains } catch { Write-CaseLog "    process lineage failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-LoggingGaps } catch { Write-CaseLog "    logging gaps failed: $($_.Exception.Message)" 'DarkYellow' }
     try { Get-ParseNeeds } catch { Write-CaseLog "    parse-needed check failed: $($_.Exception.Message)" 'DarkYellow' }
     $script:Verdict = $null
@@ -5258,6 +5587,7 @@ function New-Package {
         Analyst = $script:CurrentAnalyst
         Computer = $Computer
         StartedUTC = $StartTime.ToUniversalTime().ToString('o')
+        Role = $script:HostRole
         FinishedUTC = (Get-Date).ToUniversalTime().ToString('o')
         OS = if ($os) { $os.Caption + ' ' + $os.Version } else { '' }
         Owner = $env:USERNAME
@@ -5737,7 +6067,7 @@ function Invoke-ProcessPivot {
     $scan = {
         param([string]$term)
         $found = New-Object System.Collections.Generic.List[object]
-        foreach ($f in @(Get-ChildItem -LiteralPath $script:CsvDir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin @('process_pivot.csv', 'supertimeline.csv') } | Sort-Object Name)) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $script:CsvDir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Where-Object { @('process_pivot.csv', 'supertimeline.csv') -notcontains $_.Name } | Sort-Object Name)) {
             $src = $f.BaseName
             $rr = $null
             try { $rr = @(Import-Csv -LiteralPath $f.FullName -ErrorAction Stop) } catch { continue }
@@ -6040,6 +6370,7 @@ if ($NoMenu -or $script:SimpleUI) {
         Write-Host "  Please DO NOT close this window until it says DONE." -ForegroundColor Yellow
         Write-Host ""
     } else {
+        if ($script:HostRole -ne 'Workstation') { Write-CaseLog "Host role detected: $script:HostRole (role telemetry enabled in this preset)" 'Cyan' }
         Write-CaseLog "NoMenu mode: running preset '$Preset' ($(@($selection.Values | Where-Object { $_ }).Count) modules)" 'Cyan'
     }
     if ($Preset -eq 'Flash') {

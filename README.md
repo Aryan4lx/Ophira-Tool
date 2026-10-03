@@ -183,6 +183,17 @@ chainsaw hunt raw\evtx -s sigma/ --mapping mappings/sigma-event-logs-all.yml
 - **hayabusa time-boxing** — scans only the configured log range (`--time-offset`) with eid-filter (`-E`); per-module timings recorded in `case.json` (`ModuleTimings`)
 - Native tools launched console-less (`.NET CreateNoWindow`) — avoids console handshake stalls and runspace pipe overhead
 
+## OS support
+
+| OS | Status |
+|---|---|
+| Windows 10/11, Server 2016-2025 (PowerShell 5.1) | Full support |
+| Windows 8/8.1, Server 2012/R2 (PS 5.0/5.1) | Full support |
+| Windows 7 SP1 / 2008 R2 **with WMF 5.1** (needs .NET 4.5.2) | Supported - OS cmdlets missing on Win7 (Get-Net*, Get-Smb*, Defender) are guard-wrapped and skip gracefully; SQLECmd needs .NET 9 which does not install on Win7, so browser artifacts finish analyst-side via `-Mode Parse` |
+| Any host with PowerShell < 5.0 (stock Win7 = PS 2.0) | Blocked by design with a clear fail-fast message (v2.21: the whole script parses under PS 2.0, so the friendly gate + WinRM-push guidance renders everywhere instead of parser errors) |
+
+Role telemetry follows the host, not the preset: a DC auto-enables module 4.9 (Kerberos/DS), an IIS box auto-enables 8.12 (web artifacts) under Standard/Full; `-Preset DC` / `-Preset WebServer` force them on.
+
 ## Testing on a VM (safe demo recipe)
 
 Snapshot first, host-only networking is enough (nothing below needs internet), revert after.
@@ -229,7 +240,7 @@ while ($true) { try { (New-Object Net.Sockets.TcpClient('1.1.1.1', 443)).Close()
 - [x] **Hunt pack**: R1-R7 technique detections (renamed LOLBin, DLL side-loads live+static, download-exec, USB trail, account lifecycle, public RDP) with ATT&CK tags + verdict floors; BAM/DAM, USB history, UAL, Office MRU, local-admins, audit-policy artifacts; module 7.2 flagged-process minidumps + YARA (v2.19)
 - [x] **APT depth**: structured parses (4688 process-creation w/ cmdline, 4698 task installs, 5140/5145 share access, Sysmon EID 10/13/2, Defender 5001/5007) + hunt rules R8-R15 (LSASS access, Office→interpreter chains, proxy-exec LOLBin command lines, UAC bypass, timestomping, admin-share staging, discovery storms, Defender tamper); fleet lateral-chain stitching + SIEM hunt records (v2.20)
 - [ ] Real-host pilot run (validate hayabusa timing + MFTECmd on live volume)
-- [ ] Role-based presets (WebServer / DC / Workstation)
+- [x] **Role presets + correlation spine**: auto-detected host role (DC/WebServer/Workstation) + `DC`/`WebServer` presets with auto role-pack; module 4.9 Kerberos/DS parses (4768/4769/4771/4776, 4662 DCSync GUIDs, 5136), module 8.12 IIS/HTTPERR raw + W3C parse; hunt rules R16-R21 (DCSync, Kerberoasting, AS-REP, password spray, webshell chains, web anomalies); session attribution (4624 LogonId x 4688/5145), process-lineage chains for flagged binaries, new sources in entity correlation; Win7/PS2.0 parse-compat sweep (friendly gate fires everywhere) (v2.21)
 
 ## Coverage vs Velociraptor (built-in Windows artifacts)
 

@@ -21,7 +21,7 @@ function New-Csv { param($Path, [string[]]$Header, [string[]]$Lines) ($Header + 
 # ============================================================================
 # PART 1 - module 4.8: network + DNS beaconing through the real Run block
 # ============================================================================
-$m48 = [regex]::Match($src, "(?s)Id = '4\.8';.*?Run = \{(.*?)\r?\n        \} \}\r?\n    \[pscustomobject\]@\{ Id = '5\.1'")
+$m48 = [regex]::Match($src, "(?s)Id = '4\.8';.*?Run = \{(.*?)\r?\n        \} \}\r?\n    \[pscustomobject\]@\{ Id = '4\.9'")
 if (-not $m48.Success) { throw 'module 4.8 extract failed' }
 
 $case = Join-Path $env:TEMP ("ophira_v214_" + (Get-Date -Format 'HHmmss'))
