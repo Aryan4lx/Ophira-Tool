@@ -6942,7 +6942,7 @@ function Invoke-CanaryMode {
     if ($Target) {
         Write-Host "  And on TARGET '$Target':" -ForegroundColor Yellow
         Write-Host "   - enable the same audits (+ Detailed File Share) - restored after"
-        Write-Host "   - receive an SMB session + a labeled file write from canary_test (\\Target\C$\Users\Public\canary_lateral.exe)"
+        Write-Host "   - receive an SMB session + a labeled file write to its admin share (canary_lateral.exe)"
         Write-Host "   - receive its own collection, scored for the cross-host detections"
         Write-Host "  The target must be domain-joined and reachable (this account needs remote-admin rights on it)." -ForegroundColor Yellow
         Write-Host "  Targeting by IP also needs this host's WinRM TrustedHosts to include the target." -ForegroundColor Yellow
@@ -7030,17 +7030,22 @@ function Invoke-CanaryMode {
     if ($Target) {
         $lateralOk = $false
         $null = & net.exe use "\\$Target\C$" /delete 2>&1
-        $null = & net.exe use "\\$Target\C$" $canPass /user:"$env:USERDOMAIN\canary_test" 2>&1
+        # authenticate as the TARGET ADMIN when we have those credentials (R12 needs the admin
+        # share anyway; canary_test exercises account lifecycle locally, not this leg)
+        $useUser = "$env:USERDOMAIN\canary_test"; $usePass = $canPass
+        if ($tCred) { $useUser = $tCred.UserName; $usePass = $tCred.GetNetworkCredential().Password }
+        $nu = & net.exe use "\\$Target\C$" $usePass /user:"$useUser" 2>&1
         if ($LASTEXITCODE -eq 0) {
             $null = & cmd.exe /c "dir \\$Target\C$\Users\Public > nul" 2>&1
             try {
                 Copy-Item $canExe "\\$Target\C$\Users\Public\canary_lateral.exe" -Force -ErrorAction Stop
                 $lateralOk = $true
-                Write-Host "    lateral: SMB session as canary_test + canary_lateral.exe written to target admin share" -ForegroundColor Gray
+                Write-Host "    lateral: SMB session as $useUser + canary_lateral.exe written to target admin share" -ForegroundColor Gray
             } catch { Write-Host "    lateral write failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
             $null = & net.exe use "\\$Target\C$" /delete 2>&1
         } else {
-            Write-Host "    lateral SMB failed (target not domain-aware of this canary user?) - B-side checks will be BLIND" -ForegroundColor DarkYellow
+            Write-Host "    lateral SMB failed (exit $LASTEXITCODE): $(($nu | Where-Object { "$_" } | Select-Object -Last 1))" -ForegroundColor DarkYellow
+            Write-Host "    B-side checks will be BLIND" -ForegroundColor DarkYellow
         }
     }
     $recon = @(
@@ -7056,7 +7061,7 @@ function Invoke-CanaryMode {
     } catch { Write-Host "    certutil fetch skipped (offline?)" -ForegroundColor DarkYellow }
     $null = & net.exe localgroup administrators canary_test /delete 2>&1
     $null = & net.exe user canary_test /delete 2>&1
-    if ($Target) { $null = Invoke-Command @rc -ScriptBlock { Remove-Item C:\Users\Public\canary_lateral.exe -Force -ErrorAction SilentlyContinue } -ErrorAction SilentlyContinue }
+    if ($Target) { $null = Invoke-Command @rc -ScriptBlock { Remove-Item C:\Users\Public\canary_lateral.exe -Force -ErrorAction SilentlyContinue } }
     Write-Host "    canary_test removed (all planted artifacts are self-labeled)" -ForegroundColor Gray
 
     # ---- phase 3: collection (Standard: Quick excludes the 4688/auth parses the scorecard reads) ----
@@ -7121,8 +7126,9 @@ function Invoke-CanaryMode {
             $bShare = @(Import-Csv -LiteralPath (Join-Path $bcsv 'security_share_access.csv') -ErrorAction SilentlyContinue)
             $bSess = @(Import-Csv -LiteralPath (Join-Path $bcsv 'session_activity.csv') -ErrorAction SilentlyContinue)
             $bHf = @(Import-Csv -LiteralPath (Join-Path $bcsv 'hunt_findings.csv') -ErrorAction SilentlyContinue)
+            $bAcct = if ($tCred) { ($tCred.UserName -split '\\')[-1] } else { 'canary_test' }
             $bChecks = @(
-                @{ L = 'B 4624 type-3 from canary_test';     Hit = 0; Data = @($bAuth | Where-Object { "$($_.EventId)" -eq '4624' -and "$($_.LogonType)" -eq '3' -and "$($_.Account)" -match 'canary_test' }).Count; DataWhy = 'network logon did not arrive (audit off on target, or SMB leg failed)' }
+                @{ L = "B 4624 type-3 lateral logon ($bAcct)"; Hit = 0; Data = @($bAuth | Where-Object { "$($_.EventId)" -eq '4624' -and "$($_.LogonType)" -eq '3' -and "$($_.Account)" -match $bAcct }).Count; DataWhy = 'network logon did not arrive (audit off on target, or SMB leg failed)' }
                 @{ L = 'B 5145 share access captured';       Hit = 0; Data = @($bShare | Where-Object { $_ -match 'canary|C\$' }).Count;            DataWhy = 'Detailed File Share audit not active at touch time' }
                 @{ L = 'B session attribution join';         Hit = 0; Data = @($bSess | Where-Object { $_ -match 'canary' }).Count;                DataWhy = 'no canary share/process activity to attribute' }
                 @{ L = 'B R12  admin-share executable staging'; Hit = @($bHf | Where-Object { $_.Rule -match 'Admin-share' }).Count; Data = @($bShare | Where-Object { $_ -match 'canary_lateral\.exe' }).Count; DataWhy = '5145 rows missing (audit off) or write leg failed' }
@@ -7159,7 +7165,7 @@ function Invoke-CanaryMode {
                 foreach ($u in $Undo) { $p2 = $u -split '\|'; $null = & auditpol.exe /set /subcategory:"$($p2[1])" /success:disable 2>&1 }
             } -ArgumentList (, @($bUndo))
             Write-Host "  Target audit state restored." -ForegroundColor DarkGray
-        } catch { Write-Host "  Target audit restore failed - restore manually on ${Target}:" -ForegroundColor Yellow; $bUndo | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow } }
+        } catch { Write-Host "  Target audit restore failed ($($_.Exception.Message)) - restore manually on ${Target}:" -ForegroundColor Yellow; $bUndo | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow } }
     }
     return $true
 }

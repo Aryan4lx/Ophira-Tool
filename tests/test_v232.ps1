@@ -28,11 +28,11 @@ Check "consent: domain-joined caveat" ($src -match 'domain-joined and reachable'
 # ============================================================================
 Check "remote: Detailed File Share audit enabled on target" ($src -match [regex]::Escape("'Detailed File Share'"))
 Check "remote: unreachable target degrades to single-host" ($src -match [regex]::Escape('continuing single-host'))
-Check "ordering: canary user created BEFORE lateral leg" ($src -match '(?s)user canary_test \$canPass /add.*?net\.exe use.*?/user:"\$env:USERDOMAIN\\canary_test"')
-Check "lateral: SMB as canary_test + labeled write + unmap" ($src -match '/user:"\$env:USERDOMAIN\\canary_test"' -and $src -match [regex]::Escape('canary_lateral.exe') -and $src -match [regex]::Escape('net.exe use "\\$Target\C$" /delete'))
+Check "ordering: canary user created BEFORE lateral leg" ($src -match ('(?s)user canary_test \$canPass /add.*?' + [regex]::Escape('net.exe use "\\$Target\C$" $usePass /user:')))
+Check "lateral: SMB as target admin (or canary_test fallback) + labeled write + unmap" ($src -match '\$useUser = \$tCred\.UserName' -and $src -match [regex]::Escape('canary_lateral.exe') -and $src -match [regex]::Escape('net.exe use "\\$Target\C$" /delete'))
 Check "lateral: remote labeled file cleaned up" ($src -match [regex]::Escape('Remove-Item C:\Users\Public\canary_lateral.exe'))
 Check "collect: target via Invoke-DeployMode Standard CANARY" ($src -match [regex]::Escape("Invoke-DeployMode -Targets @(`$Target) -DeployPreset 'Standard'"))
-Check "scorecard: B-side 4624/5145/attribution/R12 rows" ((@('4624 type-3 from canary_test','5145 share access captured','session attribution join','R12  admin-share executable staging') | Where-Object { $src -match [regex]::Escape($_) }).Count -eq 4)
+Check "scorecard: B-side 4624/5145/attribution/R12 rows" ((@('lateral logon','5145 share access captured','session attribution join','R12  admin-share executable staging') | Where-Object { $src -match [regex]::Escape($_) }).Count -eq 4)
 Check "scorecard: fleet stitch pointer printed" ($src -match 'Fleet stitch check')
 Check "restore: remote audit undo after local" ($src -match [regex]::Escape("Target audit state restored") -and $src -match [regex]::Escape('/subcategory:"$($p2[1])" /success:disable'))
 
