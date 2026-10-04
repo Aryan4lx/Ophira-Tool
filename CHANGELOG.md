@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.31
+- **Narrative case draft**: new `Get-CaseNarrative` turns the verdict + hunt findings into a plain-language executive draft (`case_draft.txt` + a "Case draft" section under the verdict in report.html): assessment line, WHAT THE EVIDENCE SHOWS (strong signals with details, weight-2 as "also seen"), BEST LEADS (high-severity detections with ATT&CK tags), WHAT THIS ASSESSMENT COULD NOT SEE (missing coverage + absence-is-not-proof), CAVEATS. Machine-generated starting point for the analyst's report - deterministic template, explicitly marked "edit before use"; degrades to an honest note when the verdict engine didn't run
+- Tests: `tests\test_v231.ps1` (12 checks) - draft content through the real function (strong/notable/leads/caveats/coverage-missing), no-verdict path, regen + report + index wiring
+
 ## v2.30
 - **RDP bitmap cache raw copy** (module 4.4): `Terminal Server Client\Cache\*.bmc` tiles -> `raw\rdp_cache` - screen fragments of what INBOUND RDP sessions displayed (what the attacker saw and did over RDP); analyst-side viewing via RdpCacheStudio (report raw-pointer updated)
 - **Fleet inventory**: `case.json` now records the collection `Preset`; `fleet_hosts.csv` gains a Preset column; `-Mode Analyze` prints a VERDICTS distribution line (per-verdict host counts) in the summary

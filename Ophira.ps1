@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.30  -  Windows Incident Response Triage Toolkit
+Ophira v2.31  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -37,7 +37,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.30"
+$ScriptVersion = "2.31"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -4048,6 +4048,20 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     } else {
         $null = $sb.AppendLine("<div class='vbanner v0'><p class='vtitle'>VERDICT UNAVAILABLE</p><p class='vowner'>The verdict engine did not run - review the raw sections below.</p></div>")
     }
+    # ---------- narrative case draft (v2.31) ----------
+    try {
+        $draft = @(Get-CaseNarrative)
+        if ($draft.Count -gt 0) {
+            $null = $sb.AppendLine("<a name='draft'></a><h2>Case draft (auto-written - edit before use)</h2><div class='draft'>")
+            foreach ($line in $draft) {
+                $esc = ConvertTo-HtmlEsc $line
+                if ($line -match '^[A-Z][A-Z ]+$') { $null = $sb.AppendLine("<p><b>$esc</b></p>") }
+                elseif ($line -match '^ - ') { $null = $sb.AppendLine("<p style='margin:2px 0 2px 18px'>$esc</p>") }
+                elseif ($line) { $null = $sb.AppendLine("<p>$esc</p>") }
+            }
+            $null = $sb.AppendLine("</div><div class='meta'>Plain-text copy: <b>case_draft.txt</b> in the case folder - starting point for your report, not a conclusion.</div>")
+        }
+    } catch { }
 
     # ---------- evidence coverage ----------
     $null = $sb.AppendLine("<a name='coverage'></a><h2>Evidence coverage & data quality</h2>")
@@ -4838,7 +4852,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         $null = $sb.AppendLine("<tr><td>csv\$(ConvertTo-HtmlEsc $f.Name)</td><td>$rows</td><td>$(ConvertTo-HtmlEsc $d)</td></tr>")
     }
     $null = $sb.AppendLine("</table>")
-    $null = $sb.AppendLine("<div class='meta'>Also in the case: <b>supertimeline.csv</b> (MASTER chronology - every artifact, filter by time), <b>csv\evtx_ecmd\</b> (full event-log CSVs for deep-dives, when EvtxECmd ran in Parse mode), <b>siem_export.ndjson</b> (Splunk/Elastic-ready records), <b>verdict.json</b>, <b>attack_layer.json</b> (MITRE ATT&amp;CK Navigator layer - load at navigator.mitre.org), <b>case.json</b> (run metadata + module timings), raw evidence under <b>raw\</b> (evtx, registry hives, prefetch, recent/jumplists, browser DBs, firewall log, RDP bitmap cache tiles in <b>raw\rdp_cache</b> - reconstruct what inbound RDP sessions displayed with RdpCacheStudio), collection.log</div>")
+    $null = $sb.AppendLine("<div class='meta'>Also in the case: <b>supertimeline.csv</b> (MASTER chronology - every artifact, filter by time), <b>csv\evtx_ecmd\</b> (full event-log CSVs for deep-dives, when EvtxECmd ran in Parse mode), <b>siem_export.ndjson</b> (Splunk/Elastic-ready records), <b>case_draft.txt</b> (auto-written executive draft - edit into your report), <b>verdict.json</b>, <b>attack_layer.json</b> (MITRE ATT&amp;CK Navigator layer - load at navigator.mitre.org), <b>case.json</b> (run metadata + module timings), raw evidence under <b>raw\</b> (evtx, registry hives, prefetch, recent/jumplists, browser DBs, firewall log, RDP bitmap cache tiles in <b>raw\rdp_cache</b> - reconstruct what inbound RDP sessions displayed with RdpCacheStudio), collection.log</div>")
 
     $null = $sb.AppendLine("<div class='foot'>Generated $(Get-Date -Format u) by Ophira v$ScriptVersion - all verdicts are correlation heuristics; verify against raw CSV/evtx evidence before acting.</div>")
     $null = $sb.AppendLine("</body></html>")
@@ -6164,6 +6178,55 @@ function Get-CompromiseVerdict {
     }
 }
 
+function Get-CaseNarrative {
+    # Plain-language executive draft built from the verdict + hunt findings (v2.31).
+    # Written to case_draft.txt and rendered under the verdict in report.html - a starting
+    # draft for the analyst's report, not a conclusion. Deterministic template, no filler.
+    $L = New-Object System.Collections.Generic.List[string]
+    $L.Add("CASE DRAFT - $Computer ($script:HostRole) - collected $($StartTime.ToString('yyyy-MM-dd HH:mm')) local, Ophira v$ScriptVersion")
+    $L.Add("")
+    if (-not $script:Verdict) { $L.Add("The verdict engine did not run - this draft has no assessment. Review the evidence sections."); return $L.ToArray() }
+    $v = $script:Verdict
+    $L.Add("ASSESSMENT: $($v.Level) (confidence $($v.ConfidencePercent)% of expected evidence collected). $($v.OwnerLine)")
+    $L.Add("")
+    $strong = @($v.Signals | Where-Object { $_.Weight -ge 3 })
+    $notable = @($v.Signals | Where-Object { $_.Weight -eq 2 })
+    if ($strong.Count -gt 0 -or $notable.Count -gt 0) {
+        $L.Add("WHAT THE EVIDENCE SHOWS")
+        foreach ($s in $strong) {
+            $d = if ("$($s.Detail)") { " ($($s.Detail))" } else { '' }
+            $L.Add(" - $($s.Signal) x$($s.Count)$d")
+        }
+        foreach ($s in $notable) {
+            $d = if ("$($s.Detail)") { " ($($s.Detail))" } else { '' }
+            $L.Add(" - Also seen: $($s.Signal) x$($s.Count)$d")
+        }
+    } else {
+        $L.Add("WHAT THE EVIDENCE SHOWS: no compromising signals in the collected evidence.")
+    }
+    $L.Add("")
+    $leads = @(Import-CaseCsv 'hunt_findings' | Where-Object { "$($_.Severity)" -eq 'high' } | Select-Object -First 5)
+    if ($leads.Count -gt 0) {
+        $L.Add("BEST LEADS (high-severity hunt detections - verify against cited evidence)")
+        foreach ($f in $leads) { $L.Add(" - [$($f.Attck)] $($f.Rule) on $($f.Entity): $($f.Evidence)") }
+        $L.Add("")
+    }
+    $missing = @($v.Coverage | Where-Object { -not $_.Collected })
+    if ($missing.Count -gt 0) {
+        $L.Add("WHAT THIS ASSESSMENT COULD NOT SEE")
+        $L.Add(" - Evidence sources not collected: " + (($missing | ForEach-Object { $_.Source }) -join ', '))
+        $L.Add(" - Absence of findings in these areas is NOT proof of absence.")
+        $L.Add("")
+    }
+    if (@($v.Caveats).Count -gt 0) {
+        $L.Add("CAVEATS")
+        foreach ($c in @($v.Caveats)) { $L.Add(" - $c") }
+        $L.Add("")
+    }
+    $L.Add("(Machine-generated starting draft - verify every lead against the cited evidence, then rewrite in your own words.)")
+    return $L.ToArray()
+}
+
 function Invoke-RegenerateOutputs {
     # Shared by New-Package and -Mode Parse: rebuilds every derived artifact from csv\
     # (supertimeline, gaps, parse_needed, verdict.json, SIEM export, ATT&CK layer, report.html).
@@ -6194,6 +6257,7 @@ function Invoke-RegenerateOutputs {
             Write-CaseLog "    VERDICT: $($script:Verdict.Level) (confidence $($script:Verdict.ConfidencePercent)%) - $($script:Verdict.Signals.Count) signal(s), $($script:Verdict.Caveats.Count) caveat(s) -> verdict.json" $vColor
         }
     } catch { Write-CaseLog "    verdict engine failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { Get-CaseNarrative | Set-Content -LiteralPath (Join-Path $CaseDir 'case_draft.txt') -Encoding UTF8 } catch { Write-CaseLog "    case draft failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-SiemExport } catch { Write-CaseLog "    siem export failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-AttackLayer } catch { Write-CaseLog "    ATT&CK layer failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-HtmlReport | Out-Null } catch { Write-CaseLog "    report generation failed: $($_.Exception.Message)" 'DarkYellow' }
