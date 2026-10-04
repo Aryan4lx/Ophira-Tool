@@ -50,7 +50,7 @@ foreach ($n in @('Get-EventDataRows')) {
 Invoke-Expression $defs3
 function Get-LogStart { $null }
 function Get-FilteredEvents { param($LogName, $Ids, $Start, $MaxMsg)
-    $msg4624 = "An account was successfully logged on.`r`n`r`nSubject:`r`n`tAccount Name:`t-`r`n`tAccount Domain:`t-`r`n`tLogon ID:`t0x0`r`n`r`nNew Logon:`r`n`tAccount Name:`tcanary_test`r`n`tAccount Domain:`tCORP`r`n`tLogon ID:`t0xABCDEF`r`n`tLogon Type:`t3`r`n`r`nNetwork Information:`r`n`tSource Network Address:`t192.168.16.129"
+    $msg4624 = "An account was successfully logged on.`r`n`r`nSubject:`r`n`tAccount Name:`t-`r`n`tAccount Domain:`t-`r`n`tLogon ID:`t0x0`r`n`r`nNew Logon:`r`n`tAccount Name:`tcanary_test`r`n`tAccount Domain:`tCORP`r`n`tLogon ID:`t0xABCDEF`r`n`tLinked Logon ID:`t0x0`r`n`tLogon Type:`t3`r`n`r`nNetwork Information:`r`n`tSource Network Address:`t192.168.16.129"
     @(, [pscustomobject]@{ TimeCreated = (Get-Date '2026-10-04 12:00:00'); Id = 4624; Message = $msg4624 })
 }
 function Export-Evtx { param($LogName, $FileName) }
@@ -62,9 +62,10 @@ $mod41 = [pscustomobject]@{ Id = '4.1'; Name = 'Security log'; Run = [scriptbloc
 $a = @($saved4['security_auth_events'])[0]
 Check "4624: Account = New Logon account (canary_test), not subject '-'" ("$($a.Account)" -eq 'canary_test')
 Check "4624: LogonId = New Logon session (0xABCDEF), not 0x0" ("$($a.LogonId)" -eq '0xABCDEF')
+Check "4624: Linked Logon ID (0x0) does not shadow the New Logon session" (($src -match [regex]::Escape('$nlIdx = $msg.IndexOf(''New Logon'')')))
+Check "5140/5145: LogonId mapped to SubjectLogonId (Win11 field name)" ($src -match [regex]::Escape("LogonId = 'SubjectLogonId'"))
 Check "4624: SubjectAccount captured separately" ("$($a.SubjectAccount)" -eq '-')
 Check "4624: LogonType + SourceIp still parsed" ("$($a.LogonType)" -eq '3' -and "$($a.SourceIp)" -eq '192.168.16.129')
-Check "session attribution join key now matches 5145 SubjectUserLogonId semantics" ($src -match 'lids\[\$lids\.Count - 1\]')
 
 Write-Host ""
 Write-Host "RESULT: $pass passed, $fail failed"

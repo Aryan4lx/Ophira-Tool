@@ -2085,15 +2085,18 @@ $script:Modules = @(
             Save-Rows -Name 'security_events' -Rows $ev
             $auth = @($ev | Where-Object { @(4624, 4625) -contains $_.Id } | ForEach-Object {
                 $msg = "$($_.Message)"
-                # 4624/4625 have Subject: + New Logon: sections - the logon account/session live in the LAST
-                # Account Name / Logon ID (first = the caller's subject, often '-' or ANONYMOUS LOGON)
+                # 4624/4625: the logon account/session live in the New Logon section - anchor after it
+                # (Subject Logon ID is the caller's, and a Linked Logon ID may trail New Logon)
+                $nlIdx = $msg.IndexOf('New Logon')
+                $after = if ($nlIdx -ge 0) { $msg.Substring($nlIdx) } else { $msg }
                 $names = [regex]::Matches($msg, 'Account Name:\s+([^\r\n]+)')
-                $lids = [regex]::Matches($msg, 'Logon ID:\s+(0x[0-9A-Fa-f]+)')
-                $acct = if ($names.Count -gt 0) { $names[$names.Count - 1].Groups[1].Value.Trim() } else { '' }
+                $nlNames = [regex]::Matches($after, 'Account Name:\s+([^\r\n]+)')
+                $acct = if ($nlNames.Count -gt 0) { $nlNames[0].Groups[1].Value.Trim() } elseif ($names.Count -gt 0) { $names[0].Groups[1].Value.Trim() } else { '' }
                 $subject = if ($names.Count -gt 0) { $names[0].Groups[1].Value.Trim() } else { '' }
                 $ip = if ($msg -match 'Source Network Address:\s+(\S+)') { $Matches[1] } else { '' }
                 $lt = if ($msg -match 'Logon Type:\s+(\d+)') { $Matches[1] } else { '' }
-                $lid = if ($lids.Count -gt 0) { $lids[$lids.Count - 1].Groups[1].Value.Trim() } else { '' }
+                $lids = [regex]::Matches($after, 'Logon ID:\s+(0x[0-9A-Fa-f]+)')
+                $lid = if ($lids.Count -gt 0) { $lids[0].Groups[1].Value.Trim() } else { '' }
                 [pscustomobject]@{ Time = $_.TimeCreated; EventId = $_.Id; Account = $acct; SubjectAccount = $subject; SourceIp = $ip; LogonType = $lt; LogonId = $lid }
             })
             # account management EIDs (R6 account lifecycle) - TargetUserName-style EventData
@@ -2120,7 +2123,7 @@ $script:Modules = @(
             }
             Save-Rows -Name 'security_task_install' -Rows $taskEv
             if ($taskEv.Count -gt 0) { Write-CaseLog "    4698 scheduled task installs: $($taskEv.Count)" 'Gray' }
-            $shareEv = Get-EventDataRows -LogName 'Security' -Id @(5140, 5145) -Start $start -Cap 8000 -Fields ([ordered]@{ Account = 'SubjectUserName'; LogonId = 'SubjectUserLogonId'; ShareName = 'ShareName'; RelativeTargetName = 'RelativeTargetName'; SourceIp = 'IpAddress'; AccessList = 'AccessList' })
+            $shareEv = Get-EventDataRows -LogName 'Security' -Id @(5140, 5145) -Start $start -Cap 8000 -Fields ([ordered]@{ Account = 'SubjectUserName'; LogonId = 'SubjectLogonId'; ShareName = 'ShareName'; RelativeTargetName = 'RelativeTargetName'; SourceIp = 'IpAddress'; AccessList = 'AccessList' })
             Save-Rows -Name 'security_share_access' -Rows $shareEv
             if ($shareEv.Count -ge 8000) { Write-CaseLog "    share access: capped at 8000 rows - wide file-share activity (file server?)" 'DarkGray' }
             Export-Evtx -LogName 'Security' -FileName 'Security.evtx'
@@ -7053,7 +7056,7 @@ function Invoke-CanaryMode {
         { & nltest.exe /dclist:"$env:USERDOMAIN" 2>&1 }, { & systeminfo.exe 2>&1 }, { & ipconfig.exe /all 2>&1 },
         { & quser.exe 2>&1 }, { & tasklist.exe 2>&1 }, { & klist.exe 2>&1 }, { & netstat.exe -an 2>&1 }
     )
-    foreach ($rc in $recon) { $null = & $rc }
+    foreach ($rcmd in $recon) { $null = & $rcmd }
     Write-Host "    discovery burst (10 recon tools)" -ForegroundColor Gray
     try {
         $null = & certutil.exe -urlcache -f 'https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/README.md' "$env:TEMP\canary_dl.bin" 2>&1
@@ -7127,10 +7130,13 @@ function Invoke-CanaryMode {
             $bSess = @(Import-Csv -LiteralPath (Join-Path $bcsv 'session_activity.csv') -ErrorAction SilentlyContinue)
             $bHf = @(Import-Csv -LiteralPath (Join-Path $bcsv 'hunt_findings.csv') -ErrorAction SilentlyContinue)
             $bAcct = if ($tCred) { ($tCred.UserName -split '\\')[-1] } else { 'canary_test' }
+            $c4624 = @($bAuth | Where-Object { "$($_.EventId)" -eq '4624' -and "$($_.LogonType)" -eq '3' -and "$($_.Account)" -match $bAcct }).Count
+            $c5145 = @($bShare | Where-Object { $_ -match 'canary|C\$' }).Count
+            $cJoin = @($bSess | Where-Object { $_ -match 'canary' }).Count
             $bChecks = @(
-                @{ L = "B 4624 type-3 lateral logon ($bAcct)"; Hit = 0; Data = @($bAuth | Where-Object { "$($_.EventId)" -eq '4624' -and "$($_.LogonType)" -eq '3' -and "$($_.Account)" -match $bAcct }).Count; DataWhy = 'network logon did not arrive (audit off on target, or SMB leg failed)' }
-                @{ L = 'B 5145 share access captured';       Hit = 0; Data = @($bShare | Where-Object { $_ -match 'canary|C\$' }).Count;            DataWhy = 'Detailed File Share audit not active at touch time' }
-                @{ L = 'B session attribution join';         Hit = 0; Data = @($bSess | Where-Object { $_ -match 'canary' }).Count;                DataWhy = 'no canary share/process activity to attribute' }
+                @{ L = "B 4624 type-3 lateral logon ($bAcct)"; Hit = $c4624; Data = $c4624; DataWhy = 'network logon did not arrive (audit off on target, or SMB leg failed)' }
+                @{ L = 'B 5145 share access captured';       Hit = $c5145; Data = $c5145;            DataWhy = 'Detailed File Share audit not active at touch time' }
+                @{ L = 'B session attribution join';         Hit = $cJoin; Data = $cJoin;                DataWhy = 'no canary share/process activity to attribute' }
                 @{ L = 'B R12  admin-share executable staging'; Hit = @($bHf | Where-Object { $_.Rule -match 'Admin-share' }).Count; Data = @($bShare | Where-Object { $_ -match 'canary_lateral\.exe' }).Count; DataWhy = '5145 rows missing (audit off) or write leg failed' }
             )
             $bs = 0
