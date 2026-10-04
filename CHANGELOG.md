@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.30
+- **RDP bitmap cache raw copy** (module 4.4): `Terminal Server Client\Cache\*.bmc` tiles -> `raw\rdp_cache` - screen fragments of what INBOUND RDP sessions displayed (what the attacker saw and did over RDP); analyst-side viewing via RdpCacheStudio (report raw-pointer updated)
+- **Fleet inventory**: `case.json` now records the collection `Preset`; `fleet_hosts.csv` gains a Preset column; `-Mode Analyze` prints a VERDICTS distribution line (per-verdict host counts) in the summary
+- Tests: `tests\test_v230.ps1` (9 checks) - module 4.4 cache copy through real module code (.bmc only, count logged, viewer hint), metadata/inventory wiring
+
 ## v2.29
 - **Detection canary (`-Mode Canary` / menu [C])** - self-test the whole pipeline on one host: with explicit consent (lab/validation only) it enables Process Creation + 4688-cmdline + script-block logging (capturing prior state; restored afterwards unless `-KeepLogging`), plants self-labeled test activity (renamed cmd copy, `canary_test` user created + privileged-group added + removed, 10-tool recon burst, benign certutil fetch), runs a Standard collection, then prints a scorecard: **FIRED** / **MISS - data present but rule silent (file this)** / **BLIND - no telemetry (reason)** for R1b/R6/R10/R13 + pipeline total + case verdict. Planted artifacts cleaned up
 - **Fix: R6 account lifecycle was dead on real hosts** (first canary run caught it): module 4.1 only merged 4624/4625 into `security_auth_events` - the 4720/4722/4724/4726/4728/4732/4735/4756 family stayed in raw `security_events`, so R6 never saw an account event outside fixtures. The account-management family now parses (TargetUserName) into `security_auth_events` alongside logons

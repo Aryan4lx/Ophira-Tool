@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.29  -  Windows Incident Response Triage Toolkit
+Ophira v2.30  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -37,7 +37,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.29"
+$ScriptVersion = "2.30"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -877,6 +877,7 @@ function Invoke-AnalyzeMode {
         $hosts += [pscustomobject]@{
             Host = $host_; Source = $src.Name; CaseID = $meta.CaseID
             Role = $(if ($meta -and $meta.Role) { "$($meta.Role)" } else { '' })
+            Preset = $(if ($meta -and $meta.Preset) { "$($meta.Preset)" } else { '' })
             Collected = $meta.StartedUTC; Admin = $meta.AdminElevated; Sysmon = $meta.SysmonPresent
             Verdict = "$(if ($vd) { $vd.Level } else { '' })"
             VerdictRank = $(if ($vd) { [int]$vd.LevelRank } else { -1 })
@@ -1049,7 +1050,7 @@ function Invoke-AnalyzeMode {
     $reportCsv = Join-Path $OutFolder 'fleet_report.csv'
     $findings | Sort-Object Host, Type | Export-Csv -LiteralPath $reportCsv -NoTypeInformation -Encoding UTF8
     $hostsCsv = Join-Path $OutFolder 'fleet_hosts.csv'
-    $hosts | Sort-Object Host | Select-Object Host, Verdict, VerdictRank, Confidence, Role, Signals, Caveats, Collected, Admin, Sysmon, Source, CaseID | Export-Csv -LiteralPath $hostsCsv -NoTypeInformation -Encoding UTF8
+    $hosts | Sort-Object Host | Select-Object Host, Verdict, VerdictRank, Confidence, Role, Preset, Signals, Caveats, Collected, Admin, Sysmon, Source, CaseID | Export-Csv -LiteralPath $hostsCsv -NoTypeInformation -Encoding UTF8
 
     $fleetHtml = Join-Path $OutFolder 'fleet_report.html'
     $css = @'
@@ -1190,8 +1191,11 @@ a{color:#8ab4f8}.foot{margin-top:40px;color:#565e6b;font-size:11px}
     $lines += "PROPOSED TRUSTED PUBLISHERS (fleet baselining):"
     if ($proposedTrusted.Count) { foreach ($p in $proposedTrusted) { $lines += "  $($p.Signer) ($($p.Hosts) hosts)" } } else { $lines += "  none" }
     $lines | Set-Content -LiteralPath $summaryTxt -Encoding UTF8
+    $vdTot = @($hosts | Where-Object { "$($_.Verdict)" } | Group-Object Verdict | Sort-Object { $_.Group[0].VerdictRank } -Descending)
     Write-Host ""
     Write-Host "================================================================" -ForegroundColor Green
+    Write-Host ("  VERDICTS: " + (($vdTot | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join '  |  ')) -ForegroundColor $(if (@($hosts | Where-Object { $_.VerdictRank -ge 3 }).Count -gt 0) { 'Red' } else { 'Green' })
+    Write-Host "  fleet_hosts.csv   : $hostsCsv" -ForegroundColor Green
     Write-Host "  fleet_report.csv  : $reportCsv" -ForegroundColor Green
     Write-Host "  fleet_report.html : $fleetHtml" -ForegroundColor Green
     Write-Host "  fleet_summary.txt : $summaryTxt" -ForegroundColor Green
@@ -2201,6 +2205,17 @@ $script:Modules = @(
             $ev2 = Get-FilteredEvents -LogName 'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational' -Ids @(1149) -Start $start -MaxMsg 300
             Save-Rows -Name 'rdp_connections' -Rows $ev2
             Export-Evtx -LogName 'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational' -FileName 'RDP_ConnectionManager.evtx'
+            # v2.30: RDP bitmap cache - screen fragments of what INBOUND RDP sessions displayed
+            $rcSrc = Join-Path $env:LOCALAPPDATA 'Microsoft\Terminal Server Client\Cache'
+            if (Test-Path $rcSrc) {
+                $rcDst = Join-Path $RawDir 'rdp_cache'
+                New-Item -ItemType Directory -Path $rcDst -Force | Out-Null
+                $nBmc = 0
+                foreach ($f in @(Get-ChildItem -LiteralPath $rcSrc -Filter '*.bmc' -File -ErrorAction SilentlyContinue)) {
+                    try { Copy-Item -LiteralPath $f.FullName -Destination $rcDst -Force -ErrorAction Stop; $nBmc++ } catch { }
+                }
+                if ($nBmc -gt 0) { Write-CaseLog "    RDP bitmap cache: $nBmc file(s) -> raw\rdp_cache (screen fragments of inbound RDP sessions; view with RdpCacheStudio)" 'Gray' }
+            }
         } }
     [pscustomobject]@{ Id = '4.5'; Cat = 'LOGS'; Name = 'System log (service installs 7045, changes 7040)'; Default = $true; Quick = $false;
         Run = {
@@ -4823,7 +4838,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         $null = $sb.AppendLine("<tr><td>csv\$(ConvertTo-HtmlEsc $f.Name)</td><td>$rows</td><td>$(ConvertTo-HtmlEsc $d)</td></tr>")
     }
     $null = $sb.AppendLine("</table>")
-    $null = $sb.AppendLine("<div class='meta'>Also in the case: <b>supertimeline.csv</b> (MASTER chronology - every artifact, filter by time), <b>csv\evtx_ecmd\</b> (full event-log CSVs for deep-dives, when EvtxECmd ran in Parse mode), <b>siem_export.ndjson</b> (Splunk/Elastic-ready records), <b>verdict.json</b>, <b>attack_layer.json</b> (MITRE ATT&amp;CK Navigator layer - load at navigator.mitre.org), <b>case.json</b> (run metadata + module timings), raw evidence under <b>raw\</b> (evtx, registry hives, prefetch, recent/jumplists, browser DBs, firewall log), collection.log</div>")
+    $null = $sb.AppendLine("<div class='meta'>Also in the case: <b>supertimeline.csv</b> (MASTER chronology - every artifact, filter by time), <b>csv\evtx_ecmd\</b> (full event-log CSVs for deep-dives, when EvtxECmd ran in Parse mode), <b>siem_export.ndjson</b> (Splunk/Elastic-ready records), <b>verdict.json</b>, <b>attack_layer.json</b> (MITRE ATT&amp;CK Navigator layer - load at navigator.mitre.org), <b>case.json</b> (run metadata + module timings), raw evidence under <b>raw\</b> (evtx, registry hives, prefetch, recent/jumplists, browser DBs, firewall log, RDP bitmap cache tiles in <b>raw\rdp_cache</b> - reconstruct what inbound RDP sessions displayed with RdpCacheStudio), collection.log</div>")
 
     $null = $sb.AppendLine("<div class='foot'>Generated $(Get-Date -Format u) by Ophira v$ScriptVersion - all verdicts are correlation heuristics; verify against raw CSV/evtx evidence before acting.</div>")
     $null = $sb.AppendLine("</body></html>")
@@ -6193,6 +6208,7 @@ function New-Package {
         CaseID = $script:CurrentCaseID
         Analyst = $script:CurrentAnalyst
         Computer = $Computer
+        Preset = $Preset
         StartedUTC = $StartTime.ToUniversalTime().ToString('o')
         Role = $script:HostRole
         FinishedUTC = (Get-Date).ToUniversalTime().ToString('o')
