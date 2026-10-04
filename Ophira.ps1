@@ -7009,7 +7009,7 @@ function Invoke-CanaryMode {
                     $undo += "auditpol|$sub"
                 }
                 return $undo
-            } -ArgumentList (, @('Process Creation', 'User Account Management', 'Security Group Management', 'Detailed File Share')) -ErrorAction Stop)
+            } -ArgumentList (, @('Process Creation', 'User Account Management', 'Security Group Management', 'Detailed File Share')))
             Write-Host "    target ${Target}: audits ready ($(@($bUndo).Count) newly enabled)" -ForegroundColor Gray
         } catch {
             Write-Host "    target unreachable/forbidden ($($_.Exception.Message)) - continuing single-host" -ForegroundColor DarkYellow
@@ -7157,7 +7157,7 @@ function Invoke-CanaryMode {
             $null = Invoke-Command @rc -ScriptBlock {
                 param([string[]]$Undo)
                 foreach ($u in $Undo) { $p2 = $u -split '\|'; $null = & auditpol.exe /set /subcategory:"$($p2[1])" /success:disable 2>&1 }
-            } -ArgumentList (, @($bUndo)) -ErrorAction Stop
+            } -ArgumentList (, @($bUndo))
             Write-Host "  Target audit state restored." -ForegroundColor DarkGray
         } catch { Write-Host "  Target audit restore failed - restore manually on ${Target}:" -ForegroundColor Yellow; $bUndo | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow } }
     }
