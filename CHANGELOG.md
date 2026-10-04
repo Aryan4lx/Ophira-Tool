@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.27
+- **Real-host pilot fixes** (first live-host run: Server 2025 DC + Win11 over WinRM deploy; four real bugs found and fixed):
+  - **Worker tools blackout**: `Get-KitRoot` fell back to CWD; deploy-spawned workers inherit `C:\Windows\System32`, so every tools-dependent module (hayabusa, chainsaw, Amcache/RBCmd, hunt packs) silently skipped on remote endpoints while local runs (CWD = kit folder) worked by accident. Kit root is now seeded into workers via the shared preamble
+  - **Deploy with empty `-CaseID` broke remote runs**: `-CaseID ""` collapsed in the outer `powershell.exe -Command` re-parse, `-CaseID` swallowed `-LogHours` and parameter binding died (exit 1, "no result zip"). `-CaseID` is now only added when non-empty
+  - **Parallel VSS snapshot contention**: concurrent `esentutl /vss` copies (SRUM module 5.3 x NTDS module 8.14 in different workers) race on the VSS snapshot set - one failed with no detail. New `Copy-LockedFile` helper (retry with backoff + real esentutl error in the log) used by SRUM, NTDS.dit and the browser-DB fallback
+  - **Renamed LOLBins invisible at rest**: live R1 only sees running processes. New structured **Sysmon EID 1** parse (`csv\sysmon_proc_create.csv`: Image/OriginalFileName/CommandLine/User) + hunt rule **R1b** - executed name vs `OriginalFileName` identity mismatch (winupd.exe-running-Cmd.Exe class), high severity, floor-2 verdict signal, deduped; EID 1 events also woven into the master timeline with an `ORIGINAL NAME:` highlight
+- Tests: `tests\test_v227.ps1` (23 checks) - R1b through the real hunt function (fires/mutes/dedupes; caught an `.exe`-suffix comparison bug pre-release), Copy-LockedFile retry+logging, Get-KitRoot seed override, deploy guard + wiring
+
 ## v2.26
 - **IOC feed ingest (STIX/MISP) + widened xref**:
   - `Get-IocList` now also reads **`tools\iocs\*.json`** - drop STIX 2.x bundles or MISP exports (direct or response-wrapped) into the folder; hashes/domains/IPS/filenames parse into the same internal lists (`tools/iocs/` gitignored). No network, no API keys - works air-gapped; every hit is attributed to its source feed

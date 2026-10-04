@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.26  -  Windows Incident Response Triage Toolkit
+Ophira v2.27  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -36,7 +36,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.26"
+$ScriptVersion = "2.27"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -86,6 +86,7 @@ function Get-ArgString {
 }
 
 function Get-KitRoot {
+    if ($KitRoot) { return $KitRoot }
     if ($PSScriptRoot) { return $PSScriptRoot }
     return (Get-Location).Path
 }
@@ -371,6 +372,21 @@ function Get-ToolsDir {
     $root = Get-KitRoot
     if (Test-Path (Join-Path $root 'tools')) { return (Join-Path $root 'tools') }
     return $null
+}
+
+function Copy-LockedFile {
+    # Read-only copy of an in-use file via esentutl VSS snapshot, with retry - parallel
+    # esentutl /vss calls (e.g. SRUM + NTDS in different workers) race on the VSS snapshot set.
+    param([string]$Source, [string]$Dest, [int]$Retries = 2)
+    $errTxt = ''
+    for ($i = 0; $i -le $Retries; $i++) {
+        $errTxt = & esentutl.exe /y "$Source" /vss /d "$Dest" 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Dest)) { return $true }
+        if ($i -lt $Retries) { Start-Sleep -Seconds (3 * ($i + 1)) }
+    }
+    $tail = (@($errTxt -split "\r?\n") | Where-Object { "$_".Trim() } | Select-Object -Last 1)
+    Write-CaseLog "    locked-file copy failed ($Source): $tail" 'DarkYellow'
+    return $false
 }
 
 function Get-HayabusaExe {
@@ -686,7 +702,8 @@ function Invoke-DeployMode {
                     Remove-Item "$using:remoteDir\bin.zip" -Force -ErrorAction SilentlyContinue
                 } -ErrorAction Stop
             }
-            $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$remoteDir\Ophira.ps1`" -Mode Collect -NoMenu -NoElevate -Preset $preset -OutputPath `"$remoteDir\out`" -CaseID `"$caseID`""
+            $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$remoteDir\Ophira.ps1`" -Mode Collect -NoMenu -NoElevate -Preset $preset -OutputPath `"$remoteDir\out`""
+            if ($caseID) { $cmd += " -CaseID `"$caseID`"" }
             if ($sharePath) { $cmd += " -SharePath `"$sharePath`"" }
             if ($logHours -ge 0) { $cmd += " -LogHours $logHours" }
             $res = Invoke-Command -Session $s -ScriptBlock {
@@ -1523,7 +1540,7 @@ function Get-ParseNeeds {
 }
 
 $script:SharedFunctions = @(
-    'Get-KitRoot', 'Get-ToolsDir', 'Get-LogStart', 'Get-IocList', 'Test-TrustedPublisher',
+    'Get-KitRoot', 'Get-ToolsDir', 'Copy-LockedFile', 'Get-LogStart', 'Get-IocList', 'Test-TrustedPublisher',
     'Save-Rows', 'Out-RawText', 'Invoke-ExeCapture', 'Invoke-NativeTool', 'Get-WmiOrCim', 'Convert-WmiDate',
     'Test-IsPublicIp', 'Test-IsUserWritablePath', 'Get-SignatureInfo', 'Get-SysmonState',
     'Get-UserProfileList', 'Get-UserAssistRows', 'ConvertTo-Rot13', 'Get-FilteredEvents', 'Export-Evtx',
@@ -1557,7 +1574,7 @@ function New-WorkerPreamble {
     }
     $seed = @{
         CaseDir  = $CaseDir;  CsvDir = $CsvDir;  RawDir = $RawDir;  MemDir = $MemDir
-        Computer = $Computer; Preset = $Preset
+        Computer = $Computer; Preset = $Preset; KitRoot = (Get-KitRoot)
     }
     foreach ($k in $seed.Keys) {
         $lit = "'" + ("$($seed[$k])" -replace "'", "''") + "'"
@@ -2166,6 +2183,9 @@ $script:Modules = @(
             $ft = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(2) -Start $start -Cap 1000 -Fields ([ordered]@{ Image = 'Image'; TargetFilename = 'TargetFilename'; CreationUtcTime = 'CreationUtcTime'; PreviousCreationUtcTime = 'PreviousCreationUtcTime' })
             Save-Rows -Name 'sysmon_file_time' -Rows $ft
             if ($ft.Count -gt 0) { Write-CaseLog "    EID 2 file creation-time changes: $($ft.Count) (timestomping data source)" 'Yellow' }
+            # v2.27: EID 1 process create - OriginalFileName vs Image feeds the renamed-LOLBIN at-rest rule
+            $pc = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(1) -Start $start -Cap 5000 -Fields ([ordered]@{ Image = 'Image'; OriginalFileName = 'OriginalFileName'; CommandLine = 'CommandLine'; User = 'User' })
+            Save-Rows -Name 'sysmon_proc_create' -Rows $pc
             Export-Evtx -LogName 'Microsoft-Windows-Sysmon/Operational' -FileName 'Sysmon_Operational.evtx'
         } }
     [pscustomobject]@{ Id = '4.4'; Cat = 'LOGS'; Name = 'RDP logs (LocalSessionManager + ConnectionManager)'; Default = $true; Quick = $false;
@@ -2481,8 +2501,7 @@ $script:Modules = @(
             $dest = Join-Path $RawDir 'sru'
             New-Item -ItemType Directory -Path $dest -Force | Out-Null
             $out = Join-Path $dest 'SRUDB.dat'
-            & esentutl.exe /y "$sru" /vss /d "$out" 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) { Write-CaseLog "    SRUM copy failed" 'DarkYellow' }
+            $null = Copy-LockedFile -Source $sru -Dest $out
         } }
     [pscustomobject]@{ Id = '5.4'; Cat = 'ARTIFACTS'; Name = 'Execution history (chainsaw: shimcache+amcache timeline, SRUM, evtx gaps)'; Default = $true; Quick = $false;
         Run = {
@@ -3084,7 +3103,7 @@ public class OphiraDump {
                     $outFile = Join-Path $sub $file
                         $ok = $false
                         try { Copy-Item -LiteralPath $src -Destination $outFile -Force -ErrorAction Stop; $ok = $true } catch { }
-                        if (-not $ok) { & esentutl.exe /y /vss "$src" /d "$outFile" 2>&1 | Out-Null; $ok = (Test-Path -LiteralPath $outFile) }
+                        if (-not $ok) { $ok = Copy-LockedFile -Source $src -Dest $outFile }
                         if ($ok) { $inv += [pscustomobject]@{ Browser = $b.Name; Profile = $pd; File = $file; Bytes = (Get-Item -LiteralPath $outFile).Length } }
                     }
                 }
@@ -3466,11 +3485,10 @@ public class OphiraDump {
                 if (Test-Path $ntds) {
                     $d = Join-Path $RawDir 'server\ntds'
                     New-Item -ItemType Directory -Path $d -Force | Out-Null
-                    & esentutl.exe /y "$ntds" /vss /d (Join-Path $d 'ntds.dit') 2>&1 | Out-Null
-                    if ($LASTEXITCODE -eq 0) {
+                    if (Copy-LockedFile -Source $ntds -Dest (Join-Path $d 'ntds.dit')) {
                         $inv += [pscustomobject]@{ Type = 'NTDS'; File = 'ntds.dit'; SizeMB = [math]::Round((Get-Item (Join-Path $d 'ntds.dit')).Length / 1MB, 2); LastWrite = (Get-Item (Join-Path $d 'ntds.dit')).LastWriteTime }
                         Write-CaseLog '    NTDS.dit VSS-copied (read-only copy; hash extraction is analyst-side only) -> raw\server\ntds' 'Yellow'
-                    } else { Write-CaseLog '    NTDS.dit VSS copy failed (needs admin + VSS)' 'DarkYellow' }
+                    }
                 }
             } elseif ($isDc) {
                 Write-CaseLog '    DC detected - NTDS.dit copy available with Full preset (module 8.14)' 'DarkGray'
@@ -4753,6 +4771,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'security_task_install'           = '4698 scheduled task installs with the task action - remote/atexec-style persistence'
         'security_share_access'           = '5140/5145 share access incl. admin-share writes - lateral movement + staging data source'
         'sysmon_process_access'           = 'Sysmon EID 10 ProcessAccess - LSASS credential-dump data source'
+        'sysmon_proc_create'              = 'Sysmon EID 1 process create with OriginalFileName - renamed-binary at-rest evidence'
         'sysmon_registry'                 = 'Sysmon EID 13 RegistryEvent - UAC bypass / persistence data source'
         'sysmon_file_time'                = 'Sysmon EID 2 file creation-time changes - timestomping evidence'
         'defender_config_events'          = 'Defender 5001/5007 - real-time protection disabled / exclusion changes (tamper)'
@@ -4845,6 +4864,7 @@ function New-SuperTimeline {
     & $weave 'sysmon_network' 5000 { param($r) @("$($r.Time)", 'network connection (Sysmon 3)', (& $leaf $r.Image), "$($r.DestIp):$($r.DestPort)", "proto $($r.Protocol)") }
     & $weave 'sysmon_dns' 5000 { param($r) @("$($r.Time)", 'DNS query (Sysmon 22)', (& $leaf $r.Image), "$($r.QueryName)", "resolved $($r.QueryResults)") }
     & $weave 'sysmon_image_load' 3000 { param($r) @("$($r.Time)", 'image load (Sysmon 7)', (& $leaf $r.Process), (& $leaf $r.Dll), "signed=$($r.Signed) $($r.Signature)") }
+    & $weave 'sysmon_proc_create' 5000 { param($r) @("$($r.Time)", 'process create (Sysmon 1)', (& $leaf $r.Image), '', $(if ("$($r.OriginalFileName)" -and ((Split-Path "$($r.Image)" -Leaf) -ne "$($r.OriginalFileName)")) { "ORIGINAL NAME: $($r.OriginalFileName) | $($r.CommandLine)" } else { "$($r.CommandLine)" })) }
     & $weave 'sysmon_process_access' 3000 { param($r) @("$($r.Time)", 'process access (Sysmon 10)', (& $leaf $r.SourceImage), (& $leaf $r.TargetImage), "granted=$($r.GrantedAccess) trace=$(("$($r.CallTrace)" -replace '\+.*', ''))") }
     & $weave 'sysmon_registry' 3000 { param($r) @("$($r.Time)", "registry event (Sysmon 13)", (& $leaf $r.Image), "$($r.TargetObject)", "$($r.EventType)") }
     & $weave 'sysmon_file_time' 1000 { param($r) @("$($r.Time)", 'file creation time changed (Sysmon 2)', (& $leaf $r.Image), (& $leaf $r.TargetFilename), "$($r.PreviousCreationUtcTime) -> $($r.CreationUtcTime)") }
@@ -5389,6 +5409,27 @@ function New-HuntFindings {
         if ($idHit.Count -gt 0 -and ($leaf -replace '\.exe$', '') -ne $idHit[0]) {
             & $find 'Renamed LOLBin (version-info mismatch)' 'high' $p "file '$leaf' but embedded identity '$($idHit[0])' (internal=$internal; original=$original)" 'T1036.003'
         }
+    }
+
+    # ---------- R1b: renamed LOLBin at rest - Sysmon EID1 OriginalFileName vs executed Image name ----------
+    # catches copies that already exited (live R1 only sees running processes); winupd.exe-class
+    $r1bSeen = @{}
+    foreach ($r in (Import-CaseCsv 'sysmon_proc_create')) {
+        $orig = "$($r.OriginalFileName)".ToLower().Trim()
+        if (-not $orig) { continue }
+        $img = "$($r.Image)"
+        $leaf = ''
+        try { $leaf = (Split-Path $img -Leaf).ToLower() } catch { continue }
+        if (-not $leaf) { continue }
+        $origBase = $orig -replace '\.exe$', ''
+        $leafBase = $leaf -replace '\.exe$', ''
+        if ($lolBins -notcontains "$origBase.exe" -or $leafBase -eq $origBase) { continue }
+        $key = "$leaf|$origBase"
+        if ($r1bSeen.ContainsKey($key)) { continue }
+        $r1bSeen[$key] = $true
+        $cmd = "$($r.CommandLine)"
+        if ($cmd.Length -gt 120) { $cmd = $cmd.Substring(0, 120) + '...' }
+        & $find 'Renamed LOLBin at rest (Sysmon identity mismatch)' 'high' $img "executed as '$leaf' but embedded identity '$origBase'$(if ($cmd) { " | cmd: $cmd" })" 'T1036.003'
     }
 
     # ---------- R2: DLL side-load live - proxy DLL loaded from user-writable path (Sysmon EID 7) ----------
