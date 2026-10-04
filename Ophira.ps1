@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.31  -  Windows Incident Response Triage Toolkit
+Ophira v2.32  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -31,13 +31,14 @@ param(
     [string]$TimelineStart = '',
     [string]$TimelineEnd = '',
     [string]$HayabusaPath = '',
+    [string]$CanaryTarget = '',
     [switch]$KeepLogging,
     [string]$DeltaPath = '',
     [string[]]$SetupTools,
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.31"
+$ScriptVersion = "2.32"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -2083,11 +2084,16 @@ $script:Modules = @(
             Save-Rows -Name 'security_events' -Rows $ev
             $auth = @($ev | Where-Object { @(4624, 4625) -contains $_.Id } | ForEach-Object {
                 $msg = "$($_.Message)"
-                $acct = if ($msg -match 'Account Name:\s+(\S+)') { $Matches[1] } else { '' }
+                # 4624/4625 have Subject: + New Logon: sections - the logon account/session live in the LAST
+                # Account Name / Logon ID (first = the caller's subject, often '-' or ANONYMOUS LOGON)
+                $names = [regex]::Matches($msg, 'Account Name:\s+([^\r\n]+)')
+                $lids = [regex]::Matches($msg, 'Logon ID:\s+(0x[0-9A-Fa-f]+)')
+                $acct = if ($names.Count -gt 0) { $names[$names.Count - 1].Groups[1].Value.Trim() } else { '' }
+                $subject = if ($names.Count -gt 0) { $names[0].Groups[1].Value.Trim() } else { '' }
                 $ip = if ($msg -match 'Source Network Address:\s+(\S+)') { $Matches[1] } else { '' }
                 $lt = if ($msg -match 'Logon Type:\s+(\d+)') { $Matches[1] } else { '' }
-                $lid = if ($msg -match 'Logon ID:\s+(0x[0-9A-Fa-f]+)') { $Matches[1] } else { '' }
-                [pscustomobject]@{ Time = $_.TimeCreated; EventId = $_.Id; Account = $acct; SourceIp = $ip; LogonType = $lt; LogonId = $lid }
+                $lid = if ($lids.Count -gt 0) { $lids[$lids.Count - 1].Groups[1].Value.Trim() } else { '' }
+                [pscustomobject]@{ Time = $_.TimeCreated; EventId = $_.Id; Account = $acct; SubjectAccount = $subject; SourceIp = $ip; LogonType = $lt; LogonId = $lid }
             })
             # account management EIDs (R6 account lifecycle) - TargetUserName-style EventData
             $acctEv = Get-EventDataRows -LogName 'Security' -Id @(4720, 4722, 4724, 4726, 4728, 4732, 4735, 4756) -Start $start -Cap 2000 -Fields ([ordered]@{ Account = 'TargetUserName'; SourceIp = 'IpAddress'; LogonType = ''; LogonId = '' })
@@ -6912,10 +6918,11 @@ function Invoke-TimelineMode {
 
 function Invoke-CanaryMode {
     # Detection self-test: plant safe, self-labeled test activity, enable the logging the
-    # hunt rules need, run a Quick collection, then score which detections fired.
+    # hunt rules need, run a collection, then score which detections fired. With -Target,
+    # also exercises the cross-host story (lateral SMB touch as canary_test -> R12/attribution).
     # The ONLY mode that changes endpoint state (audit policy + registry + test artifacts) -
     # audit changes are restored afterwards unless -KeepLogging.
-    param([switch]$KeepLogging)
+    param([switch]$KeepLogging, [string]$Target)
     Write-Host ""
     Write-Host "=== Detection canary (validate the pipeline end-to-end) ===" -ForegroundColor Cyan
     if (-not (Test-IsAdmin)) {
@@ -6924,12 +6931,20 @@ function Invoke-CanaryMode {
         try { Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $argStr"; return } catch { Write-Host "  Elevation declined - canary needs admin." -ForegroundColor Red; return $false }
     }
     if ($script:SimpleUI) { Write-Host "  Canary is a responder tool - not available in the simple owner UI." -ForegroundColor Yellow; return $false }
+    if (-not $Target) { $Target = (Read-Host "  Lateral target PC (IP/name, ENTER = single-host canary)").Trim() }
     Write-Host ""
     Write-Host "  This will, on THIS PC:" -ForegroundColor Yellow
     Write-Host "   - enable Process Creation + cmdline + scriptblock logging (restored after, unless -KeepLogging)"
     Write-Host "   - plant self-labeled test activity: renamed cmd copy, canary_test user (created + deleted),"
     Write-Host "     recon command burst, certutil fetch of a benign file"
-    Write-Host "   - run a Quick collection and score which hunt rules fired"
+    Write-Host "   - run a Standard collection and score which hunt rules fired"
+    if ($Target) {
+        Write-Host "  And on TARGET '$Target':" -ForegroundColor Yellow
+        Write-Host "   - enable the same audits (+ Detailed File Share) - restored after"
+        Write-Host "   - receive an SMB session + a labeled file write from canary_test (\\Target\C$\Users\Public\canary_lateral.exe)"
+        Write-Host "   - receive its own collection, scored for the cross-host detections"
+        Write-Host "  The target must be domain-joined and reachable (this account needs remote-admin rights on it)." -ForegroundColor Yellow
+    }
     Write-Host "  Lab / validation use only - never run it as part of a live investigation." -ForegroundColor Yellow
     $go = (Read-Host "  Run the canary here? [y/N]").Trim()
     if ($go -notmatch '^(?i)y') { Write-Host "  Cancelled." -ForegroundColor Gray; return $false }
@@ -6961,6 +6976,27 @@ function Invoke-CanaryMode {
         else { Set-ItemProperty -Path $psKey -Name EnableScriptBlockLogging -Value 1 -Force; $undo.Add("regset|$psKey|EnableScriptBlockLogging|$sbHad") }
         Write-Host "    PowerShell script block logging - enabled" -ForegroundColor Gray
     } else { Write-Host "    PowerShell script block logging - already on" -ForegroundColor DarkGray }
+    $bUndo = @()
+    if ($Target) {
+        Write-Host "    target ${Target}: enabling audits..." -ForegroundColor Gray
+        try {
+            $bUndo = @(Invoke-Command -ComputerName $Target -ScriptBlock {
+                param([string[]]$Subs)
+                $undo = @()
+                foreach ($sub in $Subs) {
+                    $before = (& auditpol.exe /get /subcategory:"$sub" 2>$null | Out-String)
+                    if ($before -match '(?i)Success') { continue }
+                    $null = & auditpol.exe /set /subcategory:"$sub" /success:enable 2>&1
+                    $undo += "auditpol|$sub"
+                }
+                return $undo
+            } -ArgumentList (, @('Process Creation', 'User Account Management', 'Security Group Management', 'Detailed File Share')) -ErrorAction Stop)
+            Write-Host "    target ${Target}: audits ready ($(@($bUndo).Count) newly enabled)" -ForegroundColor Gray
+        } catch {
+            Write-Host "    target unreachable/forbidden ($($_.Exception.Message)) - continuing single-host" -ForegroundColor DarkYellow
+            $Target = ''
+        }
+    }
 
     # ---- phase 2: plant the battery (everything self-labeled 'canary') ----
     Write-Host "  [2/4] Planting test activity..." -ForegroundColor Cyan
@@ -6968,9 +7004,26 @@ function Invoke-CanaryMode {
     Copy-Item "$env:SystemRoot\System32\cmd.exe" $canExe -Force
     $null = & $canExe /c "echo canary > `"$env:TEMP\canary_out.txt`"" 2>&1
     Write-Host "    renamed cmd copy run (canary_renamed.exe)" -ForegroundColor Gray
-    $null = & net.exe user canary_test /add 2>&1
+    $canPass = 'Canary!2026'
+    $null = & net.exe user canary_test $canPass /add 2>&1
     $null = & net.exe localgroup administrators canary_test /add 2>&1
-    Write-Host "    canary_test user created + added to Administrators" -ForegroundColor Gray
+    Write-Host "    canary_test user created + added to Administrators (kept alive for the lateral leg)" -ForegroundColor Gray
+    if ($Target) {
+        $lateralOk = $false
+        $null = & net.exe use "\\$Target\C$" /delete 2>&1
+        $null = & net.exe use "\\$Target\C$" $canPass /user:"$env:USERDOMAIN\canary_test" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $null = & cmd.exe /c "dir \\$Target\C$\Users\Public > nul" 2>&1
+            try {
+                Copy-Item $canExe "\\$Target\C$\Users\Public\canary_lateral.exe" -Force -ErrorAction Stop
+                $lateralOk = $true
+                Write-Host "    lateral: SMB session as canary_test + canary_lateral.exe written to target admin share" -ForegroundColor Gray
+            } catch { Write-Host "    lateral write failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+            $null = & net.exe use "\\$Target\C$" /delete 2>&1
+        } else {
+            Write-Host "    lateral SMB failed (target not domain-aware of this canary user?) - B-side checks will be BLIND" -ForegroundColor DarkYellow
+        }
+    }
     $recon = @(
         { & whoami.exe 2>&1 }, { & net.exe user 2>&1 }, { & net.exe localgroup administrators 2>&1 },
         { & nltest.exe /dclist:"$env:USERDOMAIN" 2>&1 }, { & systeminfo.exe 2>&1 }, { & ipconfig.exe /all 2>&1 },
@@ -6984,6 +7037,7 @@ function Invoke-CanaryMode {
     } catch { Write-Host "    certutil fetch skipped (offline?)" -ForegroundColor DarkYellow }
     $null = & net.exe localgroup administrators canary_test /delete 2>&1
     $null = & net.exe user canary_test /delete 2>&1
+    if ($Target) { $null = Invoke-Command -ComputerName $Target -ScriptBlock { Remove-Item C:\Users\Public\canary_lateral.exe -Force -ErrorAction SilentlyContinue } -ErrorAction SilentlyContinue }
     Write-Host "    canary_test removed (all planted artifacts are self-labeled)" -ForegroundColor Gray
 
     # ---- phase 3: collection (Standard: Quick excludes the 4688/auth parses the scorecard reads) ----
@@ -6995,6 +7049,16 @@ function Invoke-CanaryMode {
     $case = @(Get-ChildItem -Path $kit -Directory -Filter 'OPHIRA_*' -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_ } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
     if (-not $case) { Write-Host "  collection produced no case folder - see collection.log" -ForegroundColor Red; return $false }
     $csv = Join-Path $case.FullName 'csv'
+    $bZip = $null
+    if ($Target) {
+        Write-Host "  [3/4] Collecting on target $Target (Standard)..." -ForegroundColor Cyan
+        $beforeZips = @(Get-ChildItem -Path (Join-Path $kit 'collections') -Filter 'OPHIRA_*.zip' -File -ErrorAction SilentlyContinue)
+        try {
+            Invoke-DeployMode -Targets @($Target) -DeployPreset 'Standard' -Cred $null -DeployCaseID 'CANARY' -DeploySharePath '' -Threads 1 -PushBin $false -DeployLogHours 168
+            $bZip = Get-ChildItem -Path (Join-Path $kit 'collections') -Filter 'OPHIRA_*.zip' -File -ErrorAction SilentlyContinue | Where-Object { $beforeZips -notcontains $_ } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        } catch { Write-Host "    target collection failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+        if (-not $bZip) { Write-Host "    no result zip from target - B-side checks will be BLIND" -ForegroundColor DarkYellow }
+    }
 
     # ---- phase 4: scorecard ----
     Write-Host ""
@@ -7026,6 +7090,35 @@ function Invoke-CanaryMode {
     Write-Host ("    Pipeline: {0}/{1} canary detections fired. Case verdict: {2}" -f $score, $possible, $(if ($verdict) { "$($verdict.Level) ($($verdict.ConfidencePercent)%)" })) -ForegroundColor $(if ($score -eq $possible) { 'Green' } elseif ($score -gt 0) { 'Yellow' } else { 'Red' })
     Write-Host "    Report: $((Join-Path $case.FullName 'report.html'))" -ForegroundColor Gray
 
+    # ---- phase 4b: cross-host scorecard (target side) ----
+    if ($bZip) {
+        Write-Host ""
+        Write-Host "  Cross-host scorecard - target case: $($bZip.BaseName)" -ForegroundColor Cyan
+        $bDir = Join-Path ([IO.Path]::GetTempPath()) ("canary_b_" + (Get-Date -Format 'HHmmss'))
+        try { Expand-Archive -LiteralPath $bZip.FullName -DestinationPath $bDir -Force } catch { Write-Host "    cannot extract target case: $($_.Exception.Message)" -ForegroundColor Red; $bDir = $null }
+        if ($bDir) {
+            $bcsv = Join-Path $bDir 'csv'
+            $bAuth = @(Import-Csv -LiteralPath (Join-Path $bcsv 'security_auth_events.csv') -ErrorAction SilentlyContinue)
+            $bShare = @(Import-Csv -LiteralPath (Join-Path $bcsv 'security_share_access.csv') -ErrorAction SilentlyContinue)
+            $bSess = @(Import-Csv -LiteralPath (Join-Path $bcsv 'session_activity.csv') -ErrorAction SilentlyContinue)
+            $bHf = @(Import-Csv -LiteralPath (Join-Path $bcsv 'hunt_findings.csv') -ErrorAction SilentlyContinue)
+            $bChecks = @(
+                @{ L = 'B 4624 type-3 from canary_test';     Hit = 0; Data = @($bAuth | Where-Object { "$($_.EventId)" -eq '4624' -and "$($_.LogonType)" -eq '3' -and "$($_.Account)" -match 'canary_test' }).Count; DataWhy = 'network logon did not arrive (audit off on target, or SMB leg failed)' }
+                @{ L = 'B 5145 share access captured';       Hit = 0; Data = @($bShare | Where-Object { $_ -match 'canary|C\$' }).Count;            DataWhy = 'Detailed File Share audit not active at touch time' }
+                @{ L = 'B session attribution join';         Hit = 0; Data = @($bSess | Where-Object { $_ -match 'canary' }).Count;                DataWhy = 'no canary share/process activity to attribute' }
+                @{ L = 'B R12  admin-share executable staging'; Hit = @($bHf | Where-Object { $_.Rule -match 'Admin-share' }).Count; Data = @($bShare | Where-Object { $_ -match 'canary_lateral\.exe' }).Count; DataWhy = '5145 rows missing (audit off) or write leg failed' }
+            )
+            $bs = 0
+            foreach ($c in $bChecks) {
+                if ($c.Hit -gt 0) { $bs++; Write-Host ("    {0}  FIRED" -f $c.L) -ForegroundColor Green }
+                elseif ($c.Data -gt 0) { Write-Host ("    {0}  MISS - data present (x{1}) but rule silent: file this" -f $c.L, $c.Data) -ForegroundColor Red }
+                else { Write-Host ("    {0}  BLIND - {1}" -f $c.L, $c.DataWhy) -ForegroundColor Yellow }
+            }
+            Write-Host ("    Cross-host: {0}/{1} fired. Fleet stitch check: .\Ophira.ps1 -Mode Analyze -AnalyzePath <collections>" -f $bs, $bChecks.Count) -ForegroundColor Gray
+            Remove-Item $bDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # ---- cleanup + restore ----
     Remove-Item $canExe, "$env:TEMP\canary_out.txt", "$env:TEMP\canary_dl.bin" -Force -ErrorAction SilentlyContinue
     if (-not $KeepLogging -and $undo.Count -gt 0) {
@@ -7040,6 +7133,15 @@ function Invoke-CanaryMode {
         }
         Write-Host "  Restored. Re-run with -KeepLogging to leave logging enabled." -ForegroundColor DarkGray
     } elseif ($KeepLogging) { Write-Host "  Logging left enabled (-KeepLogging)." -ForegroundColor DarkGray }
+    if ($Target -and @($bUndo).Count -gt 0 -and -not $KeepLogging) {
+        try {
+            $null = Invoke-Command -ComputerName $Target -ScriptBlock {
+                param([string[]]$Undo)
+                foreach ($u in $Undo) { $p2 = $u -split '\|'; $null = & auditpol.exe /set /subcategory:"$($p2[1])" /success:disable 2>&1 }
+            } -ArgumentList (, @($bUndo)) -ErrorAction Stop
+            Write-Host "  Target audit state restored." -ForegroundColor DarkGray
+        } catch { Write-Host "  Target audit restore failed - restore manually on ${Target}:" -ForegroundColor Yellow; $bUndo | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow } }
+    }
     return $true
 }
 
@@ -7197,7 +7299,7 @@ if ($bareLaunch -and [Environment]::UserInteractive) {
                 'Parse' { Invoke-ParseMode | Out-Null }
                 'Process' { Invoke-ProcessPivot | Out-Null }
                 'Timeline' { Invoke-TimelineMode | Out-Null }
-                'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging | Out-Null }
+                'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging -Target $CanaryTarget | Out-Null }
                 'Links' { Show-ToolLinks }
             }
             Write-Host ""
@@ -7224,7 +7326,7 @@ if ($Mode -ne 'Collect') {
         'Parse' { Invoke-ParseMode -Path $ParsePath | Out-Null }
         'Process' { Invoke-ProcessPivot -Path $ParsePath -Indicator $ProcessName | Out-Null }
         'Timeline' { Invoke-TimelineMode -Path $ParsePath -Start $TimelineStart -End $TimelineEnd | Out-Null }
-        'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging | Out-Null }
+        'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging -Target $CanaryTarget | Out-Null }
     }
     exit 0
 }

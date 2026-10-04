@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.32
+- **Cross-host canary (`-Mode Canary -Target <ip>`)**: the self-test now exercises the lateral story end-to-end - enables audits on the TARGET remotely (incl. **Detailed File Share**/5145, the piece the pilot found missing), SMB session as the domain canary_test user, labeled `canary_lateral.exe` write to the target admin share (arms R12), remote Standard collection via the deploy path, then a B-side scorecard: 4624 type-3 / 5145 capture / session-attribution join / **R12 fired**, with target audits restored after. Unreachable target degrades to the single-host canary
+- **Fix: 4624/4625 parse took the Subject section instead of New Logon** - `Account` was often `-`/machine account and `LogonId` was the subject's (often `0x0`), so session attribution (4624 x 4688/5145 joins) keyed on the wrong session. Now parses the New Logon section (last match) + captures `SubjectAccount` separately - the join semantics finally match 5145's SubjectUserLogonId
+- Tests: `tests\test_v232.ps1` (20 checks) - lateral wiring/ordering/restore, 4624 parse fix through real module 4.1
+
 ## v2.31
 - **Narrative case draft**: new `Get-CaseNarrative` turns the verdict + hunt findings into a plain-language executive draft (`case_draft.txt` + a "Case draft" section under the verdict in report.html): assessment line, WHAT THE EVIDENCE SHOWS (strong signals with details, weight-2 as "also seen"), BEST LEADS (high-severity detections with ATT&CK tags), WHAT THIS ASSESSMENT COULD NOT SEE (missing coverage + absence-is-not-proof), CAVEATS. Machine-generated starting point for the analyst's report - deterministic template, explicitly marked "edit before use"; degrades to an honest note when the verdict engine didn't run
 - Tests: `tests\test_v231.ps1` (12 checks) - draft content through the real function (strong/notable/leads/caveats/coverage-missing), no-verdict path, regen + report + index wiring

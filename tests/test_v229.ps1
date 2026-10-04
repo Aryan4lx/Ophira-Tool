@@ -17,8 +17,8 @@ Check "param: Canary in ValidateSet" ($src -match [regex]::Escape("'Process', 'T
 Check "param: -KeepLogging switch exists" ($src -match '\[switch\]\$KeepLogging')
 Check "menu: [C] canary entry shown" ($src -match '\[C\]  Detection canary')
 Check "menu: C returns Canary" ($src -match [regex]::Escape("'^(?i)c$' { return 'Canary' }"))
-Check "dispatch: menu site wired" ($src -match [regex]::Escape("'Canary' { Invoke-CanaryMode -KeepLogging:`$KeepLogging | Out-Null }`r`n                'Links'"))
-Check "dispatch: -Mode site wired" ($src -match [regex]::Escape("'Canary' { Invoke-CanaryMode -KeepLogging:`$KeepLogging | Out-Null }`r`n    }`r`n    exit 0"))
+Check "dispatch: menu site wired" ($src -match [regex]::Escape("'Canary' { Invoke-CanaryMode -KeepLogging:`$KeepLogging -Target `$CanaryTarget | Out-Null }`r`n                'Links'"))
+Check "dispatch: -Mode site wired" ($src -match [regex]::Escape("'Canary' { Invoke-CanaryMode -KeepLogging:`$KeepLogging -Target `$CanaryTarget | Out-Null }`r`n    }`r`n    exit 0"))
 
 # ============================================================================
 # PART 2 - consent + guard rails
@@ -39,7 +39,7 @@ Check "logging: Process Creation + account mgmt + group mgmt audits" ($src -matc
 Check "logging: 4688 cmdline registry enable" ($src -match 'ProcessCreationIncludeCmdLine_Enabled')
 Check "logging: script block logging enable" ($src -match 'EnableScriptBlockLogging')
 Check "battery: renamed cmd labeled canary_renamed" ($src -match [regex]::Escape("'canary_renamed.exe'"))
-Check "battery: canary_test user created AND removed" ($src -match 'net\.exe user canary_test /add' -and $src -match 'net\.exe user canary_test /delete')
+Check "battery: canary_test user created AND removed" ($src -match 'net\.exe user canary_test \$canPass /add' -and $src -match 'net\.exe user canary_test /delete')
 Check "battery: privileged group add AND remove" ($src -match 'localgroup administrators canary_test /add' -and $src -match 'localgroup administrators canary_test /delete')
 Check "battery: recon burst >=8 distinct tools" ((@('whoami.exe','net.exe','nltest.exe','systeminfo.exe','ipconfig.exe','quser.exe','tasklist.exe','klist.exe','netstat.exe') | Where-Object { $src -match [regex]::Escape("& $($_)") }).Count -ge 8)
 Check "battery: certutil benign fetch" ($src -match 'certutil\.exe -urlcache')
