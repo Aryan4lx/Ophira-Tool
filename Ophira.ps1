@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.25  -  Windows Incident Response Triage Toolkit
+Ophira v2.26  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -36,7 +36,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.25"
+$ScriptVersion = "2.26"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -402,18 +402,71 @@ function Test-TrustedPublisher {
 }
 
 function Get-IocList {
+    # IOC feeds: classic tools\iocs.txt PLUS v2.26 feed folder tools\iocs\*.json
+    # (STIX 2.x bundles and MISP exports - drop files in, no network, no API keys).
+    # $iocs.Feed maps each indicator to its source feed for hit attribution.
     $tDir = Get-ToolsDir
     if (-not $tDir) { return $null }
+    $iocs = @{ Hashes = @{}; Sha1 = @{}; Ips = @{}; Domains = @{}; Names = @{}; Feed = @{} }
+    $addIoc = {
+        param([string]$kind, [string]$key, [string]$feed)
+        if (-not $key) { return }
+        if ($kind -eq 'sha1') { $iocs.Sha1[$key] = $true; $iocs.Hashes[$key] = $true }
+        elseif ($kind -eq 'hash') { $iocs.Hashes[$key] = $true }
+        elseif ($kind -eq 'ip') { $iocs.Ips[$key] = $true }
+        elseif ($kind -eq 'name') { $iocs.Names[$key] = $true }
+        else { $iocs.Domains[$key] = $true }
+        if (-not $iocs.Feed.ContainsKey($key)) { $iocs.Feed[$key] = $feed }
+    }
     $f = Join-Path $tDir 'iocs.txt'
-    if (-not (Test-Path -LiteralPath $f)) { return $null }
-    $iocs = @{ Hashes = @{}; Sha1 = @{}; Ips = @{}; Domains = @{} }
-    foreach ($line in (Get-Content -LiteralPath $f)) {
-        $l = ($line -replace '#.*$', '').Trim()
-        if (-not $l) { continue }
-        if ($l -match '^[a-fA-F0-9]{40}$') { $iocs.Sha1[$l.ToUpper()] = $true; $iocs.Hashes[$l.ToUpper()] = $true }
-        elseif ($l -match '^[a-fA-F0-9]{32,64}$') { $iocs.Hashes[$l.ToUpper()] = $true }
-        elseif ($l -match '^(\d{1,3}\.){3}\d{1,3}$') { $iocs.Ips[$l] = $true }
-        else { $iocs.Domains[$l.ToLower()] = $true }
+    if (Test-Path -LiteralPath $f) {
+        foreach ($line in (Get-Content -LiteralPath $f)) {
+            $l = ($line -replace '#.*$', '').Trim()
+            if (-not $l) { continue }
+            if ($l -match '^[a-fA-F0-9]{40}$') { & $addIoc 'sha1' $l.ToUpper() 'iocs.txt' }
+            elseif ($l -match '^[a-fA-F0-9]{32,64}$') { & $addIoc 'hash' $l.ToUpper() 'iocs.txt' }
+            elseif ($l -match '^(\d{1,3}\.){3}\d{1,3}$') { & $addIoc 'ip' $l 'iocs.txt' }
+            else { & $addIoc 'domain' $l.ToLower() 'iocs.txt' }
+        }
+    }
+    $feedDir = Join-Path $tDir 'iocs'
+    if (Test-Path -LiteralPath $feedDir) {
+        foreach ($jf in @(Get-ChildItem -LiteralPath $feedDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+            $feedName = $jf.BaseName
+            try {
+                $j = Get-Content -LiteralPath $jf.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
+                # STIX 2.x bundle
+                if ($j.type -eq 'bundle' -and $j.objects) {
+                    foreach ($o in @($j.objects)) {
+                        if ("$($o.type)" -ne 'indicator' -or -not "$($o.pattern)") { continue }
+                        $p = "$($o.pattern)"
+                        foreach ($m in ([regex]::Matches($p, "(?i)hashes\.'?(?:SHA|MD5)[^']*'?\s*=\s*'([a-f0-9]{32,64})'"))) {
+                            & $addIoc $(if ($m.Groups[1].Value.Length -eq 40) { 'sha1' } else { 'hash' }) $m.Groups[1].Value.ToUpper() $feedName
+                        }
+                        foreach ($m in ([regex]::Matches($p, "(?i)domain-name:value\s*=\s*'([^']+)'"))) { & $addIoc 'domain' $m.Groups[1].Value.ToLower() $feedName }
+                        foreach ($m in ([regex]::Matches($p, "(?i)(ipv4|ipv6)-addr:value\s*=\s*'([^']+)'"))) { & $addIoc 'ip' $m.Groups[2].Value $feedName }
+                        foreach ($m in ([regex]::Matches($p, "(?i)file:name\s*=\s*'([^']+)'"))) { & $addIoc 'name' $m.Groups[1].Value.ToLower() $feedName }
+                    }
+                }
+                # MISP export (direct or response-wrapped)
+                $attrs = $null
+                if ($j.Attribute) { $attrs = @($j.Attribute) }
+                elseif ($j.response -and $j.response.Attribute) { $attrs = @($j.response.Attribute) }
+                if ($attrs) {
+                    foreach ($a in $attrs) {
+                        $av = "$($a.value)"; $at = "$($a.type)"
+                        if (-not $av -or -not $at) { continue }
+                        switch -Regex ($at) {
+                            '^(md5|sha256)$' { & $addIoc 'hash' $av.ToUpper() $feedName }
+                            '^sha1$' { & $addIoc 'sha1' $av.ToUpper() $feedName }
+                            '^(domain|hostname)' { & $addIoc 'domain' $av.ToLower() $feedName }
+                            '^ip-(dst|src)' { & $addIoc 'ip' $av $feedName }
+                            '^filename' { & $addIoc 'name' $av.ToLower() $feedName }
+                        }
+                    }
+                }
+            } catch { Write-CaseLog "    IOC feed '$feedName' failed to parse: $($_.Exception.Message)" 'DarkYellow' }
+        }
     }
     if ($iocs.Hashes.Count -eq 0 -and $iocs.Ips.Count -eq 0 -and $iocs.Domains.Count -eq 0) { return $null }
     return $iocs
@@ -3019,12 +3072,16 @@ public class OphiraDump {
                     $profileDirs += @(Get-ChildItem -LiteralPath $b.Root -Directory -Filter 'Profile *' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
                 } catch { }
                 foreach ($pd in $profileDirs) {
-                    foreach ($file in @('History', 'Downloads', 'Preferences', 'Bookmarks')) {
+                    foreach ($file in @('History', 'Downloads', 'Preferences', 'Bookmarks', 'Login Data')) {
                         $src = Join-Path $b.Root "$pd\$file"
                         if (-not (Test-Path -LiteralPath $src)) { continue }
                         $sub = Join-Path $dst "$($b.Name)_$pd"
-                        if (-not (Test-Path -LiteralPath $sub)) { New-Item -ItemType Directory -Path $sub -Force | Out-Null }
-                        $outFile = Join-Path $sub $file
+                    if (-not (Test-Path -LiteralPath $sub)) { New-Item -ItemType Directory -Path $sub -Force | Out-Null }
+                    foreach ($rootFile in @('Local State')) {
+                        $rs = Join-Path $b.Root $rootFile
+                        if (Test-Path -LiteralPath $rs) { Copy-Item -LiteralPath $rs -Destination (Join-Path $sub $rootFile) -Force -ErrorAction SilentlyContinue }
+                    }
+                    $outFile = Join-Path $sub $file
                         $ok = $false
                         try { Copy-Item -LiteralPath $src -Destination $outFile -Force -ErrorAction Stop; $ok = $true } catch { }
                         if (-not $ok) { & esentutl.exe /y /vss "$src" /d "$outFile" 2>&1 | Out-Null; $ok = (Test-Path -LiteralPath $outFile) }
@@ -3419,6 +3476,68 @@ public class OphiraDump {
                 Write-CaseLog '    DC detected - NTDS.dit copy available with Full preset (module 8.14)' 'DarkGray'
             }
             Save-Rows -Name 'server_logs' -Rows $inv
+        } }
+    [pscustomobject]@{ Id = '8.15'; Cat = 'CONTEXT'; Name = 'Credential exposure sweep (auto-logon, WLAN keys, DPAPI vault, LSASS dumps, browser Login Data)'; Default = $true; Quick = $false;
+        Run = {
+            $rows = @()
+            # auto-logon: user name + whether a plaintext password value exists (value itself NOT copied to csv)
+            $wl = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
+            if ($wl -and "$($wl.DefaultUserName)") {
+                $hasPw = -not [string]::IsNullOrEmpty("$($wl.DefaultPassword)")
+                $rows += [pscustomobject]@{ Item = 'Auto-logon (Winlogon)'; Detail = "user '$($wl.DefaultUserName)', cached password: $(if ($hasPw) { 'PRESENT' } else { 'absent' })"; Risk = $(if ($hasPw) { 'HIGH' } else { 'LOW' }) }
+            }
+            # WLAN profiles - keys captured into raw\wifi (evidence, analyst material)
+            $wifiProfiles = @()
+            try {
+                foreach ($l in (& netsh.exe wlan show profiles 2>$null | ForEach-Object { "$_" })) {
+                    if ($l -match 'All User Profile\s*:\s*(.+)$') { $wifiProfiles += $Matches[1].Trim() }
+                }
+            } catch { }
+            foreach ($p in $wifiProfiles) {
+                try {
+                    $d = (& netsh.exe wlan show profile name="$p" key=clear 2>$null | ForEach-Object { "$_" }) -join "`n"
+                    $auth = ''; if ($d -match 'Authentication\s*:\s*(\S+)') { $auth = $Matches[1] }
+                    $hasKey = $d -match 'Key Content\s*:\s*(\S)'
+                    Out-RawText -SubDir 'wifi' -Name ("wlan_" + ($p -replace '[^\w\.-]', '_') + ".txt") -Text ($d -split "`n")
+                    $rows += [pscustomobject]@{ Item = "WLAN profile '$p'"; Detail = "auth $auth, key $(if ($hasKey) { 'CAPTURED -> raw\wifi' } else { 'not stored' })"; Risk = $(if ($hasKey) { 'MEDIUM' } else { 'LOW' }) }
+                } catch { }
+            }
+            # DPAPI vault + protect blobs (analyst-side decryption) per user
+            $vaultCount = 0
+            foreach ($u in (@(Get-ChildItem "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Public|Default|All Users' }))) {
+                foreach ($sub in @('AppData\Local\Microsoft\Credentials', 'AppData\Roaming\Microsoft\Credentials', 'AppData\Local\Microsoft\Protect')) {
+                    $src = Join-Path $u.FullName $sub
+                    if (-not (Test-Path $src)) { continue }
+                    $files = @(Get-ChildItem -LiteralPath $src -Recurse -File -ErrorAction SilentlyContinue)
+                    if ($files.Count -eq 0) { continue }
+                    $d = Join-Path $RawDir "vault\$($u.Name)\$([IO.Path]::GetFileName($sub))"
+                    New-Item -ItemType Directory -Path $d -Force | Out-Null
+                    $files | Copy-Item -Destination $d -Force -ErrorAction SilentlyContinue
+                    $vaultCount += $files.Count
+                }
+            }
+            if ($vaultCount -gt 0) { $rows += [pscustomobject]@{ Item = 'DPAPI vault blobs'; Detail = "$vaultCount credential/protect blob(s) -> raw\vault (analyst-side decrypt)"; Risk = 'MEDIUM' } }
+            # LSASS dump hunt - shallow, fast, well-known drop spots (recorded, never copied)
+            $dmpRoots = @("$env:TEMP", "$env:SystemRoot\Temp", "$env:ProgramData")
+            foreach ($u in (@(Get-ChildItem "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Public|Default|All Users' }))) {
+                $dmpRoots += @((Join-Path $u.FullName 'AppData\Local\Temp'), (Join-Path $u.FullName 'Documents'), (Join-Path $u.FullName 'Desktop'))
+            }
+            $dmp = @()
+            foreach ($root in $dmpRoots) {
+                if (-not $root -or -not (Test-Path $root)) { continue }
+                try { $dmp += @(Get-ChildItem -LiteralPath $root -Filter '*.dmp' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)lsass|dump' }) } catch { }
+                if (@($dmp).Count -ge 10) { break }
+            }
+            foreach ($f in (($dmp | Sort-Object FullName -Unique) | Select-Object -First 10)) {
+                $rows += [pscustomobject]@{ Item = 'Possible credential dump on disk'; Detail = "$($f.FullName) ($([math]::Round($f.Length / 1MB, 1)) MB)"; Risk = 'HIGH' }
+            }
+            Save-Rows -Name 'credential_sweep' -Rows $rows
+            $hot = @($rows | Where-Object { "$($_.Risk)" -eq 'HIGH' }).Count
+            if ($rows.Count -gt 0) {
+                Write-CaseLog "    credential sweep: $($rows.Count) finding(s) ($hot HIGH) -> csv\credential_sweep.csv" $(if ($hot -gt 0) { 'Red' } else { 'Gray' })
+            } else {
+                Write-CaseLog '    credential sweep: no exposure findings (no auto-logon, no WLAN keys, no vault blobs, no dumps)' 'Gray'
+            }
         } }
 )
 
@@ -3993,6 +4112,8 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     }
     $yaraScanned = @(Import-CaseCsv 'yara_scanned.csv')
     foreach ($y in ($yaraScanned | Where-Object { "$($_.Hits)" -match '^\d+$' -and [int]$_.Hits -gt 0 -and "$($_.SHA256)" })) { $iocBlock.Add("sha256  $($y.SHA256)") }
+    foreach ($h in (Import-CaseCsv 'ioc_hits_dns')) { $iocBlock.Add("domain  $($h.Query)"); if ("$($h.Resolved)") { $iocBlock.Add("ip  $(("$($h.Resolved)" -split '[,;]')[0].Trim())") } }
+    foreach ($h in (Import-CaseCsv 'ioc_hits_network')) { $iocBlock.Add("ip  $($h.RemoteIp)") }
     $iocUnique = @($iocBlock.ToArray() | Sort-Object -Unique)
     if ($iocUnique.Count -gt 0) {
         $null = $sb.AppendLine("<h3>Copy-ready indicator list (defanged)</h3><pre class='ioc'>")
@@ -4435,6 +4556,16 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         }
         $null = $sb.AppendLine("</table>")
     }
+    $credSweep = @(Import-CaseCsv 'credential_sweep.csv')
+    if ($credSweep.Count -gt 0) {
+        $snapAny = $true
+        $null = $sb.AppendLine("<h3>Credential exposure sweep</h3><table><tr><th>Risk</th><th>Item</th><th>Detail</th></tr>")
+        foreach ($c3 in ($credSweep | Select-Object -First 12)) {
+            $rCls = switch -Regex ("$($c3.Risk)") { 'HIGH' { 'crit'; break } 'MEDIUM' { 'med'; break } default { 'info' } }
+            $null = $sb.AppendLine("<tr><td class='$rCls'><b>$(ConvertTo-HtmlEsc $c3.Risk)</b></td><td>$(ConvertTo-HtmlEsc $c3.Item)</td><td class='path'>$(ConvertTo-HtmlEsc $c3.Detail)</td></tr>")
+        }
+        $null = $sb.AppendLine("</table><div class='meta'>WLAN keys and DPAPI vault blobs ship under raw\ for analyst-side handling only - treat the case folder as sensitive material. Source: csv\credential_sweep.csv</div>")
+    }
     if ($savedCreds.Count -gt 0) {
         $snapAny = $true
         $null = $sb.AppendLine("<h3>Stored credentials on this host (lateral movement risk)</h3><table><tr><th>Entry</th></tr>")
@@ -4598,6 +4729,10 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'wer_reports'                     = 'Windows Error Reporting crash reports (faulting app/module) - evidence of failed attacker tooling'
         'server_logs'                     = 'Inventory of copied server-role logs (DNS/DHCP audit, SYSVOL policies, NTDS.dit on Full+DC)'
         'registry_recmd'                  = 'RECmd batch registry deep-dive (persistence/execution/lateral keys across all saved hives) - analyst-side enrichment'
+        'ioc_hits_dns'                    = 'IOC-listed domains observed in Sysmon DNS queries (feed-attributed)'
+        'ioc_hits_network'                = 'IOC-listed IPs observed in historical connections (feed-attributed)'
+        'ioc_hits_mft'                    = 'IOC-listed filenames found on disk ($MFT, exact name match)'
+        'credential_sweep'                = 'Credential exposure: auto-logon, WLAN keys (raw\wifi), DPAPI vault (raw\vault), LSASS dumps on disk'
         'usn_write_bursts'                = 'USN journal: mass file-modification windows (ransomware)'
         'lnk_parsed'                      = 'LNK parse (Recent docs - what files were opened)'
         'jumplist_parsed*'                = 'Jump List parse (per-app recent files)'
@@ -5186,6 +5321,45 @@ function New-ProcessChains {
     } else {
         Write-CaseLog '    process lineage: flagged binaries have no parent edges in this case' 'DarkGray'
     }
+}
+
+function New-IocHits {
+    # v2.26: xref the structured case telemetry against the IOC feeds (iocs.txt + tools\iocs\).
+    # Historical DNS queries + network connections + $MFT dropped-filename exact matches.
+    $iocs = Get-IocList
+    if (-not $iocs) { return }
+    $feedOf = { param($k) $f = $iocs.Feed[$k]; if ($f) { $f } else { 'iocs.txt' } }
+    $dns = @()
+    foreach ($r in (Import-CaseCsv 'sysmon_dns')) {
+        $q = "$($r.QueryName)".ToLower()
+        if (-not $q) { continue }
+        foreach ($k in $iocs.Domains.Keys) {
+            if ($q -eq $k -or $q.EndsWith(".$k")) {
+                $dns += [pscustomobject]@{ Indicator = $k; Feed = (& $feedOf $k); Query = $q; Process = "$($r.Image)"; Resolved = "$($r.QueryResults)"; Match = 'dns-query' }
+                break
+            }
+        }
+    }
+    Save-Rows -Name 'ioc_hits_dns' -Rows $dns
+    if (@($dns).Count -gt 0) { Write-CaseLog "    DNS IOC HITS: $(@($dns).Count) query/queries to known-bad domain(s) -> csv\ioc_hits_dns.csv" 'Red' }
+    $net = @()
+    foreach ($r in (Import-CaseCsv 'sysmon_network')) {
+        $ip = "$($r.DestIp)"
+        if (-not $ip -or -not $iocs.Ips.ContainsKey($ip)) { continue }
+        $net += [pscustomobject]@{ Indicator = $ip; Feed = (& $feedOf $ip); RemoteIp = $ip; Port = "$($r.DestPort)"; Process = "$($r.Image)"; Match = 'network-connection' }
+    }
+    Save-Rows -Name 'ioc_hits_network' -Rows $net
+    if (@($net).Count -gt 0) { Write-CaseLog "    NETWORK IOC HITS: $(@($net).Count) connection(s) to known-bad IP(s) -> csv\ioc_hits_network.csv" 'Red' }
+    $mft = @()
+    if ($iocs.Names.Count -gt 0) {
+        foreach ($r in (Import-CaseCsv 'mft_recent')) {
+            $nm = "$($r.Name)".ToLower()
+            if (-not $nm -or -not $iocs.Names.ContainsKey($nm)) { continue }
+            $mft += [pscustomobject]@{ Indicator = $nm; Feed = (& $feedOf $nm); Path = "$($r.Path)"; Created = "$($r.Created)"; Match = 'mft-filename' }
+        }
+    }
+    Save-Rows -Name 'ioc_hits_mft' -Rows $mft
+    if (@($mft).Count -gt 0) { Write-CaseLog "    FILENAME IOC HITS: $($mft.Count) known-bad filename(s) on disk -> csv\ioc_hits_mft.csv" 'Red' }
 }
 
 function New-HuntFindings {
@@ -5808,6 +5982,11 @@ function Get-CompromiseVerdict {
     Add-Signal 'Uncommon persistence mechanism (IFEO/AppInit/Winlogon/netsh/LSA)' 2 $asepHotN (($asep | Where-Object { $_.Flags -match 'user-path|nondefault' -and "$($_.Category)" -notmatch 'ComHijack|StartupApproved' } | Select-Object -First 3 | ForEach-Object { "$($_.Category): $($_.Name) = $($_.Value)" }) -join '; ')
     Add-Signal 'Memory malfind indicators (injected code regions)' 2 @($memMf).Count (($memMf | Select-Object -First 3 | ForEach-Object { "$($_.Process)($($_.PID))" }) -join '; ')
     Add-Signal 'IOC domain observed in browser history' 2 @($browserIoc).Count (($browserIoc | Select-Object -First 3 | ForEach-Object { $_.Indicator }) -join '; ')
+    $dnsIoc = @(Import-CaseCsv 'ioc_hits_dns')
+    $netIoc = @(Import-CaseCsv 'ioc_hits_network')
+    Add-Signal 'IOC hit - known-bad DNS query / historical connection' 2 ($dnsIoc.Count + $netIoc.Count) ((@($dnsIoc | Select-Object -First 3 | ForEach-Object { $_.Query }) + @($netIoc | Select-Object -First 2 | ForEach-Object { $_.RemoteIp })) -join '; ')
+    $mftIoc = @(Import-CaseCsv 'ioc_hits_mft')
+    Add-Signal 'IOC hit - known-bad filename on disk ($MFT)' 2 @($mftIoc).Count (($mftIoc | Select-Object -First 3 | ForEach-Object { $_.Path }) -join '; ')
     Add-Signal 'IOC hit - live system' 3 @($iocLive).Count (($iocLive | Select-Object -First 3 | ForEach-Object { $_.Indicator }) -join '; ')
     Add-Signal 'Sigma detection - critical' 3 $hayCrit (($hay | Where-Object { "$($_.Level)" -match 'crit' } | Select-Object -First 3 | ForEach-Object { $_.RuleTitle }) -join '; ')
     Add-Signal 'YARA hit - medium rule' 2 $yaraMed (($yara | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
@@ -5848,6 +6027,9 @@ function Get-CompromiseVerdict {
     Add-Cov 'Web telemetry (IIS)' (Test-Path (Join-Path $CsvDir 'iis_requests.csv')) 2
     Add-Cov 'Session attribution + process lineage' ((Test-Path (Join-Path $CsvDir 'session_activity.csv')) -or (Test-Path (Join-Path $CsvDir 'process_chains.csv'))) 2
     Add-Cov 'Host extras (WER/StartupInfo/QuickAssist/GPO)' ((Test-Path (Join-Path $CsvDir 'wer_reports.csv')) -or (Test-Path (Join-Path $CsvDir 'startup_info.csv'))) 2
+    $iocsLoaded = $false
+    try { $iocsLoaded = ($null -ne (Get-IocList)) } catch { }
+    Add-Cov 'IOC feeds loaded (iocs.txt/STIX/MISP)' $iocsLoaded 2
     Add-Cov 'LOLDrivers driver hash check' (Test-Path (Join-Path $CsvDir 'loldrivers_hits.csv')) 3
     Add-Cov 'Sysmon telemetry (bonus)' ([bool]$Sysmon) 5
     Add-Cov 'RAM capture (bonus)' (Test-Path $MemDir) 3
@@ -5916,6 +6098,7 @@ function Invoke-RegenerateOutputs {
     try { New-SuperTimeline } catch { Write-CaseLog "    supertimeline failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-SigmaRuleLogs } catch { Write-CaseLog "    sigma rule logs failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-HuntFindings } catch { Write-CaseLog "    hunt findings failed: $($_.Exception.Message)" 'DarkYellow' }
+    try { New-IocHits } catch { Write-CaseLog "    IOC xref failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-EntityCorrelation } catch { Write-CaseLog "    entity correlation failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-SessionAttribution } catch { Write-CaseLog "    session attribution failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-ProcessChains } catch { Write-CaseLog "    process lineage failed: $($_.Exception.Message)" 'DarkYellow' }
@@ -5974,9 +6157,11 @@ function New-Package {
     if ($script:Verdict) { $case | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $CaseDir 'case.json') -Encoding UTF8 }
 
     $manifest = @()
-    $manifest += "Ophira v$ScriptVersion evidence manifest"
+    $manifest += "Ophira v$ScriptVersion evidence manifest + chain of custody"
     $manifest += "CaseID: $($script:CurrentCaseID)  Analyst: $($script:CurrentAnalyst)"
-    $manifest += "Host: $Computer  Collected: $($StartTime.ToString('u'))"
+    $manifest += "Host: $Computer  Collected: $($StartTime.ToString('u'))  Packaged: $((Get-Date).ToUniversalTime().ToString('u'))"
+    $manifest += "Scope: every file in this folder is SHA256-hashed below (the manifest itself excepted - hash it after zip)."
+    $manifest += "Custody: the case zip is the evidence unit; keep the hash of the zip with your case notes."
     $manifest += ""
     try {
         $selfHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash

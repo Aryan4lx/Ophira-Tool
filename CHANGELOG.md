@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.26
+- **IOC feed ingest (STIX/MISP) + widened xref**:
+  - `Get-IocList` now also reads **`tools\iocs\*.json`** - drop STIX 2.x bundles or MISP exports (direct or response-wrapped) into the folder; hashes/domains/IPS/filenames parse into the same internal lists (`tools/iocs/` gitignored). No network, no API keys - works air-gapped; every hit is attributed to its source feed
+  - **New-IocHits** (in the shared packaging/Parse pipeline): feed domains x Sysmon DNS queries (`ioc_hits_dns`), feed IPs x historical connections (`ioc_hits_network`), feed filenames x $MFT exact-name matches (`ioc_hits_mft`); verdict signals (floor 2) for DNS/network and known-bad filename on disk; new indicators join the defanged report block
+- **Credential-exposure sweep (module 8.15)**: auto-logon (user + password PRESENT/absent - value not copied to CSV), WLAN profiles with `key=clear` capture -> `raw\wifi`, DPAPI Credentials/Protect blobs -> `raw\vault` (analyst-side decrypt), shallow LSASS-dump hunt over known drop spots (recorded, never copied), browser **Login Data** + `Local State` added to the browser raw copy -> `credential_sweep.csv` + report snapshot table
+- **Evidence manifest + chain of custody**: manifest header gains Packaged-UTC, scope and custody notes (case zip = evidence unit, keep the zip hash with case notes); script + every file SHA256'd as before
+- Tests: `tests\test_v226.ps1` (19 checks) - STIX/MISP parsing, feed attribution, DNS/network/MFT xref precision, credential sweep + manifest + wiring
+
 ## v2.25
 - **Analyst deep-dive pack**:
   - **`-Mode Timeline` pivot** (menu [T]): `-Path <case> -TimelineStart 'yyyy-MM-dd HH:mm' -TimelineEnd ...` filters the master timeline (UTC) to a window -> `csv\timeline_<start>_<end>.csv` + console summary (by source, busiest minutes, top actors). The "someone reported weird activity at 14:00" workflow as a one-command mode

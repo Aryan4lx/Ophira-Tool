@@ -3,5 +3,6 @@ IRCASE_*/
 collections/
 .vscode/
 tools/iocs.txt
+tools/iocs/
 OPHIRA_*/
 tools/KAPE/
