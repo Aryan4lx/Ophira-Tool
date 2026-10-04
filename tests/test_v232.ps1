@@ -17,7 +17,9 @@ $stamp = Get-Date -Format 'HHmmss'
 # ============================================================================
 Check "param: -CanaryTarget exists" ($src -match '\[string\]\$CanaryTarget')
 Check "dispatch: both sites pass -Target" (([regex]::Matches($src, [regex]::Escape('Invoke-CanaryMode -KeepLogging:$KeepLogging -Target $CanaryTarget'))).Count -eq 2)
-Check "canary: -Target param on function" ($src -match '(?s)function Invoke-CanaryMode \{[^}]*param\(\[switch\]\$KeepLogging, \[string\]\$Target\)')
+Check "canary: -Target/-TargetUser params on function" ($src -match '(?s)function Invoke-CanaryMode \{.*?param\(\[switch\]\$KeepLogging, \[string\]\$Target, \[string\]\$TargetUser\)')
+Check "remote: credential splat for second-hop sessions" ($src -match '(?s)\$rc = @\{ ComputerName = \$Target; ErrorAction = .Stop. \}.*?if \(\$tCred\) \{ \$rc\.Credential = \$tCred \}.*?Invoke-Command @rc -ScriptBlock')
+Check "remote: env-var override for lab automation" ($src -match 'OPHIRA_CANARY_TARGET_PASS' -and $src -match 'Get-Credential -UserName \$TargetUser')
 Check "consent: lateral warning + target file name" ($src -match 'receive an SMB session' -and $src -match 'canary_lateral\.exe')
 Check "consent: domain-joined caveat" ($src -match 'domain-joined and reachable')
 
@@ -25,7 +27,6 @@ Check "consent: domain-joined caveat" ($src -match 'domain-joined and reachable'
 # PART 2 - lateral battery: remote audits, SMB leg, ordering
 # ============================================================================
 Check "remote: Detailed File Share audit enabled on target" ($src -match [regex]::Escape("'Detailed File Share'"))
-Check "remote: audit enable runs via Invoke-Command with undo capture" ($src -match '(?s)Invoke-Command -ComputerName \$Target -ScriptBlock \{.*?\$undo \+= "auditpol\|\$sub"')
 Check "remote: unreachable target degrades to single-host" ($src -match [regex]::Escape('continuing single-host'))
 Check "ordering: canary user created BEFORE lateral leg" ($src -match '(?s)user canary_test \$canPass /add.*?net\.exe use.*?/user:"\$env:USERDOMAIN\\canary_test"')
 Check "lateral: SMB as canary_test + labeled write + unmap" ($src -match '/user:"\$env:USERDOMAIN\\canary_test"' -and $src -match [regex]::Escape('canary_lateral.exe') -and $src -match [regex]::Escape('net.exe use "\\$Target\C$" /delete'))

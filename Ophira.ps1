@@ -32,6 +32,7 @@ param(
     [string]$TimelineEnd = '',
     [string]$HayabusaPath = '',
     [string]$CanaryTarget = '',
+    [string]$CanaryTargetUser = '',
     [switch]$KeepLogging,
     [string]$DeltaPath = '',
     [string[]]$SetupTools,
@@ -6922,7 +6923,7 @@ function Invoke-CanaryMode {
     # also exercises the cross-host story (lateral SMB touch as canary_test -> R12/attribution).
     # The ONLY mode that changes endpoint state (audit policy + registry + test artifacts) -
     # audit changes are restored afterwards unless -KeepLogging.
-    param([switch]$KeepLogging, [string]$Target)
+    param([switch]$KeepLogging, [string]$Target, [string]$TargetUser)
     Write-Host ""
     Write-Host "=== Detection canary (validate the pipeline end-to-end) ===" -ForegroundColor Cyan
     if (-not (Test-IsAdmin)) {
@@ -6944,10 +6945,26 @@ function Invoke-CanaryMode {
         Write-Host "   - receive an SMB session + a labeled file write from canary_test (\\Target\C$\Users\Public\canary_lateral.exe)"
         Write-Host "   - receive its own collection, scored for the cross-host detections"
         Write-Host "  The target must be domain-joined and reachable (this account needs remote-admin rights on it)." -ForegroundColor Yellow
+        Write-Host "  Targeting by IP also needs this host's WinRM TrustedHosts to include the target." -ForegroundColor Yellow
     }
     Write-Host "  Lab / validation use only - never run it as part of a live investigation." -ForegroundColor Yellow
     $go = (Read-Host "  Run the canary here? [y/N]").Trim()
     if ($go -notmatch '^(?i)y') { Write-Host "  Cancelled." -ForegroundColor Gray; return $false }
+    # remote actions need EXPLICIT credentials when this process itself sits in a remoting session
+    # (network token cannot authenticate a second hop) - prompt, or read the lab-automation override
+    $tCred = $null
+    if ($Target) {
+        if (-not $TargetUser) { $TargetUser = (Read-Host "  Target admin account (ENTER = current account)").Trim() }
+        if ($TargetUser) {
+            if ($env:OPHIRA_CANARY_TARGET_PASS) {
+                $tpw = ConvertTo-SecureString $env:OPHIRA_CANARY_TARGET_PASS -AsPlainText -Force
+                $tCred = New-Object PSCredential($TargetUser, $tpw)
+                Write-Host "  Target credentials: $TargetUser (from OPHIRA_CANARY_TARGET_PASS)" -ForegroundColor DarkGray
+            } else { $tCred = Get-Credential -UserName $TargetUser -Message "Password for target $Target" }
+            if (-not $tCred) { $TargetUser = '' }
+        }
+        if (-not $TargetUser) { Write-Host "  No target credentials - remote leg uses the current account (works only from a locally-launched, interactive session)." -ForegroundColor DarkYellow }
+    }
 
     # ---- phase 1: enable logging (capturing prior state for restore) ----
     Write-Host ""
@@ -6980,7 +6997,9 @@ function Invoke-CanaryMode {
     if ($Target) {
         Write-Host "    target ${Target}: enabling audits..." -ForegroundColor Gray
         try {
-            $bUndo = @(Invoke-Command -ComputerName $Target -ScriptBlock {
+            $rc = @{ ComputerName = $Target; ErrorAction = 'Stop' }
+            if ($tCred) { $rc.Credential = $tCred }
+            $bUndo = @(Invoke-Command @rc -ScriptBlock {
                 param([string[]]$Subs)
                 $undo = @()
                 foreach ($sub in $Subs) {
@@ -7037,7 +7056,7 @@ function Invoke-CanaryMode {
     } catch { Write-Host "    certutil fetch skipped (offline?)" -ForegroundColor DarkYellow }
     $null = & net.exe localgroup administrators canary_test /delete 2>&1
     $null = & net.exe user canary_test /delete 2>&1
-    if ($Target) { $null = Invoke-Command -ComputerName $Target -ScriptBlock { Remove-Item C:\Users\Public\canary_lateral.exe -Force -ErrorAction SilentlyContinue } -ErrorAction SilentlyContinue }
+    if ($Target) { $null = Invoke-Command @rc -ScriptBlock { Remove-Item C:\Users\Public\canary_lateral.exe -Force -ErrorAction SilentlyContinue } -ErrorAction SilentlyContinue }
     Write-Host "    canary_test removed (all planted artifacts are self-labeled)" -ForegroundColor Gray
 
     # ---- phase 3: collection (Standard: Quick excludes the 4688/auth parses the scorecard reads) ----
@@ -7054,7 +7073,7 @@ function Invoke-CanaryMode {
         Write-Host "  [3/4] Collecting on target $Target (Standard)..." -ForegroundColor Cyan
         $beforeZips = @(Get-ChildItem -Path (Join-Path $kit 'collections') -Filter 'OPHIRA_*.zip' -File -ErrorAction SilentlyContinue)
         try {
-            Invoke-DeployMode -Targets @($Target) -DeployPreset 'Standard' -Cred $null -DeployCaseID 'CANARY' -DeploySharePath '' -Threads 1 -PushBin $false -DeployLogHours 168
+            Invoke-DeployMode -Targets @($Target) -DeployPreset 'Standard' -Cred $tCred -DeployCaseID 'CANARY' -DeploySharePath '' -Threads 1 -PushBin $false -DeployLogHours 168
             $bZip = Get-ChildItem -Path (Join-Path $kit 'collections') -Filter 'OPHIRA_*.zip' -File -ErrorAction SilentlyContinue | Where-Object { $beforeZips -notcontains $_ } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
         } catch { Write-Host "    target collection failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
         if (-not $bZip) { Write-Host "    no result zip from target - B-side checks will be BLIND" -ForegroundColor DarkYellow }
@@ -7135,7 +7154,7 @@ function Invoke-CanaryMode {
     } elseif ($KeepLogging) { Write-Host "  Logging left enabled (-KeepLogging)." -ForegroundColor DarkGray }
     if ($Target -and @($bUndo).Count -gt 0 -and -not $KeepLogging) {
         try {
-            $null = Invoke-Command -ComputerName $Target -ScriptBlock {
+            $null = Invoke-Command @rc -ScriptBlock {
                 param([string[]]$Undo)
                 foreach ($u in $Undo) { $p2 = $u -split '\|'; $null = & auditpol.exe /set /subcategory:"$($p2[1])" /success:disable 2>&1 }
             } -ArgumentList (, @($bUndo)) -ErrorAction Stop
@@ -7299,7 +7318,7 @@ if ($bareLaunch -and [Environment]::UserInteractive) {
                 'Parse' { Invoke-ParseMode | Out-Null }
                 'Process' { Invoke-ProcessPivot | Out-Null }
                 'Timeline' { Invoke-TimelineMode | Out-Null }
-                'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging -Target $CanaryTarget | Out-Null }
+                'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging -Target $CanaryTarget -TargetUser $CanaryTargetUser | Out-Null }
                 'Links' { Show-ToolLinks }
             }
             Write-Host ""
@@ -7326,7 +7345,7 @@ if ($Mode -ne 'Collect') {
         'Parse' { Invoke-ParseMode -Path $ParsePath | Out-Null }
         'Process' { Invoke-ProcessPivot -Path $ParsePath -Indicator $ProcessName | Out-Null }
         'Timeline' { Invoke-TimelineMode -Path $ParsePath -Start $TimelineStart -End $TimelineEnd | Out-Null }
-        'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging -Target $CanaryTarget | Out-Null }
+        'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging -Target $CanaryTarget -TargetUser $CanaryTargetUser | Out-Null }
     }
     exit 0
 }
