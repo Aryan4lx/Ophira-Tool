@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.27  -  Windows Incident Response Triage Toolkit
+Ophira v2.28  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -36,7 +36,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.27"
+$ScriptVersion = "2.28"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -2970,6 +2970,19 @@ public class OphiraDump {
                 Write-CaseLog "    AmcacheParser: historical execution inventory..." 'Cyan'
                 $null = Invoke-NativeTool -ExePath $amcExe.FullName -ToolArgs @('-f', $amcHive, '--csv', $CsvDir, '--csvf', 'amcache.csv')
                 $amcCsv = Join-Path $CsvDir 'amcache.csv'
+                if (-not (Test-Path $amcCsv)) {
+                    # AmcacheParser 2026+ writes split CSVs (amcache_UnassociatedFileEntries etc.) - merge the
+                    # file-entry family back into amcache.csv so the IOC xref / hunt / timeline consumers work
+                    $parts = @(Get-ChildItem -Path $CsvDir -Filter 'amcache_*.csv' -ErrorAction SilentlyContinue | Where-Object { (Get-Content -LiteralPath $_.FullName -First 1) -match '^"?ApplicationName' })
+                    if ($parts.Count -eq 0) { $parts = @(Get-ChildItem -Path $CsvDir -Filter 'amcache_DriveBinaries.csv' -File -ErrorAction SilentlyContinue) }
+                    if ($parts.Count -gt 0) {
+                        try {
+                            $rows = @(); foreach ($p in $parts) { $rows += @(Import-Csv -LiteralPath $p.FullName) }
+                            $rows | Export-Csv -LiteralPath $amcCsv -NoTypeInformation -Encoding UTF8
+                            Write-CaseLog "    amcache: $($rows.Count) entries (merged $($parts.Count) split CSVs)" 'Gray'
+                        } catch { Write-CaseLog "    amcache split-CSV merge failed: $($_.Exception.Message)" 'DarkYellow' }
+                    }
+                }
                 if (Test-Path $amcCsv) {
                     $n = @(Get-Content -LiteralPath $amcCsv | Select-Object -Skip 1).Count
                     Write-CaseLog "    amcache: $n entries in csv\amcache.csv" 'Gray'
@@ -2990,7 +3003,7 @@ public class OphiraDump {
                             if ($hits.Count) { Write-CaseLog "    AMCACHE IOC HITS: $($hits.Count) (csv\ioc_hits_amcache.csv)" 'Red' }
                         } catch { Write-CaseLog "    amcache IOC xref failed: $($_.Exception.Message)" 'DarkYellow' }
                     }
-                } else { Write-CaseLog "    AmcacheParser produced no output" 'DarkYellow' }
+                } else { Write-CaseLog "    AmcacheParser produced no output (and no split CSVs to merge)" 'DarkYellow' }
             }
             $rbSrc = Join-Path $RawDir 'recyclebin'
             if ($rbExe -and (Test-Path $rbSrc) -and @(Get-ChildItem -LiteralPath $rbSrc -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {

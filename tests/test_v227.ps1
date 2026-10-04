@@ -95,6 +95,48 @@ Check "no raw esentutl /vss calls left outside the helper" (([regex]::Matches($s
 Check "SharedFunctions: Copy-LockedFile whitelisted for workers" ($src -match "'Get-KitRoot', 'Get-ToolsDir', 'Copy-LockedFile'")
 Check "verdict: huntHi regex still covers R1b rule name" ($src -match [regex]::Escape("-match 'Renamed LOLBin|side-load"))
 
+# ============================================================================
+# PART 5 - module 8.4 merges AmcacheParser 2026+ split CSVs into amcache.csv
+# ============================================================================
+$m84 = [regex]::Match($src, "(?s)Id = '8\.4';.*?Run = \{(.*?)\r?\n        \} \}\r?\n    \[pscustomobject\]@\{ Id = '8\.5'")
+if (-not $m84.Success) { throw 'extract failed: module 8.4' }
+$defs3 = ''
+foreach ($n in @('Get-KitRoot', 'Get-ToolsDir', 'Get-IocList')) {
+    $m = [regex]::Match($src, "(?s)function $n \{.*?\r?\n\}")
+    if (-not $m.Success) { throw "extract failed: $n" }
+    $defs3 += $m.Value + "`r`n"
+}
+Invoke-Expression $defs3
+$kit3 = Join-Path $env:TEMP "ophira_k84_$stamp"
+New-Item -ItemType Directory -Path (Join-Path $kit3 'tools'), (Join-Path $kit3 'raw\registry') -Force | Out-Null
+Set-Content (Join-Path $kit3 'tools\AmcacheParser.exe') -Value 'fake'
+Set-Content (Join-Path $kit3 'raw\registry\Amcache.hve') -Value 'hive'
+$CsvDir = Join-Path $kit3 'csv'
+New-Item -ItemType Directory -Path $CsvDir -Force | Out-Null
+$RawDir = Join-Path $kit3 'raw'
+$KitRoot = $kit3
+function Invoke-NativeTool { param($ExePath, $ToolArgs, $WorkingDirectory, [switch]$QuietLog, $CaptureOut)
+    # simulate AmcacheParser 2026+ split output (no single amcache.csv)
+    (@('"ApplicationName","ProgramId","FileKeyLastWriteTimestamp","SHA1","FullPath","Name"',
+      '"evil.exe","p1","2026-10-04","aabb","C:\evil.exe","evil.exe"',
+      '"cmd.exe","p2","2026-10-04","ccdd","C:\Windows\System32\cmd.exe","cmd.exe"') | Set-Content -LiteralPath (Join-Path $CsvDir 'amcache_UnassociatedFileEntries.csv') -Encoding UTF8)
+    (@('"KeyName","DriverName"', '"k1","drv.sys"') | Set-Content -LiteralPath (Join-Path $CsvDir 'amcache_DriveBinaries.csv') -Encoding UTF8)
+}
+function Get-IocList { $null }
+$iocCalls = 0
+function Get-IocList { $script:iocCalls++; @{ Sha1 = @{} } }
+$log3 = New-Object System.Collections.Generic.List[string]
+function Write-CaseLog { param([string]$Message, [string]$Color = 'Gray') $script:log3.Add($Message) }
+$mod84 = [pscustomobject]@{ Id = '8.4'; Name = 'EZ parsers'; Run = $null }
+$mod84.Run = [scriptblock]::Create($m84.Groups[1].Value)
+& $mod84.Run
+$merged = Join-Path $CsvDir 'amcache.csv'
+Check "8.4: split CSVs merged into amcache.csv" (Test-Path $merged)
+$mr = @(Import-Csv -LiteralPath $merged -ErrorAction SilentlyContinue)
+Check "8.4: merged rows = file-entry family only (2 rows, DriveBinaries excluded)" ($mr.Count -eq 2 -and $mr[0].SHA1 -eq 'aabb')
+Check "8.4: merge logged" (@($log3 | Where-Object { $_ -match 'merged 1 split CSVs' }).Count -eq 1)
+Check "8.4: IOC xref still runs after merge" ($iocCalls -ge 1)
+
 Write-Host ""
 Write-Host "RESULT: $pass passed, $fail failed"
 if ($fail -gt 0) { exit 1 }

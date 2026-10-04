@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.28
+- **AmcacheParser 2026+ split-CSV merge** (second pilot-redeploy finding): AmcacheParser 2026.5 writes split outputs (`amcache_UnassociatedFileEntries.csv`, `amcache_DriveBinaries.csv`, ...) and no longer a single `amcache.csv`, so module 8.4 reported "produced no output" and every downstream consumer (IOC SHA1 xref, hunt R3 static, entity correlation, YARA targets) ran blind. The file-entry family (ApplicationName-headered splits) is now merged back into `csv\amcache.csv` (DriveBinaries fallback) before the existing IOC xref
+- Pilot redeploy validation with v2.27: kit-root seed live (hayabusa/amcache/RBCmd all run on endpoints), NTDS.dit VSS copy succeeds under parallel SRUM load (40MB), R1b + structured EID1 in place
+- Tests: module 8.4 merge covered in `tests\test_v227.ps1` (27 checks total)
+
 ## v2.27
 - **Real-host pilot fixes** (first live-host run: Server 2025 DC + Win11 over WinRM deploy; four real bugs found and fixed):
   - **Worker tools blackout**: `Get-KitRoot` fell back to CWD; deploy-spawned workers inherit `C:\Windows\System32`, so every tools-dependent module (hayabusa, chainsaw, Amcache/RBCmd, hunt packs) silently skipped on remote endpoints while local runs (CWD = kit folder) worked by accident. Kit root is now seeded into workers via the shared preamble
