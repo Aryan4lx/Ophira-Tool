@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.28  -  Windows Incident Response Triage Toolkit
+Ophira v2.29  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -7,7 +7,7 @@ by a responder during early triage / threat hunting.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links', 'UpdateRules', 'Tune', 'Parse', 'Process', 'Timeline')]
+    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links', 'UpdateRules', 'Tune', 'Parse', 'Process', 'Timeline', 'Canary')]
     [string]$Mode = 'Collect',
     [string]$CaseID = "",
     [string]$Analyst = "",
@@ -31,12 +31,13 @@ param(
     [string]$TimelineStart = '',
     [string]$TimelineEnd = '',
     [string]$HayabusaPath = '',
+    [switch]$KeepLogging,
     [string]$DeltaPath = '',
     [string[]]$SetupTools,
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.28"
+$ScriptVersion = "2.29"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -2084,6 +2085,9 @@ $script:Modules = @(
                 $lid = if ($msg -match 'Logon ID:\s+(0x[0-9A-Fa-f]+)') { $Matches[1] } else { '' }
                 [pscustomobject]@{ Time = $_.TimeCreated; EventId = $_.Id; Account = $acct; SourceIp = $ip; LogonType = $lt; LogonId = $lid }
             })
+            # account management EIDs (R6 account lifecycle) - TargetUserName-style EventData
+            $acctEv = Get-EventDataRows -LogName 'Security' -Id @(4720, 4722, 4724, 4726, 4728, 4732, 4735, 4756) -Start $start -Cap 2000 -Fields ([ordered]@{ Account = 'TargetUserName'; SourceIp = 'IpAddress'; LogonType = ''; LogonId = '' })
+            $auth = @($auth + $acctEv)
             Save-Rows -Name 'security_auth_events' -Rows $auth
             $brute = @($auth | Where-Object { $_.EventId -eq 4625 } | Group-Object SourceIp |
                 Where-Object { $_.Count -ge 5 } | Sort-Object Count -Descending |
@@ -6356,6 +6360,7 @@ function Show-TaskMenu {
         Write-Host "   [7]  Tool links" -ForegroundColor Yellow
         Write-Host "   [8]  Finish a collected case (parse evidence analyst-side)" -ForegroundColor Yellow
         Write-Host "   [9]  Analyze a single process (pivot on a case)" -ForegroundColor Yellow
+        Write-Host "   [C]  Detection canary (self-test the pipeline on this PC)" -ForegroundColor Yellow
         Write-Host "   [T]  Timeline pivot (filter the master timeline to a window)" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "   [Q]  Quit" -ForegroundColor DarkGray
@@ -6372,6 +6377,7 @@ function Show-TaskMenu {
             '^(?i)7$' { return 'Links' }
             '^(?i)8$' { return 'Parse' }
             '^(?i)9$' { return 'Process' }
+            '^(?i)c$' { return 'Canary' }
             '^(?i)t$' { return 'Timeline' }
             '^(?i)q$' { return $null }
             default { }
@@ -6824,6 +6830,139 @@ function Invoke-TimelineMode {
     return $true
 }
 
+function Invoke-CanaryMode {
+    # Detection self-test: plant safe, self-labeled test activity, enable the logging the
+    # hunt rules need, run a Quick collection, then score which detections fired.
+    # The ONLY mode that changes endpoint state (audit policy + registry + test artifacts) -
+    # audit changes are restored afterwards unless -KeepLogging.
+    param([switch]$KeepLogging)
+    Write-Host ""
+    Write-Host "=== Detection canary (validate the pipeline end-to-end) ===" -ForegroundColor Cyan
+    if (-not (Test-IsAdmin)) {
+        Write-Host "  Needs an elevated shell (audit policy + registry changes). Relaunching..." -ForegroundColor Yellow
+        $argStr = Get-ArgString
+        try { Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $argStr"; return } catch { Write-Host "  Elevation declined - canary needs admin." -ForegroundColor Red; return $false }
+    }
+    if ($script:SimpleUI) { Write-Host "  Canary is a responder tool - not available in the simple owner UI." -ForegroundColor Yellow; return $false }
+    Write-Host ""
+    Write-Host "  This will, on THIS PC:" -ForegroundColor Yellow
+    Write-Host "   - enable Process Creation + cmdline + scriptblock logging (restored after, unless -KeepLogging)"
+    Write-Host "   - plant self-labeled test activity: renamed cmd copy, canary_test user (created + deleted),"
+    Write-Host "     recon command burst, certutil fetch of a benign file"
+    Write-Host "   - run a Quick collection and score which hunt rules fired"
+    Write-Host "  Lab / validation use only - never run it as part of a live investigation." -ForegroundColor Yellow
+    $go = (Read-Host "  Run the canary here? [y/N]").Trim()
+    if ($go -notmatch '^(?i)y') { Write-Host "  Cancelled." -ForegroundColor Gray; return $false }
+
+    # ---- phase 1: enable logging (capturing prior state for restore) ----
+    Write-Host ""
+    Write-Host "  [1/4] Enabling logging..." -ForegroundColor Cyan
+    $undo = New-Object System.Collections.Generic.List[string]
+    foreach ($sub in @('Process Creation', 'User Account Management', 'Security Group Management')) {
+        $before = (& auditpol.exe /get /subcategory:"$sub" 2>$null | Out-String)
+        if ($before -match '(?i)Success') { Write-Host "    $sub - already on" -ForegroundColor DarkGray; continue }
+        $null = & auditpol.exe /set /subcategory:"$sub" /success:enable 2>&1
+        $undo.Add("auditpol|$sub")
+        Write-Host "    $sub - enabled" -ForegroundColor Gray
+    }
+    $auditKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit'
+    $cmdHad = (Get-ItemProperty -Path $auditKey -Name ProcessCreationIncludeCmdLine_Enabled -ErrorAction SilentlyContinue).ProcessCreationIncludeCmdLine_Enabled
+    if ("$cmdHad" -ne '1') {
+        if (-not (Test-Path $auditKey)) { New-Item -Path $auditKey -Force | Out-Null }
+        if ($null -eq $cmdHad) { New-ItemProperty -Path $auditKey -Name ProcessCreationIncludeCmdLine_Enabled -Value 1 -PropertyType DWord -Force | Out-Null; $undo.Add("regdel|$auditKey|ProcessCreationIncludeCmdLine_Enabled") }
+        else { Set-ItemProperty -Path $auditKey -Name ProcessCreationIncludeCmdLine_Enabled -Value 1 -Force; $undo.Add("regset|$auditKey|ProcessCreationIncludeCmdLine_Enabled|$cmdHad") }
+        Write-Host "    4688 command line - enabled" -ForegroundColor Gray
+    } else { Write-Host "    4688 command line - already on" -ForegroundColor DarkGray }
+    $psKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'
+    $sbHad = (Get-ItemProperty -Path $psKey -Name EnableScriptBlockLogging -ErrorAction SilentlyContinue).EnableScriptBlockLogging
+    if ("$sbHad" -ne '1') {
+        if (-not (Test-Path $psKey)) { New-Item -Path $psKey -Force | Out-Null }
+        if ($null -eq $sbHad) { New-ItemProperty -Path $psKey -Name EnableScriptBlockLogging -Value 1 -PropertyType DWord -Force | Out-Null; $undo.Add("regdel|$psKey|EnableScriptBlockLogging") }
+        else { Set-ItemProperty -Path $psKey -Name EnableScriptBlockLogging -Value 1 -Force; $undo.Add("regset|$psKey|EnableScriptBlockLogging|$sbHad") }
+        Write-Host "    PowerShell script block logging - enabled" -ForegroundColor Gray
+    } else { Write-Host "    PowerShell script block logging - already on" -ForegroundColor DarkGray }
+
+    # ---- phase 2: plant the battery (everything self-labeled 'canary') ----
+    Write-Host "  [2/4] Planting test activity..." -ForegroundColor Cyan
+    $canExe = Join-Path $env:PUBLIC 'canary_renamed.exe'
+    Copy-Item "$env:SystemRoot\System32\cmd.exe" $canExe -Force
+    $null = & $canExe /c "echo canary > `"$env:TEMP\canary_out.txt`"" 2>&1
+    Write-Host "    renamed cmd copy run (canary_renamed.exe)" -ForegroundColor Gray
+    $null = & net.exe user canary_test /add 2>&1
+    $null = & net.exe localgroup administrators canary_test /add 2>&1
+    Write-Host "    canary_test user created + added to Administrators" -ForegroundColor Gray
+    $recon = @(
+        { & whoami.exe 2>&1 }, { & net.exe user 2>&1 }, { & net.exe localgroup administrators 2>&1 },
+        { & nltest.exe /dclist:"$env:USERDOMAIN" 2>&1 }, { & systeminfo.exe 2>&1 }, { & ipconfig.exe /all 2>&1 },
+        { & quser.exe 2>&1 }, { & tasklist.exe 2>&1 }, { & klist.exe 2>&1 }, { & netstat.exe -an 2>&1 }
+    )
+    foreach ($rc in $recon) { $null = & $rc }
+    Write-Host "    discovery burst (10 recon tools)" -ForegroundColor Gray
+    try {
+        $null = & certutil.exe -urlcache -f 'https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/README.md' "$env:TEMP\canary_dl.bin" 2>&1
+        Write-Host "    certutil benign fetch" -ForegroundColor Gray
+    } catch { Write-Host "    certutil fetch skipped (offline?)" -ForegroundColor DarkYellow }
+    $null = & net.exe localgroup administrators canary_test /delete 2>&1
+    $null = & net.exe user canary_test /delete 2>&1
+    Write-Host "    canary_test removed (all planted artifacts are self-labeled)" -ForegroundColor Gray
+
+    # ---- phase 3: collection (Standard: Quick excludes the 4688/auth parses the scorecard reads) ----
+    Write-Host "  [3/4] Collecting (Standard preset, ~3-5 min)..." -ForegroundColor Cyan
+    $kit = Get-KitRoot
+    $before = @(Get-ChildItem -Path $kit -Directory -Filter 'OPHIRA_*' -ErrorAction SilentlyContinue)
+    $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Mode Collect -NoMenu -NoElevate -Preset Standard -CaseID CANARY -OutputPath `"$kit`""
+    $null = Start-Process -FilePath 'powershell.exe' -ArgumentList $cmd -Wait -WindowStyle Hidden
+    $case = @(Get-ChildItem -Path $kit -Directory -Filter 'OPHIRA_*' -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_ } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+    if (-not $case) { Write-Host "  collection produced no case folder - see collection.log" -ForegroundColor Red; return $false }
+    $csv = Join-Path $case.FullName 'csv'
+
+    # ---- phase 4: scorecard ----
+    Write-Host ""
+    Write-Host "  [4/4] Scorecard - case: $(Split-Path $case.FullName -Leaf)" -ForegroundColor Cyan
+    Write-Host ""
+    $hf = @(Import-Csv -LiteralPath (Join-Path $csv 'hunt_findings.csv') -ErrorAction SilentlyContinue)
+    $procRows = @(Import-Csv -LiteralPath (Join-Path $csv 'security_proc_events.csv') -ErrorAction SilentlyContinue)
+    $authRows = @(Import-Csv -LiteralPath (Join-Path $csv 'security_auth_events.csv') -ErrorAction SilentlyContinue)
+    $pcRows = @(Import-Csv -LiteralPath (Join-Path $csv 'sysmon_proc_create.csv') -ErrorAction SilentlyContinue)
+    $score = 0; $possible = 0
+    $c4720 = @($authRows | Where-Object { "$($_.EventId)" -eq '4720' }).Count
+    $c4732 = @($authRows | Where-Object { @('4728', '4732', '4756') -contains "$($_.EventId)" }).Count
+    $r6Why = if ($c4720 -eq 0 -and $c4732 -eq 0) { 'User Account Management audit not active' } elseif ($c4732 -eq 0) { 'Security Group Management audit not active (4720 seen, no group change)' } else { 'auth telemetry missing' }
+    $checks = @(
+        @{ L = 'R1b  renamed LOLBin at rest';      Hit = @($hf | Where-Object { $_.Rule -match 'Renamed LOLBin at rest' }).Count;        Data = @($pcRows | Where-Object { $_ -match 'canary_renamed' }).Count;  DataWhy = 'Sysmon not present or EID 1 not captured' }
+        @{ L = 'R6   account lifecycle';           Hit = @($hf | Where-Object { $_.Rule -match 'Account lifecycle' }).Count;              Data = ($c4720 + $c4732); DataWhy = $r6Why }
+        @{ L = 'R10  proxy-execution (certutil)';  Hit = @($hf | Where-Object { $_.Rule -match 'proxy-execution' }).Count;                Data = @($procRows | Where-Object { $_ -match 'canary|certutil' }).Count; DataWhy = '4688/cmdline audit not active at plant time' }
+        @{ L = 'R13  discovery command storm';     Hit = @($hf | Where-Object { $_.Rule -match 'Discovery command storm' }).Count;        Data = @($procRows | Where-Object { $_ -match 'whoami|systeminfo|nltest' }).Count; DataWhy = '4688 audit not active at plant time' }
+    )
+    foreach ($c in $checks) {
+        $possible++
+        if ($c.Hit -gt 0) { $score++; Write-Host ("    {0}  FIRED" -f $c.L) -ForegroundColor Green }
+        elseif ($c.Data -gt 0) { Write-Host ("    {0}  MISS - data present (x{1}) but rule silent: file this" -f $c.L, $c.Data) -ForegroundColor Red }
+        else { Write-Host ("    {0}  BLIND - no telemetry: {1}" -f $c.L, $c.DataWhy) -ForegroundColor Yellow }
+    }
+    $verdict = $null
+    try { $verdict = (Get-Content -LiteralPath (Join-Path $case.FullName 'verdict.json') -Raw | ConvertFrom-Json) } catch { }
+    Write-Host ""
+    Write-Host ("    Pipeline: {0}/{1} canary detections fired. Case verdict: {2}" -f $score, $possible, $(if ($verdict) { "$($verdict.Level) ($($verdict.ConfidencePercent)%)" })) -ForegroundColor $(if ($score -eq $possible) { 'Green' } elseif ($score -gt 0) { 'Yellow' } else { 'Red' })
+    Write-Host "    Report: $((Join-Path $case.FullName 'report.html'))" -ForegroundColor Gray
+
+    # ---- cleanup + restore ----
+    Remove-Item $canExe, "$env:TEMP\canary_out.txt", "$env:TEMP\canary_dl.bin" -Force -ErrorAction SilentlyContinue
+    if (-not $KeepLogging -and $undo.Count -gt 0) {
+        Write-Host "  Restoring original audit state..." -ForegroundColor DarkGray
+        foreach ($u in $undo) {
+            $p2 = $u -split '\|'
+            switch ($p2[0]) {
+                'auditpol' { $null = & auditpol.exe /set /subcategory:"$($p2[1])" /success:disable 2>&1 }
+                'regdel' { Remove-ItemProperty -LiteralPath $p2[1] -Name $p2[2] -Force -ErrorAction SilentlyContinue }
+                'regset' { Set-ItemProperty -LiteralPath $p2[1] -Name $p2[2] -Value $p2[3] -Force }
+            }
+        }
+        Write-Host "  Restored. Re-run with -KeepLogging to leave logging enabled." -ForegroundColor DarkGray
+    } elseif ($KeepLogging) { Write-Host "  Logging left enabled (-KeepLogging)." -ForegroundColor DarkGray }
+    return $true
+}
+
 function Invoke-DeployWizard {
     $kit = Get-KitRoot
     $hostsFile = Join-Path $kit 'hosts.txt'
@@ -6978,6 +7117,7 @@ if ($bareLaunch -and [Environment]::UserInteractive) {
                 'Parse' { Invoke-ParseMode | Out-Null }
                 'Process' { Invoke-ProcessPivot | Out-Null }
                 'Timeline' { Invoke-TimelineMode | Out-Null }
+                'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging | Out-Null }
                 'Links' { Show-ToolLinks }
             }
             Write-Host ""
@@ -7004,6 +7144,7 @@ if ($Mode -ne 'Collect') {
         'Parse' { Invoke-ParseMode -Path $ParsePath | Out-Null }
         'Process' { Invoke-ProcessPivot -Path $ParsePath -Indicator $ProcessName | Out-Null }
         'Timeline' { Invoke-TimelineMode -Path $ParsePath -Start $TimelineStart -End $TimelineEnd | Out-Null }
+        'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging | Out-Null }
     }
     exit 0
 }

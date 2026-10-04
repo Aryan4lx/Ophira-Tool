@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.29
+- **Detection canary (`-Mode Canary` / menu [C])** - self-test the whole pipeline on one host: with explicit consent (lab/validation only) it enables Process Creation + 4688-cmdline + script-block logging (capturing prior state; restored afterwards unless `-KeepLogging`), plants self-labeled test activity (renamed cmd copy, `canary_test` user created + privileged-group added + removed, 10-tool recon burst, benign certutil fetch), runs a Standard collection, then prints a scorecard: **FIRED** / **MISS - data present but rule silent (file this)** / **BLIND - no telemetry (reason)** for R1b/R6/R10/R13 + pipeline total + case verdict. Planted artifacts cleaned up
+- **Fix: R6 account lifecycle was dead on real hosts** (first canary run caught it): module 4.1 only merged 4624/4625 into `security_auth_events` - the 4720/4722/4724/4726/4728/4732/4735/4756 family stayed in raw `security_events`, so R6 never saw an account event outside fixtures. The account-management family now parses (TargetUserName) into `security_auth_events` alongside logons
+- Tests: `tests\test_v229.ps1` (33 checks) - canary wiring/consent/restore/battery/scorecard + module 4.1 auth-merge fixture
+
 ## v2.28
 - **AmcacheParser 2026+ split-CSV merge** (second pilot-redeploy finding): AmcacheParser 2026.5 writes split outputs (`amcache_UnassociatedFileEntries.csv`, `amcache_DriveBinaries.csv`, ...) and no longer a single `amcache.csv`, so module 8.4 reported "produced no output" and every downstream consumer (IOC SHA1 xref, hunt R3 static, entity correlation, YARA targets) ran blind. The file-entry family (ApplicationName-headered splits) is now merged back into `csv\amcache.csv` (DriveBinaries fallback) before the existing IOC xref
 - Pilot redeploy validation with v2.27: kit-root seed live (hayabusa/amcache/RBCmd all run on endpoints), NTDS.dit VSS copy succeeds under parallel SRUM load (40MB), R1b + structured EID1 in place
