@@ -49,7 +49,7 @@ Check "timeline: double quote in Detail escaped (valid JS)" ($rendered -match [r
 Check "timeline: source dropdown lists distinct sources" ($rendered -match '<option>sysmon_dns</option>' -and $rendered -match '<option>hayabusa</option>' -and $rendered -match ([regex]::Escape("<option value=''>all</option>")))
 Check "timeline: full-CSV pointer + Mode Timeline pointer" ($rendered -match 'csv\\supertimeline\.csv' -and $rendered -match '-Mode Timeline')
 Check "timeline: filter UI wired (text/date/source + draw)" ($rendered -match "id='tlq'" -and $rendered -match "type='date'" -and $rendered -match "id='tlsrc'" -and $rendered -match 'function tlDraw' -and $rendered -match 'tlDraw\(\);')
-Check "timeline: render cap 500 + status line" ($rendered -match '\+\+n>=500' -and $rendered -match "id='tlstat'")
+Check "timeline: render cap 1000 + status line" ($rendered -match '\+\+n>=1000' -and $rendered -match "id='tlstat'")
 Check "timeline: newest-first rendering" ($rendered -match 'for\(var i=TL\.length-1;i>=0;i--\)')
 
 # degrade: empty supertimeline renders section without crash

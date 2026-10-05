@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.34  -  Windows Incident Response Triage Toolkit
+Ophira v2.35  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -21,6 +21,9 @@ param(
     [switch]$Sequential,
     [switch]$NoElevate,
     [int]$LogHours = 168,
+    [string]$LogWindow = '',
+    [string]$LogStart = '',
+    [string]$LogEnd = '',
     [string]$SharePath = "",
     [string[]]$ComputerName,
     [string]$TargetsFile = '',
@@ -39,7 +42,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.34"
+$ScriptVersion = "2.35"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -399,9 +402,66 @@ function Get-HayabusaExe {
 }
 
 function Get-LogStart {
+    if ($script:LogStartDT) { return $script:LogStartDT }
     if ($script:LogHours -gt 0) { return (Get-Date).AddHours(-1 * $script:LogHours) }
     return $null
 }
+
+function ConvertTo-LogStart {
+    # Accepts a window expression: 90 (hours), 90h, 30d, 3m (months), 0 = all-time,
+    # or an explicit start date (2026-09-01 / '2026-09-01 08:00'). Returns a [datetime]
+    # start, the string 'ALL' for 0, or $null when not understood.
+    param([string]$Value)
+    $v = "$Value".Trim()
+    if (-not $v) { return $null }
+    if ($v -match '^(?i)0\s*(h|d|m)?$') { return 'ALL' }
+    if ($v -match '^(?i)(\d+)\s*(h|d|m)$') {
+        $n = [int]$Matches[1]
+        $now = Get-Date
+        switch ($Matches[2].ToLower()) {
+            'd' { return $now.AddDays(-$n) }
+            'm' { return $now.AddMonths(-$n) }
+            default { return $now.AddHours(-$n) }
+        }
+    }
+    if ($v -match '^\d+$') { return (Get-Date).AddHours(-1 * [int]$v) }
+    $dt = [datetime]::MinValue
+    if ([datetime]::TryParse($v, [ref]$dt)) { return $dt }
+    return $null
+}
+
+function Resolve-LogWindow {
+    # Validates -LogStart/-LogEnd/-LogWindow into $script:LogStartDT/$script:LogEndDT.
+    # Precedence: explicit -LogStart > -LogWindow > -LogHours. Returns '' or an error message.
+    $script:LogStartDT = $null
+    $script:LogEndDT = $null
+    foreach ($pair in @(@($LogStart, '-LogStart'), @($LogEnd, '-LogEnd'))) {
+        $v = "$($pair[0])".Trim()
+        if (-not $v) { continue }
+        $dt = [datetime]::MinValue
+        if (-not [datetime]::TryParse($v, [ref]$dt)) { return "$($pair[1]) '$v' is not a valid date (examples: 2026-09-01, '2026-09-01 08:00')" }
+        if ($pair[1] -eq '-LogStart') { $script:LogStartDT = $dt } else { $script:LogEndDT = $dt }
+    }
+    $w = "$LogWindow".Trim()
+    if ($w) {
+        $r = ConvertTo-LogStart $w
+        if ($null -eq $r) { return "-LogWindow '$w' not understood (use 90h / 30d / 3m / 0 = all, or a start date like 2026-09-01)" }
+        if ("$r" -eq 'ALL') { $script:LogHours = 0 }
+        elseif (-not $script:LogStartDT) { $script:LogStartDT = $r }
+    }
+    if ($script:LogStartDT -and $script:LogEndDT -and $script:LogEndDT -le $script:LogStartDT) { return '-LogEnd must be after -LogStart' }
+    return ''
+}
+
+function Get-LogRangeText {
+    if ($script:LogStartDT) { return "From $($script:LogStartDT.ToString('yyyy-MM-dd HH:mm'))$(if ($script:LogEndDT) { " to $($script:LogEndDT.ToString('yyyy-MM-dd HH:mm'))" })" }
+    if ($script:LogHours -eq 0) { return 'All time' }
+    if ($script:LogHours % 24 -eq 0) { return "Last $([int]($script:LogHours/24))d" }
+    return "Last $($script:LogHours)h"
+}
+
+$rwErr = Resolve-LogWindow
+if ($rwErr) { Write-Host "  Ophira: $rwErr" -ForegroundColor Red; exit 1 }
 
 function Test-TrustedPublisher {
     param([string]$Signer)
@@ -640,7 +700,7 @@ function Compress-ToolZip {
 }
 
 function Invoke-DeployMode {
-    param([string[]]$Targets, [string]$DeployPreset, $Cred, [string]$DeployCaseID, [string]$DeploySharePath, [int]$Threads = 8, [bool]$PushBin = $false, [int]$DeployLogHours = 0)
+    param([string[]]$Targets, [string]$DeployPreset, $Cred, [string]$DeployCaseID, [string]$DeploySharePath, [int]$Threads = 8, [bool]$PushBin = $false, [int]$DeployLogHours = 0, [string]$DeployLogWindow = '')
 
     $kit = Get-KitRoot
     $scriptPath = Join-Path $kit 'Ophira.ps1'
@@ -667,7 +727,7 @@ function Invoke-DeployMode {
     }
 
     $worker = {
-        param($c, $scriptPath, $toolsDir, $preset, $caseID, $sharePath, $cred, $outFolder, $binZip, $logHours)
+        param($c, $scriptPath, $toolsDir, $preset, $caseID, $sharePath, $cred, $outFolder, $binZip, $logHours, $logWindow)
         $result = [pscustomobject]@{ Host = $c; Ok = $false; Detail = '' }
         $s = $null
         $remoteDir = 'C:\Windows\Temp\Ophira'
@@ -709,6 +769,7 @@ function Invoke-DeployMode {
             if ($caseID) { $cmd += " -CaseID `"$caseID`"" }
             if ($sharePath) { $cmd += " -SharePath `"$sharePath`"" }
             if ($logHours -ge 0) { $cmd += " -LogHours $logHours" }
+            if ($logWindow) { $cmd += " -LogWindow '" + ($logWindow -replace "'", "''") + "'" }
             $res = Invoke-Command -Session $s -ScriptBlock {
                 param($k, $t)
                 $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $k -Wait -PassThru -WindowStyle Hidden
@@ -741,7 +802,7 @@ function Invoke-DeployMode {
         $jobs = New-Object System.Collections.ArrayList
         foreach ($c in $Batch) {
             $ps = [powershell]::Create()
-            $null = $ps.AddScript($worker.ToString()).AddArgument($c).AddArgument($scriptPath).AddArgument($toolsDir).AddArgument($DeployPreset).AddArgument($DeployCaseID).AddArgument($DeploySharePath).AddArgument($Cred).AddArgument($outFolder).AddArgument($binZip).AddArgument($DeployLogHours)
+            $null = $ps.AddScript($worker.ToString()).AddArgument($c).AddArgument($scriptPath).AddArgument($toolsDir).AddArgument($DeployPreset).AddArgument($DeployCaseID).AddArgument($DeploySharePath).AddArgument($Cred).AddArgument($outFolder).AddArgument($binZip).AddArgument($DeployLogHours).AddArgument($DeployLogWindow)
             $ps.RunspacePool = $pool
             $null = $jobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Target = $c })
         }
@@ -1588,6 +1649,8 @@ function New-WorkerPreamble {
         [void]$sb.AppendLine("`$$k = $lit")
     }
     [void]$sb.AppendLine("`$script:LogHours = $($LogHours)")
+    [void]$sb.AppendLine("`$script:LogStartDT = $(if ($script:LogStartDT) { "[datetime]'" + $script:LogStartDT.ToString('o') + "'" } else { '$null' })")
+    [void]$sb.AppendLine("`$script:LogEndDT = $(if ($script:LogEndDT) { "[datetime]'" + $script:LogEndDT.ToString('o') + "'" } else { '$null' })")
     [void]$sb.AppendLine("`$script:SimpleUI = `$$([bool]$script:SimpleUI)")
     $wl = $WorkerLog -replace "'", "''"
     $override = "function Write-CaseLog { param([string]`$Message,[string]`$Color = 'Gray',[switch]`$NoConsole) Add-Content -LiteralPath '$wl' -Value (`"[{0}] {1}`" -f (Get-Date -Format 'HH:mm:ss'), `$Message) -Encoding UTF8 } "
@@ -2252,7 +2315,11 @@ $script:Modules = @(
             $html = Join-Path $CsvDir 'hayabusa_report.html'
             $hayArgs = @('dfir-timeline', '-p', 'verbose', '-d', "$evtxDir", '-o', "$out", '-H', "$html", '-q', '-w', '-U', '-C', '-K', '-m', 'low', '-E')
             $huntNote = 'full range'
-            if ($LogHours -gt 0) { $hayArgs += @('--time-offset', "$($LogHours)h"); $huntNote = "last $($LogHours)h" }
+            if ($script:LogStartDT) {
+                $hayArgs += @('--start-timeline', $script:LogStartDT.ToString('yyyy-MM-dd HH:mm:ss'))
+                if ($script:LogEndDT) { $hayArgs += @('--end-timeline', $script:LogEndDT.ToString('yyyy-MM-dd HH:mm:ss')) }
+                $huntNote = "from $($script:LogStartDT.ToString('yyyy-MM-dd HH:mm'))$(if ($script:LogEndDT) { " to $($script:LogEndDT.ToString('yyyy-MM-dd HH:mm'))" })"
+            } elseif ($LogHours -gt 0) { $hayArgs += @('--time-offset', "$($LogHours)h"); $huntNote = "last $($LogHours)h" }
             Write-CaseLog "    hayabusa dfir-timeline Sigma hunt ($huntNote)..." 'Cyan'
             $null = Invoke-NativeTool -ExePath $h.FullName -ToolArgs $hayArgs -WorkingDirectory $h.DirectoryName
             if (Test-Path $out) {
@@ -3690,6 +3757,7 @@ function Get-FilteredEvents {
     try {
         $filter = @{ LogName = $LogName; Id = $Ids }
         if ($Start) { $filter.StartTime = $Start }
+        if ($script:LogEndDT) { $filter.EndTime = $script:LogEndDT }
         $events = Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue
         if (-not $events) { return @() }
         $rows = foreach ($e in $events) {
@@ -3724,6 +3792,7 @@ function Get-EventDataRows {
     try {
         $filter = @{ LogName = $LogName; Id = $Id }
         if ($Start) { $filter.StartTime = $Start }
+        if ($script:LogEndDT) { $filter.EndTime = $script:LogEndDT }
         $raw = Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue
         if (-not $raw) { return @() }
         foreach ($e in ($raw | Select-Object -First $Cap)) {
@@ -3840,7 +3909,7 @@ function Get-PresetSelection {
 function Show-Menu {
     param([hashtable]$Selection)
     $cats = ($script:Modules | Group-Object Cat | ForEach-Object { $_.Name })
-    $range = if ($LogHours -eq 0) { 'All time' } else { "Last $([int]($LogHours/24))d" }
+    $range = Get-LogRangeText
     $count = 0
     $byId = @{}
     $script:Modules | ForEach-Object { $byId[$_.Id] = $count; $count++ }
@@ -3870,11 +3939,13 @@ function Show-Menu {
             '^(?i)all$' { foreach ($m in $script:Modules) { $Selection[$m.Id] = $true } }
             '^(?i)none$' { foreach ($m in $script:Modules) { $Selection[$m.Id] = $false } }
             '^(?i)t$' {
+                $script:LogStartDT = $null
+                $script:LogEndDT = $null
                 if ($LogHours -eq 168) { $script:LogHours = 24 }
                 elseif ($LogHours -eq 24) { $script:LogHours = 720 }
                 elseif ($LogHours -eq 720) { $script:LogHours = 0 }
                 else { $script:LogHours = 168 }
-                $range = if ($LogHours -eq 0) { 'All time' } else { "Last $([int]($LogHours/24))d" }
+                $range = Get-LogRangeText
             }
             '^(?i)r$' { return $Selection }
             '^(?i)q$' { return $null }
@@ -4780,7 +4851,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
 
     # ---------- timeline preview (client-side filter over the master timeline) ----------
     $tlAll = @(Import-CaseCsv 'supertimeline.csv')
-    $tlRows = @($tlAll | Select-Object -Last 2000)
+    $tlRows = @($tlAll | Select-Object -Last 10000)
     $tlSources = @($tlRows | ForEach-Object { "$($_.Source)" } | Sort-Object -Unique)
     $tlParts = New-Object System.Text.StringBuilder
     foreach ($r in $tlRows) {
@@ -4788,7 +4859,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     }
     $tlJson = '[' + $tlParts.ToString().TrimEnd(',') + ']'
     $null = $sb.AppendLine("<a name='timeline'></a><h2>Timeline preview (newest $($tlRows.Count) of $($tlAll.Count) rows)</h2>")
-    $null = $sb.AppendLine("<div class='meta'>Browse the master chronology without leaving the report. Full chronology: <b>csv\supertimeline.csv</b> (Excel/Timeline Explorer) or <b>-Mode Timeline</b> for windowed CSV exports with per-source summary. Showing the newest 2,000 rows, rendered newest-first, max 500 matches.</div>")
+    $null = $sb.AppendLine("<div class='meta'>Browse the master chronology without leaving the report. Full chronology: <b>csv\supertimeline.csv</b> (Excel/Timeline Explorer) or <b>-Mode Timeline</b> for windowed CSV exports with per-source summary. Showing the newest 10,000 rows, rendered newest-first, max 1,000 matches.</div>")
     $null = $sb.AppendLine("<div style='margin:10px 0'>")
     $null = $sb.AppendLine("<input id='tlq' type='text' placeholder='text filter (actor/entity/detail)' style='width:280px' oninput='tlDraw()'> ")
     $null = $sb.AppendLine("from <input id='tlf' type='date' onchange='tlDraw()'> to <input id='tlt' type='date' onchange='tlDraw()'> ")
@@ -4810,7 +4881,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
           if(q&&(r.Detail+' '+r.Actor+' '+r.Entity+' '+r.Type).toLowerCase().indexOf(q)<0)continue;
           if(f&&r.Timestamp.substring(0,10)<f)continue;
           if(t&&r.Timestamp.substring(0,10)>t)continue;
-          rows.push(r); if(++n>=500)break;
+          rows.push(r); if(++n>=1000)break;
         }
         var h="<table><tr><th>Timestamp (UTC)</th><th>Source</th><th>Type</th><th>Actor</th><th>Entity</th><th>Detail</th></tr>";
         for(var j=0;j<rows.length;j++){var r2=rows[j];
@@ -4848,8 +4919,10 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     if (-not (Test-IsAdmin)) {
         $recs.Add('This collection ran WITHOUT admin rights - rerun elevated to include registry hives, amcache, Security log and other key sources.')
     }
-    if ($LogHours -gt 0 -and $LogHours -le 168) {
-        $recs.Add("Analysis window was only the last $([int]($LogHours/24)) day(s) - rerun with a wider window (e.g. -LogHours 720 or 0 = all) if the intrusion may be older.")
+    if ($script:LogStartDT) {
+        $recs.Add("Analysis window started at $($script:LogStartDT.ToString('yyyy-MM-dd HH:mm'))$(if ($script:LogEndDT) { " (ends $($script:LogEndDT.ToString('yyyy-MM-dd HH:mm')))" }) - rerun with an earlier -LogStart/-LogWindow if the intrusion may be older.")
+    } elseif ($LogHours -gt 0 -and $LogHours -le 168) {
+        $recs.Add("Analysis window was only the last $([int]($LogHours/24)) day(s) - rerun with a wider window (e.g. -LogWindow 30d, -LogWindow 3m or 0 = all) if the intrusion may be older.")
     }
     if ($script:Verdict -and $script:Verdict.ConfidencePercent -lt 80) {
         $recs.Add('Evidence coverage was below 80% - address the missing sources in the coverage table before treating a clean verdict as final.')
@@ -5112,7 +5185,7 @@ function New-SuperTimeline {
 
     if ($rows.Count -eq 0) { return }
     $sorted = @($rows | Sort-Object { $t = [datetime]::MinValue; try { $t = [datetime]::Parse($_.Timestamp, [System.Globalization.CultureInfo]::InvariantCulture) } catch { }; $t })
-    if ($sorted.Count -gt 60000) { $sorted = @($sorted | Select-Object -Last 60000) }
+    if ($sorted.Count -gt 120000) { $sorted = @($sorted | Select-Object -Last 120000) }
     $out = Join-Path $CsvDir 'supertimeline.csv'
     $sorted | Export-Csv -LiteralPath $out -NoTypeInformation -Encoding UTF8
     # hayabusa sort-csv: dedupe same-event rows coming from overlapping/backup evtx (PS sort above already orders by time)
@@ -6359,7 +6432,10 @@ function Get-CompromiseVerdict {
     $caveats = New-Object System.Collections.Generic.List[string]
     if (-not $isAdminRun) { $caveats.Add('Run was NOT elevated - several sources are incomplete or missing') }
     if (-not $Sysmon) { $caveats.Add('No Sysmon on host - process injection / image-load / per-process network telemetry were not available') }
-    if ($LogHours -gt 0 -and (Test-Path $evtxDir)) { $caveats.Add("Event-log analysis covered only the last $([int]($LogHours/24)) days - older activity not assessed") }
+    if (Test-Path $evtxDir) {
+        if ($script:LogStartDT) { $caveats.Add("Event-log analysis covered $(Get-LogRangeText) only - activity outside that window not assessed") }
+        elseif ($LogHours -gt 0) { $caveats.Add("Event-log analysis covered only the last $([int]($LogHours/24)) days - older activity not assessed") }
+    }
     if (-not (Test-Path $MemDir)) { $caveats.Add('No RAM capture - fileless / in-memory-only malware is not covered') }
     if (-not (Test-Path (Join-Path $CsvDir 'prefetch_index.csv'))) { $caveats.Add('Prefetch unavailable - program execution history limited') }
     if (-not (Test-Path (Join-Path $CsvDir 'amcache.csv'))) { $caveats.Add('Amcache unavailable - historical execution inventory missing') }
@@ -6500,6 +6576,8 @@ function New-Package {
         AdminElevated = (Test-IsAdmin)
         SysmonPresent = (Get-SysmonState)
         LogHours = $LogHours
+        LogStart = $(if ($script:LogStartDT) { $script:LogStartDT.ToUniversalTime().ToString('o') } else { '' })
+        LogEnd = $(if ($script:LogEndDT) { $script:LogEndDT.ToUniversalTime().ToString('o') } else { '' })
         DotNet = (Get-DotNetRelease)
         OutputFolder = $CaseDir
     }
@@ -6857,6 +6935,10 @@ function Open-CaseSession {
     $script:CurrentCaseID = "$($meta.CaseID)"
     $script:CurrentAnalyst = "$($meta.Analyst)"
     $script:LogHours = $(if ($meta.LogHours) { [int]$meta.LogHours } else { 168 })
+    $script:LogStartDT = $null
+    $script:LogEndDT = $null
+    try { if ("$($meta.LogStart)") { $script:LogStartDT = [datetime]$meta.LogStart } } catch { }
+    try { if ("$($meta.LogEnd)") { $script:LogEndDT = [datetime]$meta.LogEnd } } catch { }
     $script:Sysmon = [bool]$meta.SysmonPresent
     $script:EndpointAdmin = [bool]$meta.AdminElevated
     $st = $null
@@ -7432,6 +7514,15 @@ function Invoke-CanaryMode {
     return $true
 }
 
+function Read-WizardLine {
+    # Prompt helper for multi-step wizards: trims input; 'B'/'back' returns $null so the
+    # wizard can redo the previous step (or cancel when on the first one).
+    param([string]$Prompt)
+    $v = (Read-Host "$Prompt  (B = back)").Trim()
+    if ($v -match '^(?i)b(ack)?$') { return $null }
+    return $v
+}
+
 function Invoke-DeployWizard {
     $kit = Get-KitRoot
     $hostsFile = Join-Path $kit 'hosts.txt'
@@ -7442,98 +7533,142 @@ function Invoke-DeployWizard {
     Write-Host "  Pushes Ophira to remote PCs over WinRM, runs a collection there"
     Write-Host "  and pulls the result ZIPs back to this PC (or uploads to a share)."
     Write-Host "  Needs: WinRM enabled on targets + an admin account on them."
+    Write-Host "  Answer 'B' at any question to go back and change the previous one."
     Write-Host "================================================================" -ForegroundColor Cyan
     Write-Host ""
 
     $defTargets = $script:CfgTargets
     if (-not $defTargets -and (Test-Path -LiteralPath $hostsFile)) { $defTargets = 'hosts.txt' }
+    $defPreset = if ($script:CfgDeployPreset) { $script:CfgDeployPreset } else { 'Standard' }
+    $pushDef = if ($script:CfgPushTools) { 'Y' } else { 'N' }
+    $threads = if ($script:CfgThreads -gt 0) { $script:CfgThreads } else { $MaxThreads }
     $targets = @()
     $targetsIn = ''
-    while ($targets.Count -eq 0) {
-        $prompt = "  Target PCs (comma-separated, or a .txt file path)$(if ($defTargets) { " [$defTargets]" })"
-        $targetsIn = (Read-Host $prompt).Trim()
-        if (-not $targetsIn -and $defTargets) { $targetsIn = $defTargets.Trim() }
-        if (-not $targetsIn) { Write-Host "  please enter at least one target" -ForegroundColor Red; continue }
-        if ($targetsIn -match '\.txt$') {
-            $tf = $null
-            if (Test-Path -LiteralPath $targetsIn) { $tf = $targetsIn }
-            elseif (Test-Path -LiteralPath (Join-Path $kit $targetsIn)) { $tf = Join-Path $kit $targetsIn }
-            if ($tf) {
-                $targets = @(Get-Content -LiteralPath $tf | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_ })
-                if ($targets.Count -eq 0) { Write-Host "  file has no host entries: $tf" -ForegroundColor Red }
-            } else { Write-Host "  file not found: $targetsIn" -ForegroundColor Red }
-        } else {
-            $targets = @($targetsIn -split '[,;\s]+' | Where-Object { $_ })
-        }
-    }
-
-    Write-Host ""
     $cred = $null
-    $cIn = (Read-Host "  Credentials: ENTER = your current account ($env:USERDOMAIN\$env:USERNAME), or type a username").Trim()
-    if ($cIn) {
-        $cred = Get-Credential -UserName $cIn -Message "Password for remote PCs"
-        if (-not $cred) { Write-Host "  no credentials entered - using current account" -ForegroundColor Yellow; $cred = $null }
-    }
-
-    $defPreset = if ($script:CfgDeployPreset) { $script:CfgDeployPreset } else { 'Standard' }
-    $pIn = (Read-Host "  Collection depth: 1=Quick (~1-2 min/PC) or 2=Standard (~3-5 min/PC) [$defPreset]").Trim()
     $preset = $defPreset
-    if ($pIn -match '^1' -or $pIn -match '^(?i)q(uick)?$') { $preset = 'Quick' }
-    elseif ($pIn -match '^2' -or $pIn -match '^(?i)s(tandard)?$') { $preset = 'Standard' }
-
-    $pushDef = if ($script:CfgPushTools) { 'Y' } else { 'N' }
-    $p2In = (Read-Host "  Also push hayabusa for on-host Sigma detection (removed after run)? [y/N] (default $pushDef)").Trim()
-    $push = if ($p2In) { $p2In -match '^(?i)y' } else { [bool]$script:CfgPushTools }
-
+    $push = [bool]$script:CfgPushTools
     $shareIn = ''
-    if ($script:CfgDeployShare) {
-        $shareIn = (Read-Host "  Upload results to share (UNC path, 'none' = pull to collections\, ENTER = $($script:CfgDeployShare))").Trim()
-        if ($shareIn -ieq 'none') { $shareIn = '' }
-    } else {
-        $shareIn = (Read-Host "  Upload results to a central share instead of pulling back? (UNC path, ENTER = pull to collections\)").Trim()
-    }
-    if ($shareIn -and -not (Test-Path $shareIn)) {
-        Write-Host "  WARNING: share not reachable right now ($shareIn) - will retry during run" -ForegroundColor Yellow
-    }
-
-    $threads = if ($script:CfgThreads -gt 0) { $script:CfgThreads } else { $MaxThreads }
-
     $advLogHours = -1
-    $advIn = (Read-Host "  Advanced options (Full depth, log window, parallelism)? [y/N]").Trim()
-    if ($advIn -match '^(?i)y') {
-        $dIn = (Read-Host "  Depth: 1=Quick  2=Standard  3=Full - heaviest, includes SRUM etc. [current: $preset]").Trim()
-        if ($dIn -match '^3' -or $dIn -match '^(?i)f(ull)?$') { $preset = 'Full' }
-        $lhIn = (Read-Host "  Log analysis window in hours (ENTER = 168 = 7 days, 0 = all available)").Trim()
-        if ($lhIn -match '^\d+$') { $advLogHours = [int]$lhIn }
-        $thIn = (Read-Host "  Hosts to process in parallel (ENTER = current setting)").Trim()
-        if ($thIn -match '^\d+$' -and [int]$thIn -gt 0) { $threads = [int]$thIn }
-    }
-
-    $shown = ($targets | Select-Object -First 5) -join ', '
-    if ($targets.Count -gt 5) { $shown += ", ...($($targets.Count) total)" }
-    $credNote = if ($cred) { $cred.UserName } else { "$env:USERDOMAIN\$env:USERNAME (current)" }
-    Write-Host ""
-    Write-Host "  ----------------------------------------------------------------" -ForegroundColor Cyan
-    Write-Host "  Ready to deploy. Please confirm:" -ForegroundColor White
-    Write-Host "    Targets   : $shown"
-    Write-Host "    Depth     : $preset"
-    if ($advLogHours -ge 0) { Write-Host "    Log window: $(if ($advLogHours -eq 0) { 'all available' } else { "$advLogHours hours" })" }
-    Write-Host "    Account   : $credNote"
-    Write-Host "    hayabusa  : $(if ($push) { 'push + run + remove' } else { 'not pushed' })"
-    Write-Host "    Results   : $(if ($shareIn) { "upload to $shareIn" } else { 'pull to collections\' })"
-    if ($CaseID) { Write-Host "    Case ID   : $CaseID" }
-    Write-Host "    Parallel  : $threads hosts at once"
-    Write-Host "  ----------------------------------------------------------------" -ForegroundColor Cyan
-    $go = (Read-Host "  Start? [Y/n]").Trim()
-    if ($go -match '^[Nn]') { Write-Host "  Deploy cancelled." -ForegroundColor Yellow; return }
-
-    Invoke-DeployMode -Targets $targets -DeployPreset $preset -Cred $cred -DeployCaseID $CaseID -DeploySharePath $shareIn -Threads $threads -PushBin $push -DeployLogHours $advLogHours
-
-    $rem = (Read-Host "  Remember these answers for next time? [y/N]").Trim()
-    if ($rem -match '^(?i)y') {
-        $vals = @{ TARGETS = $targetsIn; PRESET = $preset; PUSHTOOLS = $(if ($push) { 'yes' } else { 'no' }) }
-        if ($shareIn) { $vals['DEPLOYSHARE'] = $shareIn }
-        if (Save-OphiraConfig -Values $vals) { Write-Host "  Saved to ophira.config.txt" -ForegroundColor Green }
+    $advLogWindow = ''
+    $step = 1
+    while ($true) {
+        switch ($step) {
+            1 {
+                while ($true) {
+                    $prompt = "  Target PCs (comma-separated, or a .txt file path)$(if ($defTargets) { " [$defTargets]" })"
+                    $targetsIn = Read-WizardLine $prompt
+                    if ($null -eq $targetsIn) { Write-Host "  Deploy cancelled." -ForegroundColor Yellow; return }
+                    if (-not $targetsIn -and $defTargets) { $targetsIn = $defTargets.Trim() }
+                    if (-not $targetsIn) { Write-Host "  please enter at least one target" -ForegroundColor Red; continue }
+                    if ($targetsIn -match '\.txt$') {
+                        $tf = $null
+                        if (Test-Path -LiteralPath $targetsIn) { $tf = $targetsIn }
+                        elseif (Test-Path -LiteralPath (Join-Path $kit $targetsIn)) { $tf = Join-Path $kit $targetsIn }
+                        if ($tf) {
+                            $targets = @(Get-Content -LiteralPath $tf | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_ })
+                            if ($targets.Count -eq 0) { Write-Host "  file has no host entries: $tf" -ForegroundColor Red }
+                        } else { Write-Host "  file not found: $targetsIn" -ForegroundColor Red }
+                    } else {
+                        $targets = @($targetsIn -split '[,;\s]+' | Where-Object { $_ })
+                    }
+                    if ($targets.Count -gt 0) { break }
+                }
+                $step = 2
+            }
+            2 {
+                Write-Host ""
+                $cIn = Read-WizardLine "  Credentials: ENTER = your current account ($env:USERDOMAIN\$env:USERNAME), or type a username"
+                if ($null -eq $cIn) { $step = 1; continue }
+                $cred = $null
+                if ($cIn) {
+                    $cred = Get-Credential -UserName $cIn -Message "Password for remote PCs"
+                    if (-not $cred) { Write-Host "  no credentials entered - using current account" -ForegroundColor Yellow; $cred = $null }
+                }
+                $step = 3
+            }
+            3 {
+                $pIn = Read-WizardLine "  Collection depth: 1=Quick (~1-2 min/PC) or 2=Standard (~3-5 min/PC) [$defPreset]"
+                if ($null -eq $pIn) { $step = 2; continue }
+                $preset = $defPreset
+                if ($pIn -match '^1' -or $pIn -match '^(?i)q(uick)?$') { $preset = 'Quick' }
+                elseif ($pIn -match '^2' -or $pIn -match '^(?i)s(tandard)?$') { $preset = 'Standard' }
+                $step = 4
+            }
+            4 {
+                $p2In = Read-WizardLine "  Also push hayabusa for on-host Sigma detection (removed after run)? [y/N] (default $pushDef)"
+                if ($null -eq $p2In) { $step = 3; continue }
+                $push = if ($p2In) { $p2In -match '^(?i)y' } else { [bool]$script:CfgPushTools }
+                $step = 5
+            }
+            5 {
+                if ($script:CfgDeployShare) {
+                    $shareIn = Read-WizardLine "  Upload results to share (UNC path, 'none' = pull to collections\, ENTER = $($script:CfgDeployShare))"
+                    if ($null -eq $shareIn) { $step = 4; continue }
+                    if (-not $shareIn) { $shareIn = $script:CfgDeployShare }
+                    if ($shareIn -ieq 'none') { $shareIn = '' }
+                } else {
+                    $shareIn = Read-WizardLine "  Upload results to a central share instead of pulling back? (UNC path, ENTER = pull to collections\)"
+                    if ($null -eq $shareIn) { $step = 4; continue }
+                }
+                if ($shareIn -and -not (Test-Path $shareIn)) {
+                    Write-Host "  WARNING: share not reachable right now ($shareIn) - will retry during run" -ForegroundColor Yellow
+                }
+                $step = 6
+            }
+            6 {
+                $advLogHours = -1
+                $advLogWindow = ''
+                $advIn = Read-WizardLine "  Advanced options (Full depth, log window, parallelism)? [y/N]"
+                if ($null -eq $advIn) { $step = 5; continue }
+                if ($advIn -notmatch '^(?i)y') { $step = 7; continue }
+                $dIn = Read-WizardLine "  Depth: 1=Quick  2=Standard  3=Full - heaviest, includes SRUM etc. [current: $preset]"
+                if ($null -eq $dIn) { $step = 5; continue }
+                if ($dIn -match '^3' -or $dIn -match '^(?i)f(ull)?$') { $preset = 'Full' }
+                $lhIn = Read-WizardLine "  Log analysis window (168 = hours, 30d, 3m, 0 = all, or start date 2026-09-01) [ENTER = 168 = 7 days]"
+                if ($null -eq $lhIn) { $step = 5; continue }
+                if ($lhIn) {
+                    if ($lhIn -match '^\d+$') { $advLogHours = [int]$lhIn }
+                    elseif ($null -eq (ConvertTo-LogStart $lhIn)) { Write-Host "  window not understood - keeping the default 7 days" -ForegroundColor Yellow }
+                    else { $advLogWindow = $lhIn }
+                }
+                $thIn = Read-WizardLine "  Hosts to process in parallel (ENTER = current setting)"
+                if ($null -eq $thIn) { $step = 5; continue }
+                if ($thIn -match '^\d+$' -and [int]$thIn -gt 0) { $threads = [int]$thIn }
+                $step = 7
+            }
+            7 {
+                $shown = ($targets | Select-Object -First 5) -join ', '
+                if ($targets.Count -gt 5) { $shown += ", ...($($targets.Count) total)" }
+                $credNote = if ($cred) { $cred.UserName } else { "$env:USERDOMAIN\$env:USERNAME (current)" }
+                Write-Host ""
+                Write-Host "  ----------------------------------------------------------------" -ForegroundColor Cyan
+                Write-Host "  Ready to deploy. Please confirm:" -ForegroundColor White
+                Write-Host "    Targets   : $shown"
+                Write-Host "    Depth     : $preset"
+                if ($advLogHours -ge 0) { Write-Host "    Log window: $(if ($advLogHours -eq 0) { 'all available' } else { "$advLogHours hours" })" }
+                if ($advLogWindow) { Write-Host "    Log window: from $advLogWindow" }
+                Write-Host "    Account   : $credNote"
+                Write-Host "    hayabusa  : $(if ($push) { 'push + run + remove' } else { 'not pushed' })"
+                Write-Host "    Results   : $(if ($shareIn) { "upload to $shareIn" } else { 'pull to collections\' })"
+                if ($CaseID) { Write-Host "    Case ID   : $CaseID" }
+                Write-Host "    Parallel  : $threads hosts at once"
+                Write-Host "  ----------------------------------------------------------------" -ForegroundColor Cyan
+                $go = Read-WizardLine "  Start? [Y/n]"
+                if ($null -eq $go) { $step = 6; continue }
+                if ($go -match '^[Nn]') { Write-Host "  Deploy cancelled." -ForegroundColor Yellow; return }
+                $step = 8
+            }
+            8 {
+                Invoke-DeployMode -Targets $targets -DeployPreset $preset -Cred $cred -DeployCaseID $CaseID -DeploySharePath $shareIn -Threads $threads -PushBin $push -DeployLogHours $advLogHours -DeployLogWindow $advLogWindow
+                $rem = Read-WizardLine "  Remember these answers for next time? [y/N]"
+                if ($rem -match '^(?i)y') {
+                    $vals = @{ TARGETS = $targetsIn; PRESET = $preset; PUSHTOOLS = $(if ($push) { 'yes' } else { 'no' }) }
+                    if ($shareIn) { $vals['DEPLOYSHARE'] = $shareIn }
+                    if (Save-OphiraConfig -Values $vals) { Write-Host "  Saved to ophira.config.txt" -ForegroundColor Green }
+                }
+                return
+            }
+        }
     }
 }
 
@@ -7606,7 +7741,7 @@ if ($Mode -ne 'Collect') {
                 $ComputerName += @(Get-Content -LiteralPath $TargetsFile | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_ })
             }
             if (-not $ComputerName) { Write-Host "-ComputerName or -TargetsFile required for Deploy mode" -ForegroundColor Red; exit 1 }
-            Invoke-DeployMode -Targets $ComputerName -DeployPreset $Preset -Cred $Credential -DeployCaseID $CaseID -DeploySharePath $SharePath -Threads $MaxThreads -PushBin ([bool]$PushTools) -DeployLogHours $LogHours
+            Invoke-DeployMode -Targets $ComputerName -DeployPreset $Preset -Cred $Credential -DeployCaseID $CaseID -DeploySharePath $SharePath -Threads $MaxThreads -PushBin ([bool]$PushTools) -DeployLogHours $LogHours -DeployLogWindow $LogWindow
         }
         'UpdateRules' { Invoke-UpdateRulesMode }
         'Tune' { Invoke-TuneMode | Out-Null }
