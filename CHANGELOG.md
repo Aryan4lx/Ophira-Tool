@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.37
+- **Fix: svchost audit FP on stock Windows** (caught by the first live run on a real host): `ServiceDllMissing` fired for `nsi` in the `LocalService` group - stock Windows legitimately has NO `Parameters` key for it. The audit now distinguishes "Parameters key absent entirely" (skip - stock-legal; svchost simply cannot load that member) from "Parameters key exists but has no ServiceDll value" (flag - broken/tampered registration)
+- Tests: `test_v236.ps1` extended (20 checks) - nsistub negative + stubbed `Test-Path` so the gate is exercised deterministically
+
 ## v2.36
 - **Svchost masquerade detection**: new module 1.7 (VOLATILE, runs even on Quick) audits every live `svchost.exe -k <group>` against the registry source of truth (`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Svchost`) and each member service's `Parameters\ServiceDll` -> `csv\svchost_audit.csv` (`Type/Group/Service/PID/Path/Detail`): **UnregisteredGroup** - svchost running with a `-k` group that is not registered at all (the classic svchost-disguise tell; high); **OutOfPathServiceDll** - a registered group member whose ServiceDll lives outside System32/SysWOW64 (svchost-hosted persistence in a user-writable path; high); **ServiceDllMissing** - group member without a ServiceDll value (broken or tampered registration; medium); **UnregisteredModule** - live module enumeration per svchost process flags unsigned/non-Microsoft DLLs that are not registered ServiceDlls (Microsoft-signed and System32/SysWOW64/WinSxS modules exempt; degrades silently without elevation; medium, 40-row cap)
 - **Hunt rule R27** `Svchost masquerade indicator` (T1036.005) consumes the audit CSV - the high tells (unregistered group / out-of-path ServiceDll) join the floor-2 hunt-technique verdict signal; coverage row + evidence-index entry added

@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.36  -  Windows Incident Response Triage Toolkit
+Ophira v2.37  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -42,7 +42,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.36"
+$ScriptVersion = "2.37"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -1791,8 +1791,13 @@ $script:Modules = @(
                 foreach ($svc in $grpMap[$g]) {
                     $s = "$svc"
                     if ($s -and -not $svcDll.ContainsKey($s)) {
-                        $dll = ''
-                        try { $dll = "$((Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$s\Parameters" -Name ServiceDll -ErrorAction Stop).ServiceDll)" } catch { }
+                        # $null = no Parameters key at all (stock Windows does this, e.g. nsi - not a tell)
+                        $dll = $null
+                        $parKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$s\Parameters"
+                        if (Test-Path -LiteralPath $parKey) {
+                            $dll = ''
+                            try { $dll = "$((Get-ItemProperty -Path $parKey -Name ServiceDll -ErrorAction Stop).ServiceDll)" } catch { }
+                        }
                         $svcDll[$s] = $dll
                     }
                 }
@@ -1813,11 +1818,12 @@ $script:Modules = @(
                 }
                 foreach ($svc in $grpMap[$grp]) {
                     $dll = $svcDll["$svc"]
+                    if ($null -eq $dll) { continue }
                     if (-not $dll) {
                         $key = "ServiceDllMissing|$grp|$svc"
                         if ($seen.ContainsKey($key)) { continue }
                         $seen[$key] = $true
-                        $null = $rows.Add([pscustomobject]@{ Type = 'ServiceDllMissing'; Group = $grp; Service = "$svc"; PID = ''; Path = ''; Detail = "service in group '$grp' has no ServiceDll value (broken or tampered registration)" })
+                        $null = $rows.Add([pscustomobject]@{ Type = 'ServiceDllMissing'; Group = $grp; Service = "$svc"; PID = ''; Path = ''; Detail = "service in group '$grp' has a Parameters key but no ServiceDll value (broken or tampered registration)" })
                         continue
                     }
                     if ("$dll" -notmatch '(?i)\\(System32|SysWOW64)\\') {

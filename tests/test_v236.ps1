@@ -18,9 +18,7 @@ $m17 = [regex]::Match($src, "(?s)Id = '1\.7';.*?Run = \{(.*?)\r?\n        \} \}\
 if (-not $m17.Success) { throw 'extract failed: module 1.7' }
 function Get-ItemProperty { param($Path, $Name, $ErrorAction)
     if ("$Path" -match 'CurrentVersion\\Svchost$') {
-        $o = [pscustomobject]@{ netsvcs = @('W32Time', 'wuauserv', 'evilsvc') }
-        $o | Add-Member -NotePropertyName 'netsvcs_psh' -NotePropertyValue @('W32Time') -Force
-        return $o
+        return [pscustomobject]@{ netsvcs = @('W32Time', 'wuauserv', 'evilsvc', 'nsistub') }
     }
     if ("$Path" -match 'Services\\evilsvc\\Parameters') { return [pscustomobject]@{ ServiceDll = 'C:\ProgramData\evil.dll' } }
     if ("$Path" -match 'Services\\W32Time\\Parameters') { return [pscustomobject]@{ ServiceDll = 'C:\Windows\System32\w32time.dll' } }
@@ -49,6 +47,7 @@ function Get-SignatureInfo { param([string]$Path)
     if ("$Path" -match 'msdll\.dll') { return [pscustomobject]@{ Status = 'Valid'; Signer = 'Microsoft Corporation' } }
     return [pscustomobject]@{ Status = 'NotSigned'; Signer = '' }
 }
+function Test-Path { param($LiteralPath) "$LiteralPath" -notmatch 'nsistub' }
 $saved17 = @{}
 function Save-Rows { param([string]$Name, $Rows) $script:saved17[$Name] = $Rows }
 function Write-CaseLog { param([string]$Message, [string]$Color = 'Gray') }
@@ -58,7 +57,8 @@ $mod17 = [pscustomobject]@{ Id = '1.7'; Name = 'Svchost masquerade audit'; Run =
 $ra = @($saved17['svchost_audit'])
 Check "1.7: unregistered -k group flagged (ghostgrp)" (@($ra | Where-Object { $_.Type -eq 'UnregisteredGroup' -and $_.Group -eq 'ghostgrp' -and "$($_.PID)" -eq '200' }).Count -eq 1)
 Check "1.7: ServiceDll outside System32 flagged (evilsvc -> ProgramData)" (@($ra | Where-Object { $_.Type -eq 'OutOfPathServiceDll' -and $_.Service -eq 'evilsvc' -and "$($_.Path)" -match 'ProgramData\\evil\.dll' }).Count -eq 1)
-Check "1.7: missing ServiceDll flagged (wuauserv)" (@($ra | Where-Object { $_.Type -eq 'ServiceDllMissing' -and $_.Service -eq 'wuauserv' }).Count -eq 1)
+Check "1.7: missing ServiceDll flagged (wuauserv - key exists, no value)" (@($ra | Where-Object { $_.Type -eq 'ServiceDllMissing' -and $_.Service -eq 'wuauserv' }).Count -eq 1)
+Check "1.7: no Parameters key at all (nsistub) NOT flagged (stock-legal)" (@($ra | Where-Object { $_.Service -eq 'nsistub' }).Count -eq 0)
 Check "1.7: legit in-path ServiceDll (w32time) NOT flagged" (@($ra | Where-Object { "$($_.Path)" -match 'w32time\.dll' }).Count -eq 0)
 Check "1.7: unregistered unsigned loaded DLL flagged" (@($ra | Where-Object { $_.Type -eq 'UnregisteredModule' -and "$($_.Path)" -match 'evilmod\.dll' -and "$($_.PID)" -eq '100' }).Count -eq 1)
 Check "1.7: Microsoft-signed module NOT flagged" (@($ra | Where-Object { "$($_.Path)" -match 'msdll\.dll' }).Count -eq 0)
