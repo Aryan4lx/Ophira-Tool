@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.33  -  Windows Incident Response Triage Toolkit
+Ophira v2.34  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -39,7 +39,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.33"
+$ScriptVersion = "2.34"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -4114,7 +4114,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
     $null = $sb.AppendLine("<h1>OPHIRA COMPROMISE ASSESSMENT REPORT</h1>")
     $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' }) &nbsp;|&nbsp; Elevated: $(if (Test-IsAdmin) { 'yes' } else { 'NO' })</div>")
-    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#snapshot'>Snapshot</a><a href='#drivers'>Drivers</a><a href='#hunt'>Hunt</a><a href='#entities'>Connections</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
+    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#timeline'>Timeline</a><a href='#snapshot'>Snapshot</a><a href='#drivers'>Drivers</a><a href='#hunt'>Hunt</a><a href='#entities'>Connections</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
 
     # ---------- verdict banner ----------
     $null = $sb.AppendLine("<a name='verdict'></a><h2>Verdict</h2>")
@@ -4777,6 +4777,52 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         $null = $sb.AppendLine("</table><div class='meta'>Weak posture = attack path. BAD findings are listed in the recommendations below. Source: csv\posture.csv</div>")
     }
     if (-not $snapAny) { $null = $sb.AppendLine("<div class='meta'>No snapshot data captured (relevant modules skipped).</div>") }
+
+    # ---------- timeline preview (client-side filter over the master timeline) ----------
+    $tlAll = @(Import-CaseCsv 'supertimeline.csv')
+    $tlRows = @($tlAll | Select-Object -Last 2000)
+    $tlSources = @($tlRows | ForEach-Object { "$($_.Source)" } | Sort-Object -Unique)
+    $tlParts = New-Object System.Text.StringBuilder
+    foreach ($r in $tlRows) {
+        try { $null = $tlParts.Append(($r | Select-Object Timestamp, Source, Type, Actor, Entity, Detail | ConvertTo-Json -Compress)).Append(',') } catch { }
+    }
+    $tlJson = '[' + $tlParts.ToString().TrimEnd(',') + ']'
+    $null = $sb.AppendLine("<a name='timeline'></a><h2>Timeline preview (newest $($tlRows.Count) of $($tlAll.Count) rows)</h2>")
+    $null = $sb.AppendLine("<div class='meta'>Browse the master chronology without leaving the report. Full chronology: <b>csv\supertimeline.csv</b> (Excel/Timeline Explorer) or <b>-Mode Timeline</b> for windowed CSV exports with per-source summary. Showing the newest 2,000 rows, rendered newest-first, max 500 matches.</div>")
+    $null = $sb.AppendLine("<div style='margin:10px 0'>")
+    $null = $sb.AppendLine("<input id='tlq' type='text' placeholder='text filter (actor/entity/detail)' style='width:280px' oninput='tlDraw()'> ")
+    $null = $sb.AppendLine("from <input id='tlf' type='date' onchange='tlDraw()'> to <input id='tlt' type='date' onchange='tlDraw()'> ")
+    $srcSel = "source <select id='tlsrc' onchange='tlDraw()'><option value=''>all</option>"
+    foreach ($s in $tlSources) { $srcSel += "<option>$(ConvertTo-HtmlEsc $s)</option>" }
+    $null = $sb.AppendLine($srcSel + "</select> <span id='tlstat' class='meta'></span></div>")
+    $null = $sb.AppendLine("<div id='tlbox'></div>")
+    $null = $sb.AppendLine(@"
+      <script>
+      var TL = $tlJson;
+      function tlEsc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
+      function tlDraw(){
+        var q=document.getElementById('tlq').value.toLowerCase();
+        var f=document.getElementById('tlf').value,t=document.getElementById('tlt').value,src=document.getElementById('tlsrc').value;
+        var rows=[],n=0;
+        for(var i=TL.length-1;i>=0;i--){
+          var r=TL[i];
+          if(src&&r.Source!==src)continue;
+          if(q&&(r.Detail+' '+r.Actor+' '+r.Entity+' '+r.Type).toLowerCase().indexOf(q)<0)continue;
+          if(f&&r.Timestamp.substring(0,10)<f)continue;
+          if(t&&r.Timestamp.substring(0,10)>t)continue;
+          rows.push(r); if(++n>=500)break;
+        }
+        var h="<table><tr><th>Timestamp (UTC)</th><th>Source</th><th>Type</th><th>Actor</th><th>Entity</th><th>Detail</th></tr>";
+        for(var j=0;j<rows.length;j++){var r2=rows[j];
+          h+="<tr><td>"+tlEsc(r2.Timestamp)+"</td><td>"+tlEsc(r2.Source)+"</td><td>"+tlEsc(r2.Type)+"</td><td>"+tlEsc(r2.Actor)+"</td><td class='path'>"+tlEsc(r2.Entity)+"</td><td>"+tlEsc(r2.Detail)+"</td></tr>";
+        }
+        h+="</table>";
+        document.getElementById('tlbox').innerHTML=h;
+        document.getElementById('tlstat').textContent=' '+rows.length+' shown'+(rows.length>=500?' (capped)':'')+' / '+TL.length+' loaded';
+      }
+      tlDraw();
+      </script>
+"@)
 
     # ---------- recommendations ----------
     $null = $sb.AppendLine("<a name='recommendations'></a><h2>Recommendations</h2>")

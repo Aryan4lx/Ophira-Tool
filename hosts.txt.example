@@ -1,0 +1,6 @@
+# Ophira deploy targets - one host per line (IP or name). Lines starting with # are ignored.
+# Usage: .\Ophira.ps1 -Mode Deploy -TargetsFile hosts.txt
+# Examples (remove the leading # to activate):
+#192.168.1.10
+#DC01.corp.lab
+#WIN11

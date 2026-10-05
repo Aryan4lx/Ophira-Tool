@@ -1,0 +1,39 @@
+name: release
+on:
+  push:
+    tags: [ 'v*' ]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build distribution zip + SHA256SUMS
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $files = @('Ophira.ps1','RUN-OPHIRA.bat','README.md','CHANGELOG.md','LICENSE','hosts.txt.example')
+          foreach ($f in $files) { if (-not (Test-Path $f)) { throw "missing kit file: $f" } }
+          if ((Get-Content Ophira.ps1 -Raw) -notmatch [regex]::Escape("Ophira v$($tag.TrimStart('v'))")) { throw "Ophira.ps1 version does not match tag $tag" }
+          $zip = "Ophira-$tag.zip"
+          Compress-Archive -Path $files -DestinationPath $zip -Force
+          $hashes = foreach ($f in ($files + $zip)) { "$((Get-FileHash $f -Algorithm SHA256).Hash)  $f" }
+          [IO.File]::WriteAllText("SHA256SUMS", ($hashes -join "`r`n") + "`r`n")
+
+      - name: Extract release notes from CHANGELOG
+        shell: pwsh
+        run: |
+          $raw = Get-Content CHANGELOG.md -Raw
+          $m = [regex]::Match($raw, '(?s)## ' + [regex]::Escape($env:GITHUB_REF_NAME) + '\b(.*?)(\r?\n## |\z)')
+          if (-not $m.Success) { throw "no CHANGELOG section for $($env:GITHUB_REF_NAME)" }
+          $notes = "Ophira $($env:GITHUB_REF_NAME) - single-file Windows IR triage toolkit`r`n`r`n" + $m.Groups[1].Value.Trim() + "`r`n`r`nDownload the zip, unblock it, right-click -> Extract All, then run RUN-OPHIRA.bat (see README for Setup, which fetches the DFIR tools)."
+          [IO.File]::WriteAllText("$env:TEMP\release_notes.md", $notes)
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" "Ophira-$($env:GITHUB_REF_NAME).zip" SHA256SUMS --title "Ophira $($env:GITHUB_REF_NAME)" --notes-file "$env:TEMP\release_notes.md"
