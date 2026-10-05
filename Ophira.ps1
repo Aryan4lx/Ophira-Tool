@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.37  -  Windows Incident Response Triage Toolkit
+Ophira v2.38  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -42,7 +42,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.37"
+$ScriptVersion = "2.38"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -54,7 +54,7 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
     Write-Host "  - Run Ophira on a PC with PowerShell 5.1 and use menu option 2" -ForegroundColor Gray
     Write-Host "    (Push & run on REMOTE PCs) - it reaches this host over WinRM" -ForegroundColor Gray
     Write-Host "  - Or collect manually: evtx logs, registry hives, Prefetch folder" -ForegroundColor Gray
-    Write-Host "  - Or have the security team install WMF 5.1 on this host first" -ForegroundColor Gray
+    Write-Host "  - Or have the IR team install WMF 5.1 on this host first" -ForegroundColor Gray
     Write-Host "================================================================" -ForegroundColor Red
     try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
     exit 1
@@ -3658,7 +3658,7 @@ public class OphiraDump {
             }
             Write-CaseLog "    host extras copied -> raw\extras\ (startupinfo/wer-source/quickassist/pca/mof/appcompat/gpo/wsl)" 'Gray'
         } }
-    [pscustomobject]@{ Id = '8.14'; Cat = 'CONTEXT'; Name = 'Server logs raw (DNS/DHCP audit logs, SYSVOL policies; NTDS.dit VSS copy on Full preset + DC)'; Default = $true; Quick = $false;
+    [pscustomobject]@{ Id = '8.14'; Cat = 'CONTEXT'; Name = 'Server logs raw (DNS/DHCP audit logs, SYSVOL policies)'; Default = $true; Quick = $false;
         Run = {
             $inv = @()
             foreach ($pair in @(@('dns', "$env:SystemRoot\System32\DNS"), @('dhcp', "$env:SystemRoot\System32\dhcp"))) {
@@ -3686,20 +3686,7 @@ public class OphiraDump {
                 $inv += [pscustomobject]@{ Type = 'SYSVOL'; File = "$($files.Count) policy file(s)"; SizeMB = [math]::Round((($files | Measure-Object Length -Sum).Sum) / 1MB, 2); LastWrite = '' }
                 Write-CaseLog "    SYSVOL: $($files.Count) policy file(s) (GPO persistence surface) -> raw\server\sysvol" 'Gray'
             }
-            $isDc = (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters')
-            if ($isDc -and "$Preset" -eq 'Full') {
-                $ntds = Join-Path $env:SystemRoot 'NTDS\ntds.dit'
-                if (Test-Path $ntds) {
-                    $d = Join-Path $RawDir 'server\ntds'
-                    New-Item -ItemType Directory -Path $d -Force | Out-Null
-                    if (Copy-LockedFile -Source $ntds -Dest (Join-Path $d 'ntds.dit')) {
-                        $inv += [pscustomobject]@{ Type = 'NTDS'; File = 'ntds.dit'; SizeMB = [math]::Round((Get-Item (Join-Path $d 'ntds.dit')).Length / 1MB, 2); LastWrite = (Get-Item (Join-Path $d 'ntds.dit')).LastWriteTime }
-                        Write-CaseLog '    NTDS.dit VSS-copied (read-only copy; hash extraction is analyst-side only) -> raw\server\ntds' 'Yellow'
-                    }
-                }
-            } elseif ($isDc) {
-                Write-CaseLog '    DC detected - NTDS.dit copy available with Full preset (module 8.14)' 'DarkGray'
-            }
+            # NTDS.dit is deliberately NEVER touched (file or data) by policy
             Save-Rows -Name 'server_logs' -Rows $inv
         } }
     [pscustomobject]@{ Id = '8.15'; Cat = 'CONTEXT'; Name = 'Credential exposure sweep (auto-logon, WLAN keys, DPAPI vault, LSASS dumps, browser Login Data)'; Default = $true; Quick = $false;
@@ -5103,7 +5090,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'application_events'              = 'Application log: app crashes (1000/1001/1002) + MSI installs (1033/11707/11724) - crashed attacker tools'
         'startup_info'                    = 'StartupInfo per-session app launches (WDI XMLs) - execution evidence that survives Prefetch deletion'
         'wer_reports'                     = 'Windows Error Reporting crash reports (faulting app/module) - evidence of failed attacker tooling'
-        'server_logs'                     = 'Inventory of copied server-role logs (DNS/DHCP audit, SYSVOL policies, NTDS.dit on Full+DC)'
+        'server_logs'                     = 'Inventory of copied server-role logs (DNS/DHCP audit, SYSVOL policies). NTDS.dit is never collected by policy'
         'registry_recmd'                  = 'RECmd batch registry deep-dive (persistence/execution/lateral keys across all saved hives) - analyst-side enrichment'
         'ioc_hits_dns'                    = 'IOC-listed domains observed in Sysmon DNS queries (feed-attributed)'
         'ioc_hits_network'                = 'IOC-listed IPs observed in historical connections (feed-attributed)'
@@ -6555,7 +6542,7 @@ function Get-CompromiseVerdict {
     $ownerLines = @{
         4 = 'Strong signs of MALICIOUS ACTIVITY were found on this computer.'
         3 = 'Several suspicious findings - malicious activity is LIKELY.'
-        2 = 'Some SUSPICIOUS items were found - the security team will check them.'
+        2 = 'Some SUSPICIOUS items were found - the IR team will check them.'
         1 = 'No signs of compromise were found.'
         0 = 'Not enough data could be collected to tell for sure.'
     }
@@ -6813,10 +6800,10 @@ function Show-RoleGate {
         Write-Host ""
         Write-Host "  Who is using this tool?" -ForegroundColor White
         Write-Host ""
-        Write-Host "   [1]  I am on the security / incident response team" -ForegroundColor Yellow
+        Write-Host "   [1]  IR team" -ForegroundColor Yellow
         Write-Host "        Full menu: collect, push & run on remote PCs, analyze." -ForegroundColor DarkGray
         Write-Host ""
-        Write-Host "   [2]  The security team asked me to run this" -ForegroundColor Yellow
+        Write-Host "   [2]  User" -ForegroundColor Yellow
         Write-Host "        Guided automatic collection - nothing to decide." -ForegroundColor DarkGray
         Write-Host ""
         Write-Host "----------------------------------------------------------------" -ForegroundColor DarkGray
@@ -6884,6 +6871,22 @@ function Invoke-SetupWizard {
     $wanted = $null
     if ($inp) { $wanted = $inp }
     Invoke-SetupMode -Wanted $wanted
+    # IOC feed drop-folder: gitignored (per-engagement), created so analysts see where feeds go
+    $iocDir = Join-Path (Get-ToolsDir) 'iocs'
+    if (-not (Test-Path $iocDir)) {
+        New-Item -ItemType Directory -Path $iocDir -Force | Out-Null
+        @(
+            'Ophira IOC feeds - drop files here, every collection xrefs them offline (no API keys).',
+            '',
+            'Accepted formats:',
+            '  - STIX 2.x bundle JSON  (indicators: domain-name, ipv4-addr, url, file:hashes.sha256/sha1/md5, file name)',
+            '  - MISP JSON export      (Attribute type: domain, ip-dst, sha256, sha1, md5, filename)',
+            '  - iocs.txt - plain text, one indicator per line (# starts a comment)',
+            '',
+            'Hits appear in csv\\ioc_hits_*.csv and the report IOC section with feed attribution.'
+        ) | Set-Content -LiteralPath (Join-Path $iocDir 'README.txt') -Encoding UTF8
+        Write-Host "  IOC feed folder ready: tools\iocs (drop STIX/MISP JSON or iocs.txt there)" -ForegroundColor Green
+    }
 }
 
 function Invoke-UpdateRulesMode {
@@ -7920,7 +7923,7 @@ $selection = Get-PresetSelection -P $Preset
 if ($NoMenu -or $script:SimpleUI) {
     Write-Host ""
     if ($script:SimpleUI) {
-        Write-Host "  First quick check done - details are saved for the security team." -ForegroundColor Cyan
+        Write-Host "  First quick check done - details are saved for the IR team." -ForegroundColor Cyan
         Write-Host "  Now collecting the full evidence. This usually takes 3-5 minutes." -ForegroundColor Cyan
         Write-Host "  Please DO NOT close this window until it says DONE." -ForegroundColor Yellow
         Write-Host ""
@@ -7958,19 +7961,19 @@ if ($script:SimpleUI) {
         $vColor = switch ($script:Verdict.LevelRank) { 4 { 'Red' } 3 { 'Red' } 2 { 'Yellow' } 1 { 'Green' } default { 'DarkYellow' } }
         Write-Host "     RESULT: $($script:Verdict.OwnerLine)" $vColor
         Write-Host "     This is an automated first check - please send the file below" -ForegroundColor DarkGray
-        Write-Host "     to your security team so they can confirm it." -ForegroundColor DarkGray
+        Write-Host "     to the IR team so they can confirm it." -ForegroundColor DarkGray
         Write-Host ""
     }
     if ($script:DeltaCount -gt 0) {
         Write-Host "     NOTE: $script:DeltaCount NEW items appeared since the last check." -ForegroundColor Yellow
-        Write-Host "     Mention this to your security team - they will see the details." -ForegroundColor Yellow
+        Write-Host "     Mention this to the IR team - they will see the details." -ForegroundColor Yellow
         Write-Host ""
     }
     if ($script:ShareOk) {
         Write-Host "     Your results were uploaded automatically." -ForegroundColor Green
         Write-Host "     Nothing left to do - you can close this window." -ForegroundColor Green
     } else {
-        Write-Host "     Please send this file to your security team:" -ForegroundColor White
+        Write-Host "     Please send this file to the IR team:" -ForegroundColor White
         Write-Host ""
         Write-Host "     $script:FinalZipPath" -ForegroundColor Yellow
         Write-Host ""

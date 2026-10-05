@@ -77,7 +77,7 @@ Check "modules: 8.13 saves startup_info + wer_reports" ($src -match "Save-Rows -
 Check "modules: 8.14 saves server_logs inventory" ($src -match "Save-Rows -Name 'server_logs'")
 Check "modules: QuickAssist + RemoteHelp temp paths collected" ($src -match 'Temp\\QuickAssist' -and $src -match 'Temp\\RemoteHelp')
 Check "modules: PCA + RecentFileCache + MOF + GPO dirs covered" ($src -match 'appcompat\\pca' -and $src -match 'RecentFileCache\.bcf' -and $src -match 'wbem\\MOF' -and $src -match 'GroupPolicyUsers')
-Check "modules: NTDS.dit VSS copy gated on DC + Full preset" (($src -match 'Copy-LockedFile -Source \$ntds') -and ($src -match "Test-Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NTDS\\Parameters'"))
+Check "modules: NTDS.dit NEVER touched (no copy code, policy comment)" (($src -notmatch 'Copy-LockedFile -Source \$ntds') -and ($src -match 'NTDS\.dit is deliberately NEVER touched'))
 Check "asep: SDB shim persistence check (Custom + InstalledSDB)" ($src -match 'AppCompatFlags\\Custom' -and $src -match 'InstalledSDB')
 Check "supertimeline: application_events merged" ($src -match "'rdp_connections', 'application_events'")
 Check "parse_needed: RecentFileCache -> AppCompatParser row" ($src -match "Artifact = 'recentfilecache\.csv'")

@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.38
+- **NTDS.dit is never touched, by policy**: the Full-preset DC copy of `ntds.dit` (module 8.14) is removed entirely - no file reads, no VSS copies, no raw saves. The evidence index now states the policy explicitly. The DC *role fingerprint* (registry key `HKLM\...\Services\NTDS\Parameters` existence check only) is retained for role detection - it never opens the file or its data
+- **Wording**: role gate options are now `[1] IR team` / `[2] User`; all owner-facing completion messages say "the IR team" instead of "the security team"
+- **Setup creates the IOC feed folder**: `tools\iocs\` (gitignored - feeds are per-engagement) is now created by `-Mode Setup` with a README.txt documenting the accepted formats (STIX 2.x bundle, MISP JSON export, plain `iocs.txt`), so the offline IOC xref is discoverable
+- Tests: `tests\test_v238.ps1` (12 checks) - wording sweep, zero NTDS file-interaction code with the policy comment + retained role fingerprint, Setup folder/README wiring
+
 ## v2.37
 - **Fix: svchost audit FP on stock Windows** (caught by the first live run on a real host): `ServiceDllMissing` fired for `nsi` in the `LocalService` group - stock Windows legitimately has NO `Parameters` key for it. The audit now distinguishes "Parameters key absent entirely" (skip - stock-legal; svchost simply cannot load that member) from "Parameters key exists but has no ServiceDll value" (flag - broken/tampered registration)
 - Tests: `test_v236.ps1` extended (20 checks) - nsistub negative + stubbed `Test-Path` so the gate is exercised deterministically

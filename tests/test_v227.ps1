@@ -89,7 +89,7 @@ Check "module 4.3: structured EID1 saved as sysmon_proc_create" ($src -match [re
 Check "evidence index: sysmon_proc_create documented" ($src -match "'sysmon_proc_create'\s+= 'Sysmon EID 1")
 Check "supertimeline: EID1 woven with ORIGINAL NAME highlight" (($src -match [regex]::Escape("'sysmon_proc_create' 5000")) -and ($src -match 'ORIGINAL NAME:'))
 Check "SRUM copy goes through Copy-LockedFile" ($src -match 'Copy-LockedFile -Source \$sru -Dest \$out')
-Check "NTDS copy goes through Copy-LockedFile" ($src -match 'Copy-LockedFile -Source \$ntds')
+Check "NTDS.dit never collected (policy - no Copy-LockedFile call for it)" ($src -notmatch 'Copy-LockedFile -Source \$ntds')
 Check "browser fallback copy goes through Copy-LockedFile" ($src -match 'ok = Copy-LockedFile -Source \$src')
 Check "no raw esentutl /vss calls left outside the helper" (([regex]::Matches($src, 'esentutl\.exe /y /vss|/vss /d')).Count -eq 1)
 Check "SharedFunctions: Copy-LockedFile whitelisted for workers" ($src -match "'Get-KitRoot', 'Get-ToolsDir', 'Copy-LockedFile'")
