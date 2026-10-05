@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.38  -  Windows Incident Response Triage Toolkit
+Ophira v2.39  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -42,7 +42,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.38"
+$ScriptVersion = "2.39"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -2247,18 +2247,18 @@ $script:Modules = @(
             $auth = @($ev | Where-Object { @(4624, 4625) -contains $_.Id } | ForEach-Object {
                 $msg = "$($_.Message)"
                 # 4624/4625: the logon account/session live in the New Logon section - anchor after it
-                # (Subject Logon ID is the caller's, and a Linked Logon ID may trail New Logon)
+                # (Subject Logon ID is the caller's, and a Linked Logon ID may trail New Logon).
+                # Messages arrive whitespace-COLLAPSED (no newlines), so captures must be bounded
+                # by the next field label - unbounded captures swallow the rest of the message.
                 $nlIdx = $msg.IndexOf('New Logon')
                 $after = if ($nlIdx -ge 0) { $msg.Substring($nlIdx) } else { $msg }
-                $names = [regex]::Matches($msg, 'Account Name:\s+([^\r\n]+)')
-                $nlNames = [regex]::Matches($after, 'Account Name:\s+([^\r\n]+)')
-                $acct = if ($nlNames.Count -gt 0) { $nlNames[0].Groups[1].Value.Trim() } elseif ($names.Count -gt 0) { $names[0].Groups[1].Value.Trim() } else { '' }
-                $subject = if ($names.Count -gt 0) { $names[0].Groups[1].Value.Trim() } else { '' }
+                $acct = ''; $dom = ''; $subject = ''
+                if ($after -match 'Account Name:\s+(.*?)\s+Account Domain:\s+(.*?)\s+Logon ID:') { $acct = $Matches[1].Trim(); $dom = $Matches[2].Trim() }
+                if ($msg -match 'Account Name:\s+(.*?)\s+Account Domain:\s+(.*?)\s+Logon ID:') { $subject = $Matches[1].Trim() }
                 $ip = if ($msg -match 'Source Network Address:\s+(\S+)') { $Matches[1] } else { '' }
                 $lt = if ($msg -match 'Logon Type:\s+(\d+)') { $Matches[1] } else { '' }
-                $lids = [regex]::Matches($after, 'Logon ID:\s+(0x[0-9A-Fa-f]+)')
-                $lid = if ($lids.Count -gt 0) { $lids[0].Groups[1].Value.Trim() } else { '' }
-                [pscustomobject]@{ Time = $_.TimeCreated; EventId = $_.Id; Account = $acct; SubjectAccount = $subject; SourceIp = $ip; LogonType = $lt; LogonId = $lid }
+                $lid = if ($after -match 'Logon ID:\s+(0x[0-9A-Fa-f]+)') { $Matches[1] } else { '' }
+                [pscustomobject]@{ Time = $_.TimeCreated; EventId = $_.Id; Account = $acct; AccountDomain = $dom; SubjectAccount = $subject; SourceIp = $ip; LogonType = $lt; LogonId = $lid }
             })
             # account management EIDs (R6 account lifecycle) - TargetUserName-style EventData
             $acctEv = Get-EventDataRows -LogName 'Security' -Id @(4720, 4722, 4724, 4726, 4728, 4732, 4735, 4756) -Start $start -Cap 2000 -Fields ([ordered]@{ Account = 'TargetUserName'; SourceIp = 'IpAddress'; LogonType = ''; LogonId = '' })
@@ -4263,6 +4263,12 @@ a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
 pre.ioc{background:#181b21;border:1px solid #2a2f3a;border-radius:8px;padding:12px;font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-all}
 .rec{background:#181b21;border-left:4px solid #8ab4f8;border-radius:6px;padding:10px 14px;margin:8px 0}
 details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
+td.clip{max-width:560px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:copy}
+.clip.open{white-space:normal;word-break:break-all;max-width:none}
+#copied{position:fixed;bottom:14px;right:14px;background:#1d3a26;color:#7ee2a8;padding:8px 14px;border-radius:6px;display:none;z-index:99;font-size:12px;font-weight:700}
+.sbar{margin:8px 0}.sbar input,.sbar select{background:#181b21;border:1px solid #2a2f3a;color:#d7dce3;padding:4px 8px;border-radius:4px;font-size:12px}
+.pgr{margin:6px 0}.pgr button{background:#232833;border:1px solid #333b49;color:#9ec1f0;border-radius:4px;padding:2px 10px;cursor:pointer;margin-left:4px}
+tr.techrow{cursor:pointer}
 </style>
 '@
 
@@ -4384,9 +4390,19 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
             $best = @($g.Group | Sort-Object Rank -Descending | Select-Object -First 1)
             $lvlClass = switch -Regex ("$($best.Level)") { 'crit' { 'crit'; break } 'high' { 'high'; break } 'med' { 'med'; break } default { 'info' } }
             $tacLbl = (@(Split-TagList $best.Tactic | ForEach-Object { Get-TacticLabel $_ }) -join ', ')
-            $null = $sb.AppendLine("<tr><td><b>$($g.Tech)</b></td><td>$(ConvertTo-HtmlEsc $tacLbl)</td><td>$($g.Count)</td><td class='$lvlClass'>$($best.Level)</td><td>$(ConvertTo-HtmlEsc $best.Rule)</td><td>$(ConvertTo-HtmlEsc $best.Last)</td></tr>")
+            $safeTech = "$($g.Tech)" -replace '[^A-Za-z0-9_]', ''
+            $null = $sb.AppendLine("<tr class='techrow' title='click to show/hide the matched events' onclick=""var r=document.getElementById('ev_$safeTech'); r.style.display=(r.style.display==='none'?'':'none');""><td><b>$($g.Tech)</b></td><td>$(ConvertTo-HtmlEsc $tacLbl)</td><td>$($g.Count)</td><td class='$lvlClass'>$($best.Level)</td><td>$(ConvertTo-HtmlEsc $best.Rule)</td><td>$(ConvertTo-HtmlEsc $best.Last)</td></tr>")
+            $null = $sb.AppendLine("<tr id='ev_$safeTech' style='display:none'><td colspan='6'><table>")
+            $null = $sb.AppendLine("<tr><th>Time</th><th>Alert</th><th>Level</th></tr>")
+            foreach ($e in (@($g.Group | Sort-Object { "$($_.Last)" } -Descending) | Select-Object -First 25)) {
+                $evCls = switch -Regex ("$($e.Level)") { 'crit' { 'crit'; break } 'high' { 'high'; break } 'med' { 'med'; break } default { 'info' } }
+                $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $e.Last)</td><td>$(ConvertTo-HtmlEsc $e.Rule)</td><td class='$evCls'>$(ConvertTo-HtmlEsc $e.Level)</td></tr>")
+            }
+            $extra = $g.Count - [Math]::Min(25, $g.Count)
+            if ($extra -gt 0) { $null = $sb.AppendLine("<tr><td colspan='3' class='meta'>first 25 of $($g.Count) - all events: csv\hayabusa_timeline.csv (filter MitreTags = $($g.Tech)) | drill-downs below in the Sigma section</td></tr>") }
+            $null = $sb.AppendLine("</table></td></tr>")
         }
-        $null = $sb.AppendLine("</table><div class='meta'>Source: csv\hayabusa_timeline.csv (MitreTactics/MitreTags). Reference: <a target='_blank' href='https://attack.mitre.org/techniques/enterprise/'>attack.mitre.org</a></div>")
+        $null = $sb.AppendLine("</table><div class='meta'>Click a technique row to expand the matched events. Source: csv\hayabusa_timeline.csv (MitreTactics/MitreTags). Reference: <a target='_blank' href='https://attack.mitre.org/techniques/enterprise/'>attack.mitre.org</a></div>")
     } else {
         $null = $sb.AppendLine("<div class='meta'>No ATT&CK-tagged detections in the analyzed window.</div>")
     }
@@ -4507,9 +4523,12 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
             }
             $null = $sb.AppendLine("</table>")
         }
-        # per-rule drill-down: the actual matched events for the noisiest rules
+        # per-rule drill-down: ALL matched events per rule (capped embed), client-side
+        # search + pager + click-to-copy - rendered by the shared script at the end
+        $ruleJs = New-Object System.Collections.Generic.List[string]
         if ($hayRows.Count -gt 0) {
             $drill = @($hayRows | Group-Object $alertCol | Sort-Object Count -Descending | Select-Object -First 12)
+            $embedBudget = 5000
             foreach ($g in $drill) {
                 $best = @($g.Group | Sort-Object { Get-LvlRank "$($_.Level)" } -Descending | Select-Object -First 1)
                 $lvl = "$($best.Level)"
@@ -4518,18 +4537,22 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
                 if (-not $safe) { $safe = 'unnamed_rule' }
                 if ($safe.Length -gt 80) { $safe = $safe.Substring(0, 80) }
                 $csvLink = "csv\sigma_rules\$safe.csv"
-                $null = $sb.AppendLine("<details><summary><span class='$lvlClass'><b>$(ConvertTo-HtmlEsc $g.Name)</b></span> - $($g.Count) hit(s), max <span class='$lvlClass'>$lvl</span> &nbsp;<span class='meta'>$csvLink</span></summary>")
-                $null = $sb.AppendLine("<table><tr><th>Time</th><th>Computer</th><th>EID</th><th>Level</th><th>Event details</th></tr>")
-                foreach ($r in (@($g.Group | Sort-Object Timestamp) | Select-Object -First 20)) {
-                    $det = ("$($r.Details)") -replace '\s+', ' '
-                    if ($det.Length -gt 300) { $det = $det.Substring(0, 300) + '...' }
-                    $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $r.Timestamp)</td><td>$(ConvertTo-HtmlEsc $r.Computer)</td><td>$(ConvertTo-HtmlEsc $r.EventID)</td><td class='$lvlClass'>$(ConvertTo-HtmlEsc $r.Level)</td><td class='path'>$(ConvertTo-HtmlEsc $det)</td></tr>")
+                $parts = New-Object System.Collections.Generic.List[string]
+                $take = [Math]::Min($g.Count, [Math]::Max(0, $embedBudget))
+                foreach ($r in (@($g.Group | Sort-Object Timestamp) | Select-Object -First $take)) {
+                    $d = ("$($r.Details)") -replace '\s+', ' '
+                    if ($d.Length -gt 800) { $d = $d.Substring(0, 800) + '...' }
+                    $lc = switch -Regex ("$($r.Level)") { 'crit' { 'crit'; break } 'high' { 'high'; break } 'med' { 'med'; break } default { 'info' } }
+                    try { $parts.Add(([pscustomobject]@{ t = "$($r.Timestamp)"; c = "$($r.Computer)"; e = "$($r.EventID)"; l = "$($r.Level)"; lc = $lc; d = $d } | ConvertTo-Json -Compress)) } catch { }
                 }
-                $shown = [Math]::Min(20, $g.Count)
-                if ($g.Count -gt $shown) { $null = $sb.AppendLine("<tr><td colspan='5' class='meta'>first $shown of $($g.Count) - full log: $csvLink</td></tr>") }
-                $null = $sb.AppendLine("</table></details>")
+                $embedBudget -= $take
+                $null = $ruleJs.Add("'$safe':[$($parts -join ',')]")
+                $lvlOpts = (@("$($g.Group | ForEach-Object { "$($_.Level)" } | Sort-Object -Unique)") | ForEach-Object { "<option>$($_)</option>" }) -join ''
+                $null = $sb.AppendLine("<details><summary><span class='$lvlClass'><b>$(ConvertTo-HtmlEsc $g.Name)</b></span> - $($g.Count) hit(s), max <span class='$lvlClass'>$lvl</span> &nbsp;<span class='meta'>$csvLink</span></summary>")
+                $null = $sb.AppendLine("<div class='sbar'>filter <input id='q_$safe' oninput=""renderRule('$safe')"" style='width:260px' placeholder='text in details/time/host'> level <select id='l_$safe' onchange=""renderRule('$safe')""><option value='all'>all</option>$lvlOpts</select> <span class='meta'>click a detail = copy raw - double-click = expand</span><input type='hidden' id='p_$safe' value='1'></div><div id='b_$safe'></div>")
+                $null = $sb.AppendLine("</details>")
             }
-            if ($drill.Count -gt 0) { $null = $sb.AppendLine("<div class='meta'>Expand a rule to see the matched events (time, host, event ID, hayabusa-extracted details). RecordID locates the exact record in the matching evtx under raw\evtx\.</div>") }
+            if ($drill.Count -gt 0) { $null = $sb.AppendLine("<div class='meta'>Expand a rule to browse ALL matched events (search + page + copy). Details text is capped in the embed - the full untruncated text is always in the per-rule CSV. RecordID locates the exact record in the matching evtx under raw\evtx\.</div>") }
         }
         $null = $sb.AppendLine("<div class='meta'>Full timeline: csv\hayabusa_timeline.csv &nbsp;|&nbsp; per-rule event CSVs: csv\sigma_rules\ &nbsp;|&nbsp; hayabusa's own summary: csv\hayabusa_report.html</div>")
     }
@@ -4546,15 +4569,18 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
                 if ($c.PSObject.Properties[$p] -and "$($c.$p)") { $txt = "$($c.$p)"; break }
             }
             if (-not $txt) { $txt = ($c.PSObject.Properties | ForEach-Object { "$($_.Value)" }) -join ' ' }
-            if ($txt.Length -gt 400) { $txt = $txt.Substring(0, 400) + '...' }
-            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $t)</td><td>$(ConvertTo-HtmlEsc $src)</td><td class='path'>$(ConvertTo-HtmlEsc $txt)</td></tr>")
+            $txtShow = if ($txt.Length -gt 400) { $txt.Substring(0, 400) + '...' } else { $txt }
+            $txtAttr = (ConvertTo-HtmlEsc $txt) -replace '"', '&quot;'
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $t)</td><td>$(ConvertTo-HtmlEsc $src)</td><td class='path clip' title='click = copy raw' data-full=""$txtAttr"">$(ConvertTo-HtmlEsc $txtShow)</td></tr>")
         }
         $null = $sb.AppendLine("</table><div class='meta'>First $($psCmds.Count) recovered commands (hayabusa extract-base64 over the exported PowerShell event logs). Source: csv\ps_decoded_commands.csv</div>")
     }
 
     # ---------- logon & account analysis ----------
     $null = $sb.AppendLine("<a name='logons'></a><h2>Logon & account activity</h2>")
-    $inter = @($authEv | Where-Object { "$($_.EventId)" -eq '4624' -and "$($_.LogonType)" -match '^(2|10)$' } | Group-Object Account, SourceIp | Sort-Object Count -Descending | Select-Object -First 15)
+    $inter = @($authEv | Where-Object { "$($_.EventId)" -eq '4624' -and "$($_.LogonType)" -match '^(2|10)$' } |
+        ForEach-Object { [pscustomobject]@{ Who = "$(if ("$($_.AccountDomain)") { "$($_.AccountDomain)\" })$($_.Account) @ $(if ("$($_.SourceIp)") { $_.SourceIp } else { '-' })" } } |
+        Group-Object Who | Sort-Object Count -Descending | Select-Object -First 15)
     if ($inter.Count -gt 0) {
         $null = $sb.AppendLine("<h3>Interactive / RDP logons</h3><table><tr><th>Account @ Source</th><th>Logons</th></tr>")
         foreach ($g in $inter) { $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $g.Name)</td><td><b>$($g.Count)</b></td></tr>") }
@@ -4934,51 +4960,11 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     }
     if (-not $snapAny) { $null = $sb.AppendLine("<div class='meta'>No snapshot data captured (relevant modules skipped).</div>") }
 
-    # ---------- timeline preview (client-side filter over the master timeline) ----------
+    # ---------- timeline pointer (the chronology itself lives in the CSV) ----------
     $tlAll = @(Import-CaseCsv 'supertimeline.csv')
-    $tlRows = @($tlAll | Select-Object -Last 10000)
-    $tlSources = @($tlRows | ForEach-Object { "$($_.Source)" } | Sort-Object -Unique)
-    $tlParts = New-Object System.Text.StringBuilder
-    foreach ($r in $tlRows) {
-        try { $null = $tlParts.Append(($r | Select-Object Timestamp, Source, Type, Actor, Entity, Detail | ConvertTo-Json -Compress)).Append(',') } catch { }
-    }
-    $tlJson = '[' + $tlParts.ToString().TrimEnd(',') + ']'
-    $null = $sb.AppendLine("<a name='timeline'></a><h2>Timeline preview (newest $($tlRows.Count) of $($tlAll.Count) rows)</h2>")
-    $null = $sb.AppendLine("<div class='meta'>Browse the master chronology without leaving the report. Full chronology: <b>csv\supertimeline.csv</b> (Excel/Timeline Explorer) or <b>-Mode Timeline</b> for windowed CSV exports with per-source summary. Showing the newest 10,000 rows, rendered newest-first, max 1,000 matches.</div>")
-    $null = $sb.AppendLine("<div style='margin:10px 0'>")
-    $null = $sb.AppendLine("<input id='tlq' type='text' placeholder='text filter (actor/entity/detail)' style='width:280px' oninput='tlDraw()'> ")
-    $null = $sb.AppendLine("from <input id='tlf' type='date' onchange='tlDraw()'> to <input id='tlt' type='date' onchange='tlDraw()'> ")
-    $srcSel = "source <select id='tlsrc' onchange='tlDraw()'><option value=''>all</option>"
-    foreach ($s in $tlSources) { $srcSel += "<option>$(ConvertTo-HtmlEsc $s)</option>" }
-    $null = $sb.AppendLine($srcSel + "</select> <span id='tlstat' class='meta'></span></div>")
-    $null = $sb.AppendLine("<div id='tlbox'></div>")
-    $null = $sb.AppendLine(@"
-      <script>
-      var TL = $tlJson;
-      function tlEsc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
-      function tlDraw(){
-        var q=document.getElementById('tlq').value.toLowerCase();
-        var f=document.getElementById('tlf').value,t=document.getElementById('tlt').value,src=document.getElementById('tlsrc').value;
-        var rows=[],n=0;
-        for(var i=TL.length-1;i>=0;i--){
-          var r=TL[i];
-          if(src&&r.Source!==src)continue;
-          if(q&&(r.Detail+' '+r.Actor+' '+r.Entity+' '+r.Type).toLowerCase().indexOf(q)<0)continue;
-          if(f&&r.Timestamp.substring(0,10)<f)continue;
-          if(t&&r.Timestamp.substring(0,10)>t)continue;
-          rows.push(r); if(++n>=1000)break;
-        }
-        var h="<table><tr><th>Timestamp (UTC)</th><th>Source</th><th>Type</th><th>Actor</th><th>Entity</th><th>Detail</th></tr>";
-        for(var j=0;j<rows.length;j++){var r2=rows[j];
-          h+="<tr><td>"+tlEsc(r2.Timestamp)+"</td><td>"+tlEsc(r2.Source)+"</td><td>"+tlEsc(r2.Type)+"</td><td>"+tlEsc(r2.Actor)+"</td><td class='path'>"+tlEsc(r2.Entity)+"</td><td>"+tlEsc(r2.Detail)+"</td></tr>";
-        }
-        h+="</table>";
-        document.getElementById('tlbox').innerHTML=h;
-        document.getElementById('tlstat').textContent=' '+rows.length+' shown'+(rows.length>=500?' (capped)':'')+' / '+TL.length+' loaded';
-      }
-      tlDraw();
-      </script>
-"@)
+    $tlSources = @($tlAll | ForEach-Object { "$($_.Source)" } | Sort-Object -Unique)
+    $null = $sb.AppendLine("<a name='timeline'></a><h2>Master timeline (gathered evidence chronology)</h2>")
+    $null = $sb.AppendLine("<div class='card'>The full chronology lives in <b>csv\supertimeline.csv</b> ($(ConvertTo-HtmlEsc $tlAll.Count) events from $($tlSources.Count) evidence sources - open it in Excel/Timeline Explorer and filter by Timestamp). Evidence sources woven: $(ConvertTo-HtmlEsc ($tlSources -join ', ')). Scanner conclusions (Sigma detections, hunt findings, beacons) are intentionally NOT part of it - they have their own sections above. For windowed pivots with per-source/busiest-minute summaries run <b>-Mode Timeline</b>.</div>")
 
     # ---------- recommendations ----------
     $null = $sb.AppendLine("<a name='recommendations'></a><h2>Recommendations</h2>")
@@ -5137,7 +5123,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'entities_accounts'               = 'Accounts joined across logons/RDP/console history with failure counts'
         'entities_remotes'                = 'Remote endpoints joined across connections/beacons/brute-force/RDP targets'
         'delta_new'                       = 'Findings NEW since the previous collection'
-        'supertimeline'                   = 'MASTER TIMELINE: every artifact source woven chronologically (logons, 4688/5145, Kerberos, Sysmon, prefetch, $MFT births, browser, WER, StartupInfo, hunt findings...) with Timestamp/Source/Type/Actor/Entity/Detail - filter to any timeframe in Excel/Timeline Explorer'
+        'supertimeline'                   = 'MASTER TIMELINE: gathered evidence woven chronologically (logons, 4688/5145, Kerberos, Sysmon, prefetch, $MFT births, browser, WER, StartupInfo - scanner outputs excluded by design) with Timestamp/Source/Type/Actor/Entity/Detail - filter to any timeframe in Excel/Timeline Explorer'
     }
     $null = $sb.AppendLine("<table><tr><th>Artifact</th><th>Rows</th><th>What it is / what to look for</th></tr>")
     foreach ($f in @(Get-ChildItem -Path $CsvDir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
@@ -5153,6 +5139,52 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
     $null = $sb.AppendLine("</table>")
     $null = $sb.AppendLine("<div class='meta'>Also in the case: <b>supertimeline.csv</b> (MASTER chronology - every artifact, filter by time), <b>csv\evtx_ecmd\</b> (full event-log CSVs for deep-dives, when EvtxECmd ran in Parse mode), <b>siem_export.ndjson</b> (Splunk/Elastic-ready records), <b>case_draft.txt</b> (auto-written executive draft - edit into your report), <b>verdict.json</b>, <b>attack_layer.json</b> (MITRE ATT&amp;CK Navigator layer - load at navigator.mitre.org), <b>case.json</b> (run metadata + module timings), raw evidence under <b>raw\</b> (evtx, registry hives, prefetch, recent/jumplists, browser DBs, firewall log, RDP bitmap cache tiles in <b>raw\rdp_cache</b> - reconstruct what inbound RDP sessions displayed with RdpCacheStudio), collection.log</div>")
 
+    # shared client-side helpers: click-to-copy / double-click-expand + per-rule Sigma browsers
+    $ruleJsText = '{' + ($ruleJs -join ',') + '}'
+    $null = $sb.AppendLine("<div id='copied'></div>")
+    $null = $sb.AppendLine(@"
+      <script>
+      var RULES = $ruleJsText;
+      function esc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
+      function attr(s){return esc(s).replace(/"/g,'&quot;');}
+      document.addEventListener('click',function(e){
+        var t=e.target.closest?e.target.closest('.clip'):null;
+        if(t){var f=t.getAttribute('data-full')||t.textContent;
+          if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(f);}
+          var n=document.getElementById('copied'); if(n){n.textContent='copied '+f.length+' chars to clipboard'; n.style.display='block'; setTimeout(function(){n.style.display='none';},1200);}
+        }
+      });
+      document.addEventListener('dblclick',function(e){
+        var t=e.target.closest?e.target.closest('.clip'):null;
+        if(t){t.classList.toggle('open');}
+      });
+      function pgRule(id,delta){var p=document.getElementById('p_'+id);p.value=(parseInt(p.value)||1)+delta;renderRule(id);}
+      function renderRule(id){
+        var rows=RULES[id]||[];
+        var q=((document.getElementById('q_'+id)||{}).value||'').toLowerCase();
+        var lv=(document.getElementById('l_'+id)||{}).value||'all';
+        var pg=parseInt((document.getElementById('p_'+id)||{}).value)||1, per=50;
+        var f=[],i;
+        for(i=rows.length-1;i>=0;i--){var r=rows[i];
+          if(lv!=='all'&&r.l!==lv)continue;
+          if(q&&((r.d+' '+r.t+' '+r.c).toLowerCase().indexOf(q)<0))continue;
+          f.push(r);
+        }
+        var pages=Math.max(1,Math.ceil(f.length/per)); if(pg>pages)pg=pages; if(pg<1)pg=1;
+        var pe=document.getElementById('p_'+id); if(pe)pe.value=pg;
+        var h='<table><tr><th>Time</th><th>Computer</th><th>EID</th><th>Level</th><th>Event details - click = copy raw, double-click = expand</th></tr>';
+        for(i=(pg-1)*per;i<Math.min(pg*per,f.length);i++){var r2=f[i];
+          var prev=r2.d.length>300?r2.d.substring(0,300)+'...':r2.d;
+          h+='<tr><td>'+esc(r2.t)+'</td><td>'+esc(r2.c)+'</td><td>'+esc(r2.e)+'</td><td class="'+esc(r2.lc)+'">'+esc(r2.l)+'</td><td class="clip path" data-full="'+attr(r2.d)+'" title="click = copy raw">'+esc(prev)+'</td></tr>';
+        }
+        h+='</table>';
+        var box=document.getElementById('b_'+id);
+        if(box){box.innerHTML='<div class="pgr meta">'+f.length+' match(es), page '+pg+'/'+pages
+          +'<button onclick="pgRule(\''+id+'\',-1)">prev</button><button onclick="pgRule(\''+id+'\',1)">next</button></div>'+h;}
+      }
+      Object.keys(RULES).forEach(function(k){renderRule(k);});
+      </script>
+"@)
     $null = $sb.AppendLine("<div class='foot'>Generated $(Get-Date -Format u) by Ophira v$ScriptVersion - all verdicts are correlation heuristics; verify against raw CSV/evtx evidence before acting.</div>")
     $null = $sb.AppendLine("</body></html>")
     $reportPath = Join-Path $CaseDir 'report.html'
@@ -5214,7 +5246,6 @@ function New-SuperTimeline {
     & $weave 'sysmon_registry' 3000 { param($r) @("$($r.Time)", "registry event (Sysmon 13)", (& $leaf $r.Image), "$($r.TargetObject)", "$($r.EventType)") }
     & $weave 'sysmon_file_time' 1000 { param($r) @("$($r.Time)", 'file creation time changed (Sysmon 2)', (& $leaf $r.Image), (& $leaf $r.TargetFilename), "$($r.PreviousCreationUtcTime) -> $($r.CreationUtcTime)") }
     # execution evidence
-    & $weave 'hayabusa_timeline' 5000 { param($r) @("$($r.Timestamp)", "$($r.Level): $(if ($r.PSObject.Properties['RuleTitle']) { $r.RuleTitle } elseif ($r.PSObject.Properties['Alert']) { $r.Alert } else { $r.RuleFile })", '', '', "$($r.Details)") }
     $exec = Import-CaseCsv 'execution_timeline'
     if ($exec.Count -gt 0) {
         $tCol = ($exec[0].PSObject.Properties.Name | Select-Object -First 1)
@@ -5243,7 +5274,6 @@ function New-SuperTimeline {
     & $weave 'bam_lastexec' 2000 { param($r) @("$($r.LastWrite)", "last exec ($($r.Source))", (& $leaf $r.Executable), "$($r.Executable)", "sid $($r.Sid)") }
     & $weave 'startup_info' 1000 { param($r) @("$($r.LastRun)", 'app launch (StartupInfo)', (& $leaf $r.App), "$($r.App)", "count $($r.Count)") }
     & $weave 'wer_reports' 1000 { param($r) @("$($r.Time)", 'app crash (WER)', "$($r.App)", "$($r.Module)", "$($r.File)") }
-    & $weave 'session_activity' 3000 { param($r) @("$($r.Time)", "session activity [$($r.Activity)]", "$($r.SessionAccount)", "$($r.SourceIp)", "$($r.Detail)") }
     & $weave 'office_mru' 500 { param($r) @("$($r.LastWrite)", 'office document (MRU)', "$($r.App)", (& $leaf $r.Document), "$($r.Document)") }
     $anyT = {
         param($r, $fallback)
@@ -5266,8 +5296,9 @@ function New-SuperTimeline {
         @((& $anyT $r ''), 'browser download', '', (& $leaf $tp), "$($r.PSObject.Properties['URL'].Value)")
     }
     & $weave 'iis_requests' 1000 { param($r) @("$($r.Time)", "web request (IIS) $("$($r.Method)")", '', "$($r.ClientIp) -> $("$($r.Uri)")", "status $($r.Status) ua=$("$($r.UserAgent)")") }
-    & $weave 'hunt_findings' 500 { param($r) @("$($r.Found)", "hunt finding [$($r.Severity)]", '', "$($r.Entity)", "$($r.Rule): $($r.Evidence) ($($r.Attck))") }
-    & $weave 'logging_gaps' 100 { param($r) @("$($r.Time)", 'logging gap', '', "$($r.Source)", "$($r.Meaning) $($r.Message)") }
+    # scanner/derived outputs (hayabusa Sigma results, hunt findings, session attribution,
+    # logging-gap analysis) are deliberately NOT woven here - the timeline is gathered
+    # evidence only; conclusions live in their own report sections.
 
     if ($rows.Count -eq 0) { return }
     $sorted = @($rows | Sort-Object { $t = [datetime]::MinValue; try { $t = [datetime]::Parse($_.Timestamp, [System.Globalization.CultureInfo]::InvariantCulture) } catch { }; $t })
@@ -5278,7 +5309,7 @@ function New-SuperTimeline {
     $hS = Get-HayabusaExe
     if ($hS) { $null = Invoke-NativeTool -ExePath $hS.FullName -ToolArgs @('sort-csv', '-f', $out, '-o', $out, '-C', '-q', '-K') -WorkingDirectory $hS.DirectoryName -QuietLog }
     $nFinal = @(Get-Content -LiteralPath $out | Select-Object -Skip 1).Count
-    Write-CaseLog "    MASTER TIMELINE: $($sorted.Count) events from every artifact source, $nFinal after dedupe -> csv\supertimeline.csv (filter by Timestamp in Excel/Timeline Explorer)" 'DarkGray'
+    Write-CaseLog "    MASTER TIMELINE: $($sorted.Count) evidence events, $nFinal after dedupe -> csv\supertimeline.csv (filter by Timestamp in Excel/Timeline Explorer)" 'DarkGray'
 }
 
 function New-SigmaRuleLogs {

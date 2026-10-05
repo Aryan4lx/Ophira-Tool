@@ -60,14 +60,14 @@ New-Csv (Join-Path $CsvDir 'hunt_findings.csv') '"Found","Rule","Severity","Enti
 New-SuperTimeline
 
 $tl = @(Import-Csv -LiteralPath (Join-Path $CsvDir 'supertimeline.csv'))
-Check "weave: 9 timed fixture rows all present" ($tl.Count -eq 9)
+Check "weave: 7 timed fixture rows all present (derived sources excluded)" ($tl.Count -eq 7)
 Check "weave: normalized schema (Timestamp/Source/Type/Actor/Entity/Detail)" (@($tl[0].PSObject.Properties.Name) -join ',' -eq 'Timestamp,Source,Type,Actor,Entity,Detail')
 Check "weave: sorted ascending chronologically" ((@($tl | ForEach-Object { [datetime]$_.Timestamp }) | Sort-Object) -join '|' -eq (@($tl | ForEach-Object { [datetime]$_.Timestamp }) -join '|'))
 Check "weave: 4688 row carries actor + parent + cmdline" (@($tl | Where-Object { $_.Source -eq 'security_proc_events' -and $_.Actor -eq 'bob' -and "$($_.Detail)" -match 'explorer\.exe.*powershell\.exe -enc AAAA' }).Count -eq 1)
 Check "weave: prefetch row typed + run count in detail" (@($tl | Where-Object { $_.Type -eq 'prefetch run' -and "$($_.Detail)" -match 'run count 7' -and $_.Actor -eq 'EVIL.EXE' }).Count -eq 1)
 Check "weave: mft row entity is drive-prefixed path" (@($tl | Where-Object { $_.Source -eq 'mft_recent' -and $_.Entity -eq 'C:\Users\public\evil.exe' }).Count -eq 1)
 Check "weave: browser row found via *time* column" (@($tl | Where-Object { $_.Source -eq 'browser_history' -and $_.Entity -match 'evil\.example\.com' }).Count -eq 1)
-Check "weave: hunt finding carries severity + ATT&CK" (@($tl | Where-Object { $_.Type -match 'hunt finding \[high\]' -and "$($_.Detail)" -match 'T1105' }).Count -eq 1)
+Check "weave: derived sources (session/hunt) NOT woven" (@($tl | Where-Object { $_.Source -match 'session_activity|hunt_findings' }).Count -eq 0)
 Check "weave: timestamps normalized (no raw .NET date noise)" (@($tl | Where-Object { $_.Timestamp -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$' }).Count -eq $tl.Count)
 
 # ============================================================================
@@ -76,7 +76,7 @@ Check "weave: timestamps normalized (no raw .NET date noise)" (@($tl | Where-Obj
 Check "5.5: MFT paths get drive-letter prefix" ($src -match '\$path = if \(\$parent\) \{ "\$dl\$parent\\\$name" \}')
 Check "report: entity-card context window wired" ($src -match 'Context: everything else happening' -and $src -match '\$fs\.AddMinutes\(-15\)')
 Check "report: context reads supertimeline" ($src -match "Import-CaseCsv 'supertimeline'")
-Check "evidence index: master timeline description upgraded" ($src -match 'MASTER TIMELINE: every artifact source woven chronologically')
+Check "evidence index: master timeline description updated" ($src -match 'MASTER TIMELINE: gathered evidence woven chronologically')
 
 # ============================================================================
 # PART 3 - context window rendered in the report

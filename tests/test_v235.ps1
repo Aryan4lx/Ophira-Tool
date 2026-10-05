@@ -115,9 +115,8 @@ Check "wizard: banner mentions back" ($src -match 'Answer ''B'' at any question 
 # ============================================================================
 # PART 5 - cap bumps
 # ============================================================================
-Check "preview: 10,000-row embed" ($src -match 'Select-Object -Last 10000')
-Check "preview: 1000-row render cap + updated meta text" ($src -match '\+\+n>=1000' -and $src -match 'newest 10,000 rows, rendered newest-first, max 1,000')
 Check "supertimeline: total cap 120000" ($src -match 'if \(\$sorted\.Count -gt 120000\)')
+Check "supertimeline: timeline preview embed removed (v2.39)" (($src -match 'Select-Object -Last 10000' -eq $false) -and ($src -match 'var TL = ' -eq $false))
 
 Write-Host ""
 Write-Host "RESULT: $pass passed, $fail failed" -ForegroundColor $(if ($fail -eq 0) { 'Green' } else { 'Red' })

@@ -42,21 +42,15 @@ foreach ($empty in @('hunt_findings', 'hayabusa_timeline', 'beacon_candidates', 
 $script:Verdict = Get-CompromiseVerdict
 $null = New-HtmlReport
 $rendered = Get-Content (Join-Path $CaseDir 'report.html') -Raw
-Check "timeline: nav link + section header" ($rendered -match "href='#timeline'" -and $rendered -match 'Timeline preview \(newest 3 of 3 rows\)')
-Check "timeline: rows embedded as JSON" (([regex]::Matches($rendered, [regex]::Escape('"Source":"sysmon_dns"'))).Count -ge 1 -and ([regex]::Matches($rendered, [regex]::Escape('"Source":"hayabusa"'))).Count -ge 1 -and ([regex]::Matches($rendered, [regex]::Escape('"Source":"security_proc_events"'))).Count -ge 1)
-Check "timeline: JSON embedded inside the script block" ($rendered -match '(?s)<script>\s*var TL = \[.*?\];')
-Check "timeline: double quote in Detail escaped (valid JS)" ($rendered -match [regex]::Escape('\"whoami\"'))
-Check "timeline: source dropdown lists distinct sources" ($rendered -match '<option>sysmon_dns</option>' -and $rendered -match '<option>hayabusa</option>' -and $rendered -match ([regex]::Escape("<option value=''>all</option>")))
-Check "timeline: full-CSV pointer + Mode Timeline pointer" ($rendered -match 'csv\\supertimeline\.csv' -and $rendered -match '-Mode Timeline')
-Check "timeline: filter UI wired (text/date/source + draw)" ($rendered -match "id='tlq'" -and $rendered -match "type='date'" -and $rendered -match "id='tlsrc'" -and $rendered -match 'function tlDraw' -and $rendered -match 'tlDraw\(\);')
-Check "timeline: render cap 1000 + status line" ($rendered -match '\+\+n>=1000' -and $rendered -match "id='tlstat'")
-Check "timeline: newest-first rendering" ($rendered -match 'for\(var i=TL\.length-1;i>=0;i--\)')
+Check "timeline: pointer section (header + CSV + Mode Timeline)" ($rendered -match 'Master timeline \(gathered evidence chronology\)' -and $rendered -match 'csv\\supertimeline\.csv' -and $rendered -match '-Mode Timeline')
+Check "timeline: no JS preview embedded (v2.39 removed it)" ($rendered -notmatch 'var TL = ' -and $rendered -notmatch 'function tlDraw')
+Check "timeline: evidence sources listed" ($rendered -match 'Evidence sources woven:')
 
 # degrade: empty supertimeline renders section without crash
 "# no entries" | Set-Content -LiteralPath (Join-Path $CsvDir 'supertimeline.csv') -Encoding UTF8
 $null = New-HtmlReport
 $rendered2 = Get-Content (Join-Path $CaseDir 'report.html') -Raw
-Check "timeline: empty supertimeline -> newest 0 of 0, empty JSON array" ($rendered2 -match 'Timeline preview \(newest 0 of 0 rows\)' -and $rendered2 -match [regex]::Escape('var TL = [];'))
+Check "timeline: empty supertimeline -> section renders, no crash" ($rendered2 -match 'Master timeline \(gathered evidence chronology\)')
 
 # ============================================================================
 # PART 2 - release workflow

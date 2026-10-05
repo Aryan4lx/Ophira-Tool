@@ -78,7 +78,7 @@ $script:Verdict = Get-CompromiseVerdict
 $null = New-HtmlReport
 $rendered = Get-Content (Join-Path $CaseDir 'report.html') -Raw
 Check "drill-down: details block per rule rendered" ($rendered -match '<details><summary>' -and $rendered -match 'CobaltStrike Service Install')
-Check "drill-down: event rows inside the block (EID + details visible)" ($rendered -match '<td>7045</td>' -and $rendered -match 'Service: evil2')
+Check "drill-down: ALL events embedded in the RULES map (EID + details)" ($rendered -match 'Service: evil2' -and $rendered -match 'function renderRule')
 Check "drill-down: links the per-rule CSV" ($rendered -match 'csv\\sigma_rules\\CobaltStrike_Service_Install\.csv')
 
 # ============================================================================

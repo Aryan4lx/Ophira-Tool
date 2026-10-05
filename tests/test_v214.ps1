@@ -135,14 +135,9 @@ $CsvDir = Join-Path $stCase 'csv'
 New-Item -ItemType Directory -Path $CsvDir -Force | Out-Null
 New-Csv (Join-Path $CsvDir 'security_events.csv') @('"TimeCreated","Id","Provider","Level","Message"') @(
     '"2026-09-25 10:00:00","4624","Microsoft-Windows-Security-Auditing","Information","An account logged on"',
+    '"2026-09-25 10:00:00","4624","Microsoft-Windows-Security-Auditing","Information","An account logged on"',
     '"2026-09-25 11:00:00","4625","Microsoft-Windows-Security-Auditing","Information","Logon failed"'
 )
-$stLines = @(
-    '"2026-09-25 09:00:00","Bad Rule","high","H1","Sec",4688,1,"d","","guid-x"',
-    '"2026-09-25 09:00:00","Bad Rule","high","H1","Sec",4688,1,"d","","guid-x"',
-    '"2026-09-25 09:30:00","Other Rule","low","H1","Sec",4688,2,"d","","guid-y"'
-)
-New-Csv (Join-Path $CsvDir 'hayabusa_timeline.csv') @('"Timestamp","RuleTitle","Level","Computer","Channel","EventID","RecordID","Details","ExtraFieldInfo","RuleID"') $stLines
 $script:sortCsvCalled = $false
 function Get-HayabusaExe { Get-Item (Join-Path $hbDir 'hayabusa.exe') }
 function Invoke-NativeTool { param($ExePath, $ToolArgs, $WorkingDirectory, [switch]$QuietLog, $CaptureOut)
@@ -160,8 +155,8 @@ Invoke-Expression $mST.Value
 $null = New-SuperTimeline
 $stRows = @(Import-Csv (Join-Path $CsvDir 'supertimeline.csv'))
 Check "supertimeline: sort-csv invoked" $script:sortCsvCalled
-Check "supertimeline: duplicate hayabusa row deduped (4 rows)" ($stRows.Count -eq 4)
-Check "supertimeline: sources merged (hayabusa + security)" (@($stRows | Where-Object Source -eq 'hayabusa_timeline').Count -eq 2 -and @($stRows | Where-Object Source -eq 'security_events').Count -eq 2)
+Check "supertimeline: duplicate evidence row deduped (2 rows)" ($stRows.Count -eq 2)
+Check "supertimeline: evidence-only weave (security_events source)" (@($stRows | Where-Object Source -eq 'security_events').Count -eq 2)
 
 # ============================================================================
 # PART 5 - verdict wiring for DNS beacons + LOLDrivers

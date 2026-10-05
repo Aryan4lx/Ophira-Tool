@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.39
+- **Fix: 4624/4625 accounts swallowed the message** (report "Account @ Source" showed raw event text on real hosts): `Get-FilteredEvents` collapses whitespace, but the parser captured `[^\r\n]+` - on collapsed messages that runs to the end of the event. Captures are now label-bounded (`Account Name: (.*?) Account Domain: (.*?) Logon ID:`), `AccountDomain` is captured (spaces kept - `NT AUTHORITY` intact), and the report renders `DOMAIN\user @ ip`. Fixture now uses a collapsed single-line message - the old fixture had newlines, which is why this escaped the suite
+- **Supertimeline = gathered evidence only**: hayabusa Sigma results, hunt findings, session attribution and logging-gap analysis are no longer woven into `supertimeline.csv` - scanner conclusions stay in their own report sections. The report's timeline section is now a compact pointer to `csv\supertimeline.csv` + `-Mode Timeline` (the 10,000-row JSON embed is gone - report.html shrinks by megabytes on busy cases)
+- **Report drill-downs, same file**: sigma drill-down blocks now embed **all** matched events per rule (capped 5,000 rows total, details text to 800 chars - full text stays in the per-rule CSVs) rendered client-side with text filter + level filter + 50/page pager; ATT&CK technique rows are click-to-expand showing the actual matched events (up to 25 per technique)
+- **Click-to-copy everywhere**: one shared mechanism - truncated cells carry the full text in `data-full`; **click = copy the raw value** (toast confirms), **double-click = expand the cell in place**. Applied to decoded PowerShell commands, sigma details and all future truncation points
+- Tests: `tests\test_v239.ps1` (23 checks); v214/v216/v224/v234/v235 updated for the evidence-only weave, the pointer section and the JS-rendered drill-downs
+
 ## v2.38
 - **NTDS.dit is never touched, by policy**: the Full-preset DC copy of `ntds.dit` (module 8.14) is removed entirely - no file reads, no VSS copies, no raw saves. The evidence index now states the policy explicitly. The DC *role fingerprint* (registry key `HKLM\...\Services\NTDS\Parameters` existence check only) is retained for role detection - it never opens the file or its data
 - **Wording**: role gate options are now `[1] IR team` / `[2] User`; all owner-facing completion messages say "the IR team" instead of "the security team"
