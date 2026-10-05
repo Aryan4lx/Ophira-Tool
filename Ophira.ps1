@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.32  -  Windows Incident Response Triage Toolkit
+Ophira v2.33  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -39,7 +39,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.32"
+$ScriptVersion = "2.33"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -3599,6 +3599,90 @@ public class OphiraDump {
                 Write-CaseLog '    credential sweep: no exposure findings (no auto-logon, no WLAN keys, no vault blobs, no dumps)' 'Gray'
             }
         } }
+    [pscustomobject]@{ Id = '8.16'; Cat = 'CONTEXT'; Name = 'Remote access sweep (tunnel tools, RA services, RDP ServiceDll, SSH keys, RA logs)'; Default = $true; Quick = $false;
+        Run = {
+            # Evidence surface for hunt rules R23-R26 (csv\remote_access.csv): tunnels and
+            # remote-access tools as services, RDP ServiceDll tamper, SSH authorized_keys,
+            # RA tool install/log dirs (logs preserved to raw\ra_logs - vendors rotate them fast).
+            $ra = New-Object System.Collections.Generic.List[object]
+            # NOTE: keep in sync with $tunPat/$raPat in New-HuntFindings (R23-R26)
+            $tunPat = '(?i)(^|[^a-z0-9])(ngrok|cloudflared|tailscaled?|chisel|ligolo|frpc|frps|gost|revsocks)([^a-z0-9]|$)'
+            $raPat = '(?i)(^|[^a-z0-9])(anydesk|screenconnect|connectwisecontrol|teamviewer|rustdesk)([^a-z0-9]|$)'
+
+            # 1) one service enumeration: tunnel + RA tool matches, sshd presence
+            $svcs = @()
+            try { $svcs = @(Get-WmiOrCim -Class Win32_Service) } catch { }
+            foreach ($s in $svcs) {
+                $blob = "$($s.Name) $($s.DisplayName) $($s.PathName)"
+                $kind = ''
+                if ($blob -match $tunPat) { $kind = 'Tunnel service' } elseif ($blob -match $raPat) { $kind = 'RA tool service' }
+                if (-not $kind) { continue }
+                $state = "$($s.State)"
+                $null = $ra.Add([pscustomobject]@{
+                    Type = $kind; Name = "$($s.Name)"; State = $(if ($state -eq 'Running') { 'running' } else { $state })
+                    Path = "$($s.PathName)"; Detail = "display '$($s.DisplayName)' | start $($s.StartMode) | account $($s.StartName)"
+                })
+            }
+            if (@($svcs | Where-Object { "$($_.Name)" -eq 'sshd' }).Count -gt 0) {
+                $sshState = "$(@($svcs | Where-Object { "$($_.Name)" -eq 'sshd' })[0].State)"
+                $null = $ra.Add([pscustomobject]@{ Type = 'SSH server'; Name = 'sshd'; State = $sshState; Path = "$env:SystemRoot\System32\OpenSSH"; Detail = 'OpenSSH server present - authorized_keys below are live trust anchors' })
+            }
+
+            # 2) RDP ServiceDll tamper (RDPWrap-class): the registered DLL must be termsrv.dll
+            try {
+                $svcDll = "$((Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\TermService\Parameters' -Name ServiceDll -ErrorAction Stop).ServiceDll)"
+                if ($svcDll -and $svcDll -notmatch '(?i)\\termsrv\.dll$') {
+                    $null = $ra.Add([pscustomobject]@{ Type = 'RDP ServiceDll tamper'; Name = 'TermService'; State = 'tampered'; Path = $svcDll; Detail = 'ServiceDll is not termsrv.dll - RDPWrap-class hijack (multi-session RDP on non-server)' })
+                }
+            } catch { }
+
+            # 3) authorized_keys: programdata ssh + per-profile .ssh (non-empty = planted trust)
+            $akSeen = @()
+            $pdSsh = Join-Path $env:ProgramData 'ssh'
+            if (Test-Path $pdSsh) { $akSeen += @(Get-ChildItem -LiteralPath $pdSsh -Filter '*authorized_keys*' -File -ErrorAction SilentlyContinue | ForEach-Object { @{ File = $_; Tag = 'programdata' } }) }
+            foreach ($u in @(Get-UserProfileList)) {
+                $sshDir = Join-Path "$($u.Path)" '.ssh'
+                if (Test-Path $sshDir) { $akSeen += @(Get-ChildItem -LiteralPath $sshDir -Filter '*authorized_keys*' -File -ErrorAction SilentlyContinue | ForEach-Object { @{ File = $_; Tag = "$($u.User -replace '[^\w]', '_')" } }) }
+            }
+            foreach ($ak in $akSeen) {
+                $f = $ak.File
+                $keyLines = @()
+                $readable = $true
+                try { $keyLines = @(Get-Content -LiteralPath $f.FullName -ErrorAction Stop | Where-Object { "$($_)" -and "$($_.Trim())" -notmatch '^(#|$)' }) } catch { $readable = $false }
+                $sha = ''
+                try { $sha = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction Stop).Hash } catch { }
+                $state = if (-not $readable) { 'unreadable (access denied)' } elseif ($keyLines.Count -gt 0) { "populated ($($keyLines.Count) key line(s))" } else { 'empty/comments-only' }
+                $null = $ra.Add([pscustomobject]@{
+                    Type = 'SSH authorized_keys'; Name = $f.Name; State = $state; Path = $f.FullName
+                    Detail = "profile $($ak.Tag)$(if ($sha) { " | sha256 $sha" })$(if ($keyLines.Count -gt 0) { ' | content -> raw\ra_logs' })"
+                })
+                if ($keyLines.Count -gt 0) {
+                    try { Out-RawText -SubDir 'ra_logs' -Name ("authorized_keys_" + $ak.Tag + "_" + $f.Name + ".txt") -Text (@(Get-Content -LiteralPath $f.FullName) | ForEach-Object { "$_" }) } catch { }
+                }
+            }
+
+            # 4) RA tool data dirs under ProgramData - preserve logs/configs to raw\ra_logs
+            foreach ($d in @(Get-ChildItem $env:ProgramData -Directory -ErrorAction SilentlyContinue | Where-Object { "$($_.Name)" -match $raPat })) {
+                $files = @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 20MB -and "$($_.Name)" -match '(?i)\.(log|trace|txt|xml|conf|config|ad)$|connections' } | Select-Object -First 40)
+                if ($files.Count -gt 0) {
+                    $dest = Join-Path $RawDir ("ra_logs\" + ($d.Name -replace '[^\w]', '_'))
+                    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                    $files | Copy-Item -Destination $dest -Force -ErrorAction SilentlyContinue
+                }
+                $null = $ra.Add([pscustomobject]@{
+                    Type = 'RA tool data dir'; Name = $d.Name; State = 'present'; Path = $d.FullName
+                    Detail = "$(if ($files.Count -gt 0) { "$($files.Count) evidence file(s) -> raw\ra_logs\$($d.Name -replace '[^\w]', '_')" } else { 'no retained logs' })"
+                })
+            }
+
+            Save-Rows -Name 'remote_access' -Rows $ra.ToArray()
+            $notable = @($ra | Where-Object { "$($_.Type)" -match 'Tunnel|tamper|SSH server|authorized_keys' -or "$($_.State)" -match 'running|tampered' }).Count
+            if ($ra.Count -gt 0) {
+                Write-CaseLog "    remote access sweep: $($ra.Count) row(s) ($notable notable) -> csv\remote_access.csv" $(if ($notable -gt 0) { 'Yellow' } else { 'Gray' })
+            } else {
+                Write-CaseLog '    remote access sweep: no tunnels, RA tools, RDP tamper or SSH keys found' 'Gray'
+            }
+        } }
 )
 
 function Get-FilteredEvents {
@@ -5828,6 +5912,84 @@ function New-HuntFindings {
         & $find 'Timestamp forgery indicators' 'medium' "$($m.Path)" (($checks | Select-Object -First 4) -join ' | ') 'T1070.006'
     }
 
+    # ---------- R23-R26: tunnel & remote-access pack (csv\remote_access.csv + collected sources) ----------
+    # R23 tunnel binary active - high when running/installed/service-installed, medium when only on disk
+    # R24 RA-tool service - medium (dual-use: legitimate remote support is common)
+    # R25 RDP ServiceDll tamper - high (RDPWrap-class)
+    # R26 non-empty authorized_keys - high (planted SSH trust anchor)
+    # NOTE: keep $tunPat/$raPat in sync with module 8.16
+    $tunPat = '(?i)(^|[^a-z0-9])(ngrok|cloudflared|tailscaled?|chisel|ligolo|frpc|frps|gost|revsocks)([^a-z0-9]|$)'
+    $raPat = '(?i)(^|[^a-z0-9])(anydesk|screenconnect|connectwisecontrol|teamviewer|rustdesk)([^a-z0-9]|$)'
+    $raActive = @{}
+    foreach ($r in (Import-CaseCsv 'processes')) {
+        $leaf = ''
+        try { $leaf = (Split-Path "$($r.Path)" -Leaf) } catch { continue }
+        if (-not $leaf -or "$leaf" -notmatch $tunPat) { continue }
+        $key = "$leaf".ToLower()
+        if ($raActive.ContainsKey($key)) { continue }
+        $raActive[$key] = $true
+        & $find 'Remote-access tunnel binary active' 'high' "$($r.Path)" "tunnel tool running as process '$leaf' (pid $($r.PID))" 'T1572'
+        if ($raActive.Count -gt 10) { break }
+    }
+    foreach ($r in (Import-CaseCsv 'services')) {
+        $blob = "$($r.Name) $($r.DisplayName) $($r.PathName)"
+        if ("$blob" -notmatch $tunPat) { continue }
+        $key = "$($r.Name)".ToLower()
+        if ($raActive.ContainsKey($key)) { continue }
+        $raActive[$key] = $true
+        & $find 'Remote-access tunnel binary active' 'high' "$($r.PathName)" "tunnel tool installed as service '$($r.Name)' (state $($r.State))" 'T1572'
+        if ($raActive.Count -gt 10) { break }
+    }
+    foreach ($r in (Import-CaseCsv 'system_new_services')) {
+        $blob = "$($r.Service) $($r.Binary)"
+        if ("$blob" -notmatch $tunPat) { continue }
+        $key = "$($r.Service)".ToLower()
+        if ($raActive.ContainsKey($key)) { continue }
+        $raActive[$key] = $true
+        & $find 'Remote-access tunnel binary active' 'high' "$($r.Binary)" "tunnel tool service '$($r.Service)' installed at $($r.Time) (7045)" 'T1543.003'
+        if ($raActive.Count -gt 10) { break }
+    }
+    foreach ($src in @('mft_recent', 'amcache')) {
+        foreach ($r in (Import-CaseCsv $src)) {
+            $lf = ''
+            foreach ($pn in @('Path', 'Name', 'ApplicationName')) {
+                $p2 = $r.PSObject.Properties[$pn]
+                if ($p2 -and "$($p2.Value)") { try { $lf = (Split-Path "$($p2.Value)" -Leaf) } catch { $lf = "$($p2.Value)" }; break }
+            }
+            if (-not $lf -or "$lf" -notmatch $tunPat) { continue }
+            $key = "$lf".ToLower()
+            if ($raActive.ContainsKey($key)) { continue }
+            $raActive[$key] = $true
+            & $find 'Remote-access tunnel tool on disk' 'medium' "$lf" "tunnel tool name present in $src (file evidence only - not seen running/installed)" 'T1572'
+            if ($raActive.Count -gt 20) { break }
+        }
+    }
+    $raSvcSeen = @{}
+    foreach ($r in (Import-CaseCsv 'services')) {
+        $blob = "$($r.Name) $($r.DisplayName) $($r.PathName)"
+        if ("$blob" -notmatch $raPat) { continue }
+        $key = "$($r.Name)".ToLower()
+        if ($raSvcSeen.ContainsKey($key)) { continue }
+        $raSvcSeen[$key] = $true
+        & $find 'Remote-access tool present' 'medium' "$($r.PathName)" "remote-access tool installed as service '$($r.Name)' (state $($r.State)) - dual-use, verify support expectation" 'T1219'
+        if ($raSvcSeen.Count -gt 10) { break }
+    }
+    foreach ($r in (Import-CaseCsv 'remote_access')) {
+        if ("$($r.Type)" -eq 'RA tool service' -or "$($r.Type)" -eq 'RA tool data dir') {
+            $key = "$($r.Name)".ToLower()
+            if (-not $raSvcSeen.ContainsKey($key)) {
+                $raSvcSeen[$key] = $true
+                & $find 'Remote-access tool present' 'medium' "$($r.Path)" "remote-access tool $($r.Type.ToLower()) '$($r.Name)' ($($r.State)) - dual-use, verify support expectation" 'T1219'
+            }
+        }
+        if ("$($r.Type)" -eq 'RDP ServiceDll tamper') {
+            & $find 'RDP ServiceDll tamper' 'high' "$($r.Path)" "TermService ServiceDll replaced: $($r.Path) - $($r.Detail)" 'T1112'
+        }
+        if ("$($r.Type)" -eq 'SSH authorized_keys' -and "$($r.State)" -match 'populated') {
+            & $find 'SSH authorized_keys present' 'high' "$($r.Path)" "$($r.Name) is $($r.State) - planted SSH trust anchor ($($r.Detail))" 'T1098.004'
+        }
+    }
+
     Save-Rows -Name 'hunt_findings' -Rows $out.ToArray()
     $hi = @($out | Where-Object { $_.Severity -eq 'high' }).Count
     if ($out.Count -gt 0) {
@@ -6063,7 +6225,7 @@ function Get-CompromiseVerdict {
     $dnsMed = @($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
     $lolMal = @($lol | Where-Object { $_.Status -eq 'malicious' }).Count
     $hunt = Import-CaseCsv 'hunt_findings'
-    $huntHi = @($hunt | Where-Object { "$($_.Severity)" -eq 'high' -and "$($_.Rule)" -match 'Renamed LOLBin|side-load|Downloaded then executed|LSASS access|Office app spawned|proxy-execution|Admin-share staging|Defender (real-time|exclusion)|DCSync|Password spray|Web server spawned' })
+    $huntHi = @($hunt | Where-Object { "$($_.Severity)" -eq 'high' -and "$($_.Rule)" -match 'Renamed LOLBin|side-load|Downloaded then executed|LSASS access|Office app spawned|proxy-execution|Admin-share staging|Defender (real-time|exclusion)|DCSync|Password spray|Web server spawned|Remote-access tunnel|ServiceDll tamper|authorized_keys' })
     $usnBurstN = @($usnBursts).Count
     $rExt = ((@($usnBursts) | Where-Object { "$($_.RansomExt)" } | ForEach-Object { "$($_.RansomExt)" } | Sort-Object -Unique) -join ',')
     # ponytail: COM hijacks + StartupApproved excluded from the signal (per-user COM has many legit users, e.g. Teams/OneDrive); they stay report-visible
@@ -6074,7 +6236,7 @@ function Get-CompromiseVerdict {
     Add-Signal 'C2 beaconing - highly regular callbacks' 3 $beaconHi (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp):$($_.Port) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'C2 DNS beaconing - highly regular domain queries' 3 $dnsHi (($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.Domain) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'Known-malicious driver on disk (LOLDrivers)' 2 $lolMal (($lol | Where-Object { $_.Status -eq 'malicious' } | Select-Object -First 3 | ForEach-Object { "$($_.Name): $($_.Path)" }) -join '; ')
-    Add-Signal 'Hunt technique - renamed binary / side-load / download-exec / LSASS access / Office chain / proxy-exec / share staging / Defender tamper / DCSync / spray / webshell' 2 $huntHi.Count (($huntHi | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
+    Add-Signal 'Hunt technique - renamed binary / side-load / download-exec / LSASS access / Office chain / proxy-exec / share staging / Defender tamper / DCSync / spray / webshell / tunnel / RDP hijack / SSH keys' 2 $huntHi.Count (($huntHi | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'Ransomware-like mass file modification (USN journal)' 3 $usnBurstN ((($usnBursts | Select-Object -First 3 | ForEach-Object { "$($_.WindowStart): $($_.WriteEvents) writes / $($_.DistinctFiles) files" }) -join '; ') + $(if ($rExt) { " - RANSOM EXTENSIONS: $rExt" }))
     Add-Signal 'Uncommon persistence mechanism (IFEO/AppInit/Winlogon/netsh/LSA)' 2 $asepHotN (($asep | Where-Object { $_.Flags -match 'user-path|nondefault' -and "$($_.Category)" -notmatch 'ComHijack|StartupApproved' } | Select-Object -First 3 | ForEach-Object { "$($_.Category): $($_.Name) = $($_.Value)" }) -join '; ')
     Add-Signal 'Memory malfind indicators (injected code regions)' 2 @($memMf).Count (($memMf | Select-Object -First 3 | ForEach-Object { "$($_.Process)($($_.PID))" }) -join '; ')
@@ -6119,6 +6281,7 @@ function Get-CompromiseVerdict {
     Add-Cov 'DNS query telemetry (Sysmon EID 22)' (Test-Path (Join-Path $CsvDir 'sysmon_dns.csv')) 4
     Add-Cov 'Entity correlation' (Test-Path (Join-Path $CsvDir 'entities_binaries.csv')) 3
     Add-Cov 'Hunt rules' (Test-Path (Join-Path $CsvDir 'hunt_findings.csv')) 3
+    Add-Cov 'Remote access sweep (tunnels/RA tools/SSH keys)' (Test-Path (Join-Path $CsvDir 'remote_access.csv')) 2
     Add-Cov 'Structured telemetry (4688 / Sysmon 10-13)' ((Test-Path (Join-Path $CsvDir 'security_proc_events.csv')) -or (Test-Path (Join-Path $CsvDir 'sysmon_process_access.csv'))) 3
     Add-Cov 'Kerberos/DS telemetry (DC role)' ((Test-Path (Join-Path $CsvDir 'security_kerberos.csv')) -or (Test-Path (Join-Path $CsvDir 'security_ds_access.csv'))) 3
     Add-Cov 'Web telemetry (IIS)' (Test-Path (Join-Path $CsvDir 'iis_requests.csv')) 2
@@ -6939,8 +7102,10 @@ function Invoke-CanaryMode {
     Write-Host ""
     Write-Host "  This will, on THIS PC:" -ForegroundColor Yellow
     Write-Host "   - enable Process Creation + cmdline + scriptblock logging (restored after, unless -KeepLogging)"
-    Write-Host "   - plant self-labeled test activity: renamed cmd copy, canary_test user (created + deleted),"
-    Write-Host "     recon command burst, certutil fetch of a benign file"
+    Write-Host "   - plant self-labeled test activity: renamed cmd copies (one kept alive as a fake tunnel tool),"
+    Write-Host "     canary_test user (created + deleted), recon command burst, certutil fetch of a benign file,"
+    Write-Host "     canary_tunneld service (registered + immediately removed - the 7045 event remains),"
+    Write-Host "     one labeled line in administrators_authorized_keys (file removed/restored after)"
     Write-Host "   - run a Standard collection and score which hunt rules fired"
     if ($Target) {
         Write-Host "  And on TARGET '$Target':" -ForegroundColor Yellow
@@ -7026,6 +7191,37 @@ function Invoke-CanaryMode {
     Copy-Item "$env:SystemRoot\System32\cmd.exe" $canExe -Force
     $null = & $canExe /c "echo canary > `"$env:TEMP\canary_out.txt`"" 2>&1
     Write-Host "    renamed cmd copy run (canary_renamed.exe)" -ForegroundColor Gray
+    # tunnel-tool plant: named for a tunnel binary + kept alive so it is RUNNING at collect time
+    # (fires R23 via the live process and R1/R1b via the cmd identity; killed in cleanup)
+    $ngProc = $null
+    $canNgrok = Join-Path $env:PUBLIC 'canary_ngrok.exe'
+    try {
+        Copy-Item "$env:SystemRoot\System32\cmd.exe" $canNgrok -Force -ErrorAction Stop
+        $ngProc = Start-Process -FilePath $canNgrok -ArgumentList '/c', 'ping -n 400 127.0.0.1 > nul' -WindowStyle Hidden -PassThru -ErrorAction Stop
+        Write-Host "    canary_ngrok.exe running (kept alive through collection)" -ForegroundColor Gray
+    } catch { Write-Host "    canary_ngrok plant failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+    # service-install plant: registered + immediately removed - only the 7045 event remains
+    if ($ngProc) {
+        $null = & sc.exe create canary_tunneld binPath= "$canNgrok" start= demand 2>&1
+        $null = & sc.exe delete canary_tunneld 2>&1
+        Write-Host "    canary_tunneld service registered + removed (7045 evidence remains)" -ForegroundColor Gray
+    }
+    # SSH trust plant: one labeled key line (prior file state captured; restored/removed in cleanup)
+    $akFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+    $akPrev = $null
+    $akCreated = $false
+    $akOk = $false
+    try {
+        if (Test-Path -LiteralPath $akFile) { $akPrev = @(Get-Content -LiteralPath $akFile -ErrorAction Stop | ForEach-Object { "$_" }) }
+        else {
+            $akDir = Split-Path $akFile -Parent
+            if (-not (Test-Path $akDir)) { New-Item -ItemType Directory -Path $akDir -Force | Out-Null }
+            $akCreated = $true
+        }
+        Add-Content -LiteralPath $akFile -Value 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICANARYKEYLINE canary@ophira-selftest' -ErrorAction Stop
+        $akOk = $true
+        Write-Host "    labeled line planted in administrators_authorized_keys" -ForegroundColor Gray
+    } catch { Write-Host "    authorized_keys plant skipped: $($_.Exception.Message)" -ForegroundColor DarkYellow }
     $canPass = 'Canary!2026'
     $null = & net.exe user canary_test $canPass /add 2>&1
     $null = & net.exe localgroup administrators canary_test /add 2>&1
@@ -7095,6 +7291,8 @@ function Invoke-CanaryMode {
     $procRows = @(Import-Csv -LiteralPath (Join-Path $csv 'security_proc_events.csv') -ErrorAction SilentlyContinue)
     $authRows = @(Import-Csv -LiteralPath (Join-Path $csv 'security_auth_events.csv') -ErrorAction SilentlyContinue)
     $pcRows = @(Import-Csv -LiteralPath (Join-Path $csv 'sysmon_proc_create.csv') -ErrorAction SilentlyContinue)
+    $raRows = @(Import-Csv -LiteralPath (Join-Path $csv 'remote_access.csv') -ErrorAction SilentlyContinue)
+    $sysSvcRows = @(Import-Csv -LiteralPath (Join-Path $csv 'system_new_services.csv') -ErrorAction SilentlyContinue)
     $score = 0; $possible = 0
     $c4720 = @($authRows | Where-Object { "$($_.EventId)" -eq '4720' }).Count
     $c4732 = @($authRows | Where-Object { @('4728', '4732', '4756') -contains "$($_.EventId)" }).Count
@@ -7104,6 +7302,9 @@ function Invoke-CanaryMode {
         @{ L = 'R6   account lifecycle';           Hit = @($hf | Where-Object { $_.Rule -match 'Account lifecycle' }).Count;              Data = ($c4720 + $c4732); DataWhy = $r6Why }
         @{ L = 'R10  proxy-execution (certutil)';  Hit = @($hf | Where-Object { $_.Rule -match 'proxy-execution' }).Count;                Data = @($procRows | Where-Object { $_ -match 'canary|certutil' }).Count; DataWhy = '4688/cmdline audit not active at plant time' }
         @{ L = 'R13  discovery command storm';     Hit = @($hf | Where-Object { $_.Rule -match 'Discovery command storm' }).Count;        Data = @($procRows | Where-Object { $_ -match 'whoami|systeminfo|nltest' }).Count; DataWhy = '4688 audit not active at plant time' }
+        @{ L = 'R23  remote-access tunnel (canary_ngrok)'; Hit = @($hf | Where-Object { $_.Rule -match 'Remote-access tunnel' }).Count; Data = @($raRows | Where-Object { $_ -match 'canary_ngrok' }).Count + @($sysSvcRows | Where-Object { $_ -match 'canary_ngrok|canary_tunneld' }).Count; DataWhy = 'module 8.16 + processes missing (Standard preset required)' }
+        @{ L = 'RA   service-install telemetry (7045 canary_tunneld)'; Hit = @($sysSvcRows | Where-Object { $_ -match 'canary_tunneld' }).Count; Data = @($sysSvcRows).Count; DataWhy = 'System log module (4.5) did not run - no 7045 rows' }
+        @{ L = 'R26  SSH authorized_keys plant';   Hit = @($hf | Where-Object { $_.Rule -match 'authorized_keys' }).Count;                Data = @($raRows | Where-Object { $_ -match 'administrators_authorized_keys' }).Count; DataWhy = 'module 8.16 missing (Standard preset required)' }
     )
     foreach ($c in $checks) {
         $possible++
@@ -7111,6 +7312,7 @@ function Invoke-CanaryMode {
         elseif ($c.Data -gt 0) { Write-Host ("    {0}  MISS - data present (x{1}) but rule silent: file this" -f $c.L, $c.Data) -ForegroundColor Red }
         else { Write-Host ("    {0}  BLIND - no telemetry: {1}" -f $c.L, $c.DataWhy) -ForegroundColor Yellow }
     }
+    Write-Host "    R25  RDP ServiceDll tamper  n/a - not planted (TermService tamper too invasive for a canary)" -ForegroundColor DarkGray
     $verdict = $null
     try { $verdict = (Get-Content -LiteralPath (Join-Path $case.FullName 'verdict.json') -Raw | ConvertFrom-Json) } catch { }
     Write-Host ""
@@ -7151,7 +7353,15 @@ function Invoke-CanaryMode {
     }
 
     # ---- cleanup + restore ----
-    Remove-Item $canExe, "$env:TEMP\canary_out.txt", "$env:TEMP\canary_dl.bin" -Force -ErrorAction SilentlyContinue
+    if ($ngProc -and -not $ngProc.HasExited) { $null = Stop-Process -Id $ngProc.Id -Force -ErrorAction SilentlyContinue }
+    Remove-Item $canExe, $canNgrok, "$env:TEMP\canary_out.txt", "$env:TEMP\canary_dl.bin" -Force -ErrorAction SilentlyContinue
+    if ($akOk) {
+        try {
+            if ($akCreated) { Remove-Item -LiteralPath $akFile -Force -ErrorAction Stop }
+            else { Set-Content -LiteralPath $akFile -Value $akPrev -ErrorAction Stop }
+            Write-Host "  administrators_authorized_keys restored." -ForegroundColor DarkGray
+        } catch { Write-Host "  authorized_keys restore FAILED: $akFile - remove the canary line manually" -ForegroundColor Yellow }
+    }
     if (-not $KeepLogging -and $undo.Count -gt 0) {
         Write-Host "  Restoring original audit state..." -ForegroundColor DarkGray
         foreach ($u in $undo) {
