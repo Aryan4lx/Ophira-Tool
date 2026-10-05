@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.35  -  Windows Incident Response Triage Toolkit
+Ophira v2.36  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -42,7 +42,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.35"
+$ScriptVersion = "2.36"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -1772,6 +1772,98 @@ $script:Modules = @(
             Save-Rows -Name 'drivers' -Rows $d
             Save-Rows -Name 'drivers_flagged' -Rows @($d | Where-Object { Test-IsUserWritablePath "$($_.PathName)" })
             Invoke-ExeCapture -SubDir 'drivers' -Name 'driverquery_v.csv' -Exe driverquery.exe -Arguments '/v /fo csv'
+        } }
+    [pscustomobject]@{ Id = '1.7'; Cat = 'VOLATILE'; Name = 'Svchost masquerade audit (live -k groups vs registered ServiceDlls)'; Default = $true; Quick = $true;
+        Run = {
+            # Live svchost -k groups must exist in HKLM:\...\Svchost, and every service in a
+            # registered group must carry a ServiceDll. Anything else is a masquerade/persistence
+            # tell (svchost.exe is the favorite disguise because it is always running anyway).
+            $rows = New-Object System.Collections.Generic.List[object]
+            $grpMap = @{}
+            $svk = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Svchost' -ErrorAction SilentlyContinue
+            if ($svk) {
+                foreach ($p in ($svk.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
+                    $grpMap["$($p.Name)"] = @($p.Value)
+                }
+            }
+            $svcDll = @{}
+            foreach ($g in @($grpMap.Keys)) {
+                foreach ($svc in $grpMap[$g]) {
+                    $s = "$svc"
+                    if ($s -and -not $svcDll.ContainsKey($s)) {
+                        $dll = ''
+                        try { $dll = "$((Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$s\Parameters" -Name ServiceDll -ErrorAction Stop).ServiceDll)" } catch { }
+                        $svcDll[$s] = $dll
+                    }
+                }
+            }
+            $procs = @()
+            try { $procs = @(Get-WmiOrCim -Class Win32_Process | Where-Object { "$($_.Name)" -match '(?i)^svchost\.exe$' }) } catch { }
+            $seen = @{}
+            foreach ($p in $procs) {
+                $grp = ''
+                if ("$($p.CommandLine)" -match '\-k\s+(\S+)') { $grp = $Matches[1] }
+                if (-not $grp) { continue }
+                if (-not $grpMap.ContainsKey($grp)) {
+                    $key = "UnregisteredGroup|$grp"
+                    if ($seen.ContainsKey($key)) { continue }
+                    $seen[$key] = $true
+                    $null = $rows.Add([pscustomobject]@{ Type = 'UnregisteredGroup'; Group = $grp; Service = ''; PID = $p.ProcessId; Path = ''; Detail = "svchost running with -k $grp but that group is not registered in the Svchost registry key (masquerade tell)" })
+                    continue
+                }
+                foreach ($svc in $grpMap[$grp]) {
+                    $dll = $svcDll["$svc"]
+                    if (-not $dll) {
+                        $key = "ServiceDllMissing|$grp|$svc"
+                        if ($seen.ContainsKey($key)) { continue }
+                        $seen[$key] = $true
+                        $null = $rows.Add([pscustomobject]@{ Type = 'ServiceDllMissing'; Group = $grp; Service = "$svc"; PID = ''; Path = ''; Detail = "service in group '$grp' has no ServiceDll value (broken or tampered registration)" })
+                        continue
+                    }
+                    if ("$dll" -notmatch '(?i)\\(System32|SysWOW64)\\') {
+                        $key = "OutOfPathServiceDll|$svc"
+                        if ($seen.ContainsKey($key)) { continue }
+                        $seen[$key] = $true
+                        $null = $rows.Add([pscustomobject]@{ Type = 'OutOfPathServiceDll'; Group = $grp; Service = "$svc"; PID = ''; Path = $dll; Detail = "ServiceDll outside System32 - svchost-hosted persistence in a user-writable location" })
+                    }
+                }
+            }
+            # unregistered loaded modules (live; needs elevation - degrades silently without)
+            $regDlls = @{}
+            foreach ($v in $svcDll.Values) {
+                if (-not $v) { continue }
+                $lf = ''
+                try { $lf = (Split-Path "$v" -Leaf).ToLower() } catch { }
+                if ($lf) { $regDlls[$lf] = $true }
+            }
+            foreach ($p in $procs) {
+                if (-not $p.ProcessId -or $seen.Count -gt 40) { continue }
+                $mods = $null
+                try { $mods = (Get-Process -Id $p.ProcessId -ErrorAction Stop).Modules } catch { continue }
+                foreach ($m in $mods) {
+                    $lf = ''
+                    try { $lf = "$($m.FileName)" } catch { continue }
+                    if (-not $lf) { continue }
+                    $leaf = ''
+                    try { $leaf = (Split-Path $lf -Leaf).ToLower() } catch { continue }
+                    if (-not $leaf -or $regDlls.ContainsKey($leaf)) { continue }
+                    if ("$lf" -match '(?i)\\Windows\\(System32|SysWOW64|WinSxS)\\') { continue }
+                    $sig = Get-SignatureInfo -Path $lf
+                    if ($sig -and "$($sig.Signer)" -match 'Microsoft') { continue }
+                    $key = "UnregisteredModule|$lf"
+                    if ($seen.ContainsKey($key)) { continue }
+                    $seen[$key] = $true
+                    $null = $rows.Add([pscustomobject]@{ Type = 'UnregisteredModule'; Group = ''; Service = ''; PID = $p.ProcessId; Path = $lf; Detail = "unsigned/non-Microsoft DLL loaded inside svchost that is not a registered ServiceDll" })
+                    if ($seen.Count -gt 40) { break }
+                }
+            }
+            Save-Rows -Name 'svchost_audit' -Rows $rows.ToArray()
+            $hot = @($rows | Where-Object { "$($_.Type)" -match 'UnregisteredGroup|OutOfPathServiceDll' }).Count
+            if ($rows.Count -gt 0) {
+                Write-CaseLog "    svchost audit: $($rows.Count) finding(s) ($hot high-tell) -> csv\svchost_audit.csv" $(if ($hot -gt 0) { 'Red' } else { 'Yellow' })
+            } else {
+                Write-CaseLog '    svchost audit: all live -k groups registered, ServiceDlls in place' 'Gray'
+            }
         } }
     [pscustomobject]@{ Id = '2.1'; Cat = 'PERSISTENCE'; Name = 'Autoruns (Run keys + startup folders)'; Default = $true; Quick = $true;
         Run = {
@@ -4978,6 +5070,7 @@ details{margin:6px 0}summary{cursor:pointer;color:#8ab4f8;font-size:13px}
         'rdp_client_targets'              = 'Outbound RDP destinations (registry MRU)'
         'system_events'                   = 'System log events in window'
         'system_new_services'             = 'EID 7045 service installs - malware installs itself as services'
+        'svchost_audit'                   = 'Live svchost -k groups vs registered ServiceDlls (masquerade audit: unregistered group, ServiceDll outside System32, unregistered loaded DLL)'
         'defender_status'                 = 'AV state at collection'
         'defender_threats'                = 'AV detections history'
         'defender_preferences'            = 'AV exclusions - attackers add exclusions'
@@ -6109,6 +6202,16 @@ function New-HuntFindings {
         }
     }
 
+    # ---------- R27: svchost masquerade (module 1.7 audit xref) ----------
+    $svchN = 0
+    foreach ($r in (Import-CaseCsv 'svchost_audit')) {
+        $sev = if ("$($r.Type)" -match 'UnregisteredGroup|OutOfPathServiceDll') { 'high' } else { 'medium' }
+        $ent = if ("$($r.Path)") { "$($r.Path)" } elseif ("$($r.Service)") { "svchost -k $($r.Group) / $($r.Service)" } else { "svchost -k $($r.Group)" }
+        & $find 'Svchost masquerade indicator' $sev $ent "$($r.Type): $($r.Detail)" 'T1036.005'
+        $svchN++
+        if ($svchN -ge 20) { break }
+    }
+
     Save-Rows -Name 'hunt_findings' -Rows $out.ToArray()
     $hi = @($out | Where-Object { $_.Severity -eq 'high' }).Count
     if ($out.Count -gt 0) {
@@ -6344,7 +6447,7 @@ function Get-CompromiseVerdict {
     $dnsMed = @($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' }).Count
     $lolMal = @($lol | Where-Object { $_.Status -eq 'malicious' }).Count
     $hunt = Import-CaseCsv 'hunt_findings'
-    $huntHi = @($hunt | Where-Object { "$($_.Severity)" -eq 'high' -and "$($_.Rule)" -match 'Renamed LOLBin|side-load|Downloaded then executed|LSASS access|Office app spawned|proxy-execution|Admin-share staging|Defender (real-time|exclusion)|DCSync|Password spray|Web server spawned|Remote-access tunnel|ServiceDll tamper|authorized_keys' })
+    $huntHi = @($hunt | Where-Object { "$($_.Severity)" -eq 'high' -and "$($_.Rule)" -match 'Renamed LOLBin|side-load|Downloaded then executed|LSASS access|Office app spawned|proxy-execution|Admin-share staging|Defender (real-time|exclusion)|DCSync|Password spray|Web server spawned|Remote-access tunnel|ServiceDll tamper|authorized_keys|Svchost masquerade' })
     $usnBurstN = @($usnBursts).Count
     $rExt = ((@($usnBursts) | Where-Object { "$($_.RansomExt)" } | ForEach-Object { "$($_.RansomExt)" } | Sort-Object -Unique) -join ',')
     # ponytail: COM hijacks + StartupApproved excluded from the signal (per-user COM has many legit users, e.g. Teams/OneDrive); they stay report-visible
@@ -6355,7 +6458,7 @@ function Get-CompromiseVerdict {
     Add-Signal 'C2 beaconing - highly regular callbacks' 3 $beaconHi (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp):$($_.Port) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'C2 DNS beaconing - highly regular domain queries' 3 $dnsHi (($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.Domain) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'Known-malicious driver on disk (LOLDrivers)' 2 $lolMal (($lol | Where-Object { $_.Status -eq 'malicious' } | Select-Object -First 3 | ForEach-Object { "$($_.Name): $($_.Path)" }) -join '; ')
-    Add-Signal 'Hunt technique - renamed binary / side-load / download-exec / LSASS access / Office chain / proxy-exec / share staging / Defender tamper / DCSync / spray / webshell / tunnel / RDP hijack / SSH keys' 2 $huntHi.Count (($huntHi | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
+    Add-Signal 'Hunt technique - renamed binary / side-load / download-exec / LSASS access / Office chain / proxy-exec / share staging / Defender tamper / DCSync / spray / webshell / tunnel / RDP hijack / SSH keys / svchost masquerade' 2 $huntHi.Count (($huntHi | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'Ransomware-like mass file modification (USN journal)' 3 $usnBurstN ((($usnBursts | Select-Object -First 3 | ForEach-Object { "$($_.WindowStart): $($_.WriteEvents) writes / $($_.DistinctFiles) files" }) -join '; ') + $(if ($rExt) { " - RANSOM EXTENSIONS: $rExt" }))
     Add-Signal 'Uncommon persistence mechanism (IFEO/AppInit/Winlogon/netsh/LSA)' 2 $asepHotN (($asep | Where-Object { $_.Flags -match 'user-path|nondefault' -and "$($_.Category)" -notmatch 'ComHijack|StartupApproved' } | Select-Object -First 3 | ForEach-Object { "$($_.Category): $($_.Name) = $($_.Value)" }) -join '; ')
     Add-Signal 'Memory malfind indicators (injected code regions)' 2 @($memMf).Count (($memMf | Select-Object -First 3 | ForEach-Object { "$($_.Process)($($_.PID))" }) -join '; ')
@@ -6400,6 +6503,7 @@ function Get-CompromiseVerdict {
     Add-Cov 'DNS query telemetry (Sysmon EID 22)' (Test-Path (Join-Path $CsvDir 'sysmon_dns.csv')) 4
     Add-Cov 'Entity correlation' (Test-Path (Join-Path $CsvDir 'entities_binaries.csv')) 3
     Add-Cov 'Hunt rules' (Test-Path (Join-Path $CsvDir 'hunt_findings.csv')) 3
+    Add-Cov 'Svchost masquerade audit' (Test-Path (Join-Path $CsvDir 'svchost_audit.csv')) 2
     Add-Cov 'Remote access sweep (tunnels/RA tools/SSH keys)' (Test-Path (Join-Path $CsvDir 'remote_access.csv')) 2
     Add-Cov 'Structured telemetry (4688 / Sysmon 10-13)' ((Test-Path (Join-Path $CsvDir 'security_proc_events.csv')) -or (Test-Path (Join-Path $CsvDir 'sysmon_process_access.csv'))) 3
     Add-Cov 'Kerberos/DS telemetry (DC role)' ((Test-Path (Join-Path $CsvDir 'security_kerberos.csv')) -or (Test-Path (Join-Path $CsvDir 'security_ds_access.csv'))) 3
