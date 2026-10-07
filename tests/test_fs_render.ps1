@@ -2,6 +2,7 @@
 # v2.10 verdict + report render test for file-system forensics artifacts
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 $names = @('ConvertTo-HtmlEsc', 'New-VtLink', 'Import-CaseCsv', 'Get-CompromiseVerdict', 'New-HtmlReport')
 $defs = ''
 foreach ($n in $names) {

@@ -2,6 +2,7 @@
 # v2.14 - DNS beaconing (4.8), LOLDrivers xref (8.10), -Mode Tune, supertimeline dedupe, verdict wiring
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 $defs = ''
 foreach ($n in @('Test-IsPublicIp', 'Test-IsUserWritablePath')) {
     $m = [regex]::Match($src, "(?s)function $n \{.*?\r?\n\}")
@@ -153,7 +154,9 @@ function Invoke-NativeTool { param($ExePath, $ToolArgs, $WorkingDirectory, [swit
 }
 Invoke-Expression $mST.Value
 $null = New-SuperTimeline
-$stRows = @(Import-Csv (Join-Path $CsvDir 'supertimeline.csv'))
+$stPath214 = Join-Path $CsvDir 'supertimeline.csv'
+if (-not (Test-Path $stPath214)) { $stPath214 = Join-Path $CsvDir 'derived\supertimeline.csv' }
+$stRows = @(Import-Csv $stPath214)
 Check "supertimeline: sort-csv invoked" $script:sortCsvCalled
 Check "supertimeline: duplicate evidence row deduped (2 rows)" ($stRows.Count -eq 2)
 Check "supertimeline: evidence-only weave (security_events source)" (@($stRows | Where-Object Source -eq 'security_events').Count -eq 2)

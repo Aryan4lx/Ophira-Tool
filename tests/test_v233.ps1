@@ -1,8 +1,9 @@
-$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
+﻿$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
 # v2.33 - tunnel & remote-access hunt pack: module 8.16 remote_access.csv builder,
 # hunt rules R23-R26, verdict wiring, canary battery (tunnel plant + service + SSH keys).
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 
 $pass = 0; $fail = 0
 function Check([string]$label, [bool]$ok) {
@@ -130,7 +131,7 @@ Check "canary: labeled key line planted in administrators_authorized_keys" ($src
 Check "canary: prior key file state restored or file removed" ($src -match [regex]::Escape('if ($akCreated) { Remove-Item -LiteralPath $akFile -Force -ErrorAction Stop }') -and $src -match [regex]::Escape('else { Set-Content -LiteralPath $akFile -Value $akPrev -ErrorAction Stop }'))
 Check "canary: ngrok process killed + binary removed in cleanup" ($src -match [regex]::Escape('Stop-Process -Id $ngProc.Id -Force') -and $src -match [regex]::Escape('Remove-Item $canExe, $canNgrok'))
 Check "scorecard: R23/RA-telemetry/R26 rows" ((@('R23  remote-access tunnel \(canary_ngrok\)', 'RA   service-install telemetry \(7045 canary_tunneld\)', 'R26  SSH authorized_keys plant') | Where-Object { $src -match $_ }).Count -eq 3)
-Check "scorecard: reads remote_access + system_new_services" (($src -match ([regex]::Escape("Join-Path `$csv 'remote_access.csv'"))) -and ($src -match ([regex]::Escape("Join-Path `$csv 'system_new_services.csv'"))))
+Check "scorecard: reads remote_access + system_new_services" (($src -match ([regex]::Escape("Import-CsvFlatMapped `$csv 'remote_access'"))) -and ($src -match ([regex]::Escape("Import-CsvFlatMapped `$csv 'system_new_services'"))))
 Check "scorecard: R25 printed n/a (not planted)" ($src -match 'R25  RDP ServiceDll tamper  n/a')
 
 Remove-Item $fix -Recurse -Force -ErrorAction SilentlyContinue

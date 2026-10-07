@@ -2,6 +2,7 @@
 # v2.18 - entity correlation (binaries/accounts/remotes) + report Connections section + repo path guard
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 
 $pass = 0; $fail = 0
 function Check([string]$label, [bool]$ok) {

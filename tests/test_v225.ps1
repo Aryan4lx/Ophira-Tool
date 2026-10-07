@@ -1,8 +1,9 @@
-$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
+﻿$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
 # v2.25 - analyst deep-dive pack: RECmd batch registry enrichment, EvtxECmd full evtx->CSV,
 # -Mode Timeline pivot (window filter + summary)
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 
 $pass = 0; $fail = 0
 function Check([string]$label, [bool]$ok) {
@@ -20,6 +21,10 @@ foreach ($fn in @('Open-CaseSession', 'Invoke-TimelineMode')) {
     if (-not $m.Success) { throw "$fn extract failed" }
     Invoke-Expression $m.Value
 }
+$mapM = [regex]::Match($src, '(?s)\$script:CsvCatMap = @\{.*?\r?\n\}')
+$gcpM = [regex]::Match($src, "(?s)function Get-CaseCsvPath \{.*?\r?\n\}")
+if (-not $mapM.Success -or -not $gcpM.Success) { throw 'extract failed: CsvCatMap/Get-CaseCsvPath' }
+Invoke-Expression ($mapM.Value + "`r`n" + $gcpM.Value)
 $case1 = Join-Path $env:TEMP "ophira_tl225_$stamp"
 $csv1 = Join-Path $case1 'csv'
 New-Item -ItemType Directory -Path $csv1 -Force | Out-Null

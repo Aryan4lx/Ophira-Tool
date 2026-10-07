@@ -2,6 +2,7 @@
 # v2.11 Phase C test: (1) module 2.6 live registry run  (2) verdict+report fixtures for asep/certs
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 $names = @('ConvertTo-HtmlEsc', 'New-VtLink', 'Import-CaseCsv', 'Get-CompromiseVerdict', 'New-HtmlReport', 'Test-IsUserWritablePath')
 $defs = ''
 foreach ($n in $names) {

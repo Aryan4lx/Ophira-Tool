@@ -1,7 +1,8 @@
-$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
+﻿$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
 # v2.15 - Parse mode, parse_needed honesty, Full-preset NTFS preservation, RegenerateOutputs wiring
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 
 $pass = 0; $fail = 0
 function Check([string]$label, [bool]$ok) {
@@ -105,7 +106,7 @@ Check "parse mode: returns success" ($ok -eq $true)
 Check "parse mode: fake raw-driven modules ran (3 outputs)" ((Test-Path (Join-Path $csv3 'hayabusa_timeline.csv')) -and (Test-Path (Join-Path $csv3 'execution_timeline.csv')) -and (Test-Path (Join-Path $csv3 'amcache.csv')))
 Check "parse mode: PECmd ran against raw\prefetch" (@($script:nativeCalls | Where-Object { $_ -match '^PECmd\.exe\|-d .*prefetch' }).Count -eq 1)
 Check "parse mode: LECmd ran against raw\recent" (@($script:nativeCalls | Where-Object { $_ -match '^LECmd\.exe\|-d .*recent' }).Count -eq 1)
-Check "parse mode: prefetch_parsed.csv + lnk_parsed.csv produced" ((Test-Path (Join-Path $csv3 'prefetch_parsed.csv')) -and (Test-Path (Join-Path $csv3 'lnk_parsed.csv')))
+Check "parse mode: prefetch_parsed.csv + lnk_parsed.csv produced" ((Test-Path (Join-Path $csv3 'artifacts\prefetch_parsed.csv')) -and (Test-Path (Join-Path $csv3 'artifacts\lnk_parsed.csv')))
 Check "parse mode: jumplists skipped (no raw input)" (@($script:nativeCalls | Where-Object { $_ -match 'JLECmd' }).Count -eq 0)
 Check "parse mode: regeneration invoked" ($regenCalled -eq $true)
 $cjAfter = Get-Content (Join-Path $case3 'case.json') -Raw | ConvertFrom-Json
