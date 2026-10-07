@@ -2,6 +2,7 @@
 # v2.9 beaconing render + verdict fixture test
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 $names = @('ConvertTo-HtmlEsc', 'New-VtLink', 'Import-CaseCsv', 'Get-CompromiseVerdict', 'New-HtmlReport')
 $defs = ''
 foreach ($n in $names) {

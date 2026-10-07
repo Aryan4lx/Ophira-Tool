@@ -6,3 +6,6 @@ tools/iocs.txt
 tools/iocs/
 OPHIRA_*/
 tools/KAPE/
+
+# parser interop dropped into the repo root by local Parse runs
+SQLite.Interop.dll

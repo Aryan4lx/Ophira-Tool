@@ -2,6 +2,7 @@
 # v2.16 - sigma rule logs + report drill-down, Find-SigmaRuleFile, process pivot
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 
 $pass = 0; $fail = 0
 function Check([string]$label, [bool]$ok) {
@@ -107,7 +108,10 @@ foreach ($n in @('Open-CaseSession', 'Invoke-FocusEngine')) {
     if (-not $m2.Success) { throw "extract failed: $n" }
     $defs += $m2.Value + "`r`n"
 }
-Invoke-Expression $defs
+$mapM = [regex]::Match($src, '(?s)\$script:CsvCatMap = @\{.*?\r?\n\}')
+$gcpM = [regex]::Match($src, "(?s)function Get-CaseCsvPath \{.*?\r?\n\}")
+if (-not $mapM.Success -or -not $gcpM.Success) { throw 'extract failed: CsvCatMap/Get-CaseCsvPath' }
+Invoke-Expression ($mapM.Value + "`r`n" + $gcpM.Value + "`r`n" + $defs)
 $ScriptVersion = '2.40'
 $case4 = Join-Path $env:TEMP "ophira_pivot_$stamp"
 $csv4 = Join-Path $case4 'csv'

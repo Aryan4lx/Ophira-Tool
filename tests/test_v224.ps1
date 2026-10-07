@@ -1,8 +1,9 @@
-$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
+﻿$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
 # v2.24 - master timeline weave (normalized schema, ~25 sources), MFT drive-letter fix,
 # entity-card +/-15min context rendering
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 
 $pass = 0; $fail = 0
 function Check([string]$label, [bool]$ok) {
@@ -59,7 +60,9 @@ New-Csv (Join-Path $CsvDir 'hunt_findings.csv') '"Found","Rule","Severity","Enti
 
 New-SuperTimeline
 
-$tl = @(Import-Csv -LiteralPath (Join-Path $CsvDir 'supertimeline.csv'))
+$tlPath224 = Join-Path $CsvDir 'supertimeline.csv'
+if (-not (Test-Path $tlPath224)) { $tlPath224 = Join-Path $CsvDir 'derived\supertimeline.csv' }
+$tl = @(Import-Csv -LiteralPath $tlPath224)
 Check "weave: 7 timed fixture rows all present (derived sources excluded)" ($tl.Count -eq 7)
 Check "weave: normalized schema (Timestamp/Source/Type/Actor/Entity/Detail)" (@($tl[0].PSObject.Properties.Name) -join ',' -eq 'Timestamp,Source,Type,Actor,Entity,Detail')
 Check "weave: sorted ascending chronologically" ((@($tl | ForEach-Object { [datetime]$_.Timestamp }) | Sort-Object) -join '|' -eq (@($tl | ForEach-Object { [datetime]$_.Timestamp }) -join '|'))
@@ -74,7 +77,7 @@ Check "weave: timestamps normalized (no raw .NET date noise)" (@($tl | Where-Obj
 # PART 2 - structural: MFT drive fix + entity-card context wiring
 # ============================================================================
 Check "5.5: MFT paths get drive-letter prefix" ($src -match '\$path = if \(\$parent\) \{ "\$dl\$parent\\\$name" \}')
-Check "report: entity-card context window wired" ($src -match 'Context: everything else happening' -and $src -match '\$fs\.AddMinutes\(-15\)')
+Check "report: entity-card context window wired" ($src -match 'Context: everything else happening' -and $src -match '\$fs\.AddMinutes\(-30\)')
 Check "report: context reads supertimeline" ($src -match "Import-CaseCsv 'supertimeline'")
 Check "evidence index: master timeline description updated" ($src -match 'MASTER TIMELINE: gathered evidence woven chronologically')
 
@@ -101,7 +104,9 @@ function Write-CaseLog { param([string]$Message, [string]$Color = 'Gray') }
 New-Csv (Join-Path $CsvDir 'entities_binaries.csv') '"Categories","CatCount","Name","Path","Verdict","Signer","FirstSeen","LastSeen","Hashes","Bytes","Evidence"' @(
     '"running;hunt",2,"evil.exe","C:\Users\public\evil.exe","HIGH",9,"2026-09-28 14:03:00","2026-09-28 14:06:00","","","hunt: [high] x"'
 )
-Copy-Item -LiteralPath (Join-Path $case1 'csv\supertimeline.csv') -Destination (Join-Path $CsvDir 'supertimeline.csv')
+$srcTl224 = Join-Path $case1 'csv\supertimeline.csv'
+if (-not (Test-Path $srcTl224)) { $srcTl224 = Join-Path $case1 'csv\derived\supertimeline.csv' }
+Copy-Item -LiteralPath $srcTl224 -Destination (Join-Path $CsvDir 'supertimeline.csv')
 foreach ($empty in @('hunt_findings', 'hayabusa_timeline', 'beacon_candidates', 'yara_hits', 'flash_ioc_hits', 'ioc_hits_amcache', 'defender_threats', 'logging_gaps', 'security_bruteforce_candidates', 'execution_timeline', 'security_auth_summary', 'security_auth_events', 'autoruns_runkeys', 'scheduled_tasks_flagged', 'services_flagged', 'wmi_bindings', 'delta_new', 'flash_public_connections', 'flash_process_scored', 'ioc_hits_browser', 'posture', 'memory_malfind', 'prefetch_parsed', 'mft_recent', 'usn_write_bursts', 'dns_beacon_candidates', 'loldrivers_hits', 'ps_decoded_commands', 'certificates', 'asep_sweep', 'parse_needed', 'srum_usage', 'entities_accounts', 'entities_remotes', 'memory_live_scan', 'session_activity', 'process_chains')) {
     "# no entries" | Set-Content -LiteralPath (Join-Path $CsvDir "$empty.csv") -Encoding UTF8
 }

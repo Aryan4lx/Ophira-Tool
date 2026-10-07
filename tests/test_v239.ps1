@@ -1,9 +1,10 @@
-$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
+﻿$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
 # v2.39 - collapsed-message 4624 parse fix, report UX: ATT&CK expandable technique rows,
 # sigma drill-down ALL events (in-report pager/search/copy), click-to-copy clip cells,
 # supertimeline = gathered evidence only (scanner outputs unwoven, no JS embed).
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 
 $pass = 0; $fail = 0
 function Check([string]$label, [bool]$ok) {

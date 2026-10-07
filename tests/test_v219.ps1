@@ -2,6 +2,7 @@
 # v2.19 - hunt rules R1-R7 + verdict wiring + report section
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 
 $pass = 0; $fail = 0
 function Check([string]$label, [bool]$ok) {

@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.41  -  Windows Incident Response Triage Toolkit
+Ophira v2.42  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -42,7 +42,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.41"
+$ScriptVersion = "2.42"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -160,20 +160,116 @@ function Out-Flash {
     $script:FlashLines.Add(($Text -replace "\x1b\[[0-9;]*m", ''))
 }
 
+# v2.42 CSV sortment: one name->category map decides where every known case CSV lives
+# (csv\<cat>\<name>.csv). Unknown names stay flat. Import-CaseCsv / Test-CaseCsv read
+# flat-first-then-mapped, so old flat cases and every existing consumer keep working.
+$script:CsvCatMap = @{
+    # VOLATILE
+    'processes' = 'volatile'; 'processes_flagged' = 'volatile'; 'process_hashes' = 'volatile'
+    'connections' = 'volatile'; 'connections_public_established' = 'volatile'; 'dns_cache' = 'volatile'
+    'arp_table' = 'volatile'; 'logon_sessions' = 'volatile'; 'drivers' = 'volatile'; 'drivers_flagged' = 'volatile'
+    'svchost_audit' = 'volatile'; 'bam_lastexec' = 'volatile'
+    'flash_process_scored' = 'volatile'; 'flash_ioc_hits' = 'volatile'; 'flash_public_connections' = 'volatile'
+    # PERSISTENCE
+    'autoruns_runkeys' = 'persistence'; 'autoruns_startup_folders' = 'persistence'
+    'services' = 'persistence'; 'services_flagged' = 'persistence'
+    'scheduled_tasks' = 'persistence'; 'scheduled_tasks_flagged' = 'persistence'
+    'wmi_event_filters' = 'persistence'; 'wmi_event_consumers' = 'persistence'; 'wmi_bindings' = 'persistence'
+    'asep_sweep' = 'persistence'
+    # NETWORK
+    'net_interfaces' = 'network'; 'net_reachable_subnets' = 'network'; 'smb_hosted_shares' = 'network'
+    'smb_mounted_shares' = 'network'; 'smb_active_connections' = 'network'; 'saved_credentials' = 'network'
+    'proxy_settings' = 'network'; 'net_active_probes' = 'network'; 'firewall_profiles' = 'network'
+    # LOGS
+    'security_events' = 'logs'; 'security_auth_events' = 'logs'; 'security_bruteforce_candidates' = 'logs'
+    'security_auth_summary' = 'logs'; 'security_proc_events' = 'logs'; 'security_task_install' = 'logs'
+    'security_share_access' = 'logs'; 'security_kerberos' = 'logs'; 'security_ds_access' = 'logs'
+    'powershell_events' = 'logs'; 'sysmon_events' = 'logs'; 'sysmon_network' = 'logs'; 'sysmon_dns' = 'logs'
+    'sysmon_image_load' = 'logs'; 'sysmon_process_access' = 'logs'; 'sysmon_registry' = 'logs'
+    'sysmon_file_time' = 'logs'; 'sysmon_proc_create' = 'logs'
+    'rdp_localsession' = 'logs'; 'rdp_connections' = 'logs'; 'system_events' = 'logs'; 'system_new_services' = 'logs'
+    'hayabusa_timeline' = 'logs'; 'hayabusa_report' = 'logs'; 'logon_summary' = 'logs'
+    'ps_decoded_commands' = 'logs'; 'yara_hits' = 'logs'; 'yara_scanned' = 'logs'
+    'beacon_candidates' = 'logs'; 'dns_beacon_candidates' = 'logs'; 'application_events' = 'logs'
+    # ARTIFACTS
+    'prefetch_index' = 'artifacts'; 'prefetch_parsed' = 'artifacts'; 'userassist' = 'artifacts'
+    'srum_usage' = 'artifacts'; 'execution_timeline' = 'artifacts'; 'mft_recent' = 'artifacts'
+    'amcache' = 'artifacts'; 'lnk_parsed' = 'artifacts'; 'jumplist_parsed' = 'artifacts'
+    'recyclebin' = 'artifacts'; 'recentfilecache' = 'artifacts'; 'shellbags' = 'artifacts'
+    'registry_recmd' = 'artifacts'; 'browser_files' = 'artifacts'; 'browser_history' = 'artifacts'
+    'browser_downloads' = 'artifacts'; 'browser_searches' = 'artifacts'
+    # DEFENDER
+    'defender_status' = 'defender'; 'defender_threats' = 'defender'; 'defender_preferences' = 'defender'
+    'defender_events' = 'defender'; 'defender_config_events' = 'defender'
+    # MEMORY
+    'memory_live_scan' = 'memory'; 'memory_malfind' = 'memory'; 'memory_netscan' = 'memory'
+    # CONTEXT
+    'powershell_console_history' = 'context'; 'rdp_client_targets' = 'context'; 'recyclebin_index' = 'context'
+    'bits_jobs' = 'context'; 'domain_info' = 'context'; 'local_admins' = 'context'
+    'certificates' = 'context'; 'posture' = 'context'; 'loldrivers_hits' = 'context'
+    'usb_devices' = 'context'; 'office_mru' = 'context'; 'ual_files' = 'context'
+    'iis_requests' = 'context'; 'iis_anomalies' = 'context'; 'startup_info' = 'context'
+    'wer_reports' = 'context'; 'server_logs' = 'context'; 'credential_sweep' = 'context'; 'remote_access' = 'context'
+    # DERIVED (rebuilt by Invoke-RegenerateOutputs / analyst modes)
+    'supertimeline' = 'derived'; 'parse_needed' = 'derived'; 'hunt_findings' = 'derived'
+    'entities_binaries' = 'derived'; 'entities_accounts' = 'derived'; 'entities_remotes' = 'derived'
+    'session_activity' = 'derived'; 'process_chains' = 'derived'; 'logging_gaps' = 'derived'
+    'ioc_hits_amcache' = 'derived'; 'ioc_hits_browser' = 'derived'; 'ioc_hits_dns' = 'derived'
+    'ioc_hits_network' = 'derived'; 'ioc_hits_mft' = 'derived'; 'process_pivot' = 'derived'
+}
+
+function Get-CaseCsvPath {
+    # Relative path of a case CSV under CsvDir: mapped category subfolder or flat fallback.
+    param([string]$Name)
+    if ($Name -notmatch '\.csv$') { $Name = "$Name.csv" }
+    $cat = $script:CsvCatMap[($Name -replace '\.csv$', '').ToLower()]
+    if ($cat) { return "$cat\$Name" }
+    return $Name
+}
+
+function Test-CaseCsv {
+    # Existence check for a case CSV: flat first (old cases, native-tool leftovers, wildcards),
+    # then the mapped subfolder. Wildcard names keep working through the flat branch.
+    param([string]$Name)
+    if ($Name -notmatch '\.csv$') { $Name = "$Name.csv" }
+    if (Test-Path (Join-Path $CsvDir $Name)) { return $true }
+    return (Test-Path (Join-Path $CsvDir (Get-CaseCsvPath $Name)))
+}
+
+function Get-CaseCsvFullPath {
+    # Absolute path for WRITES/native-tool args into the mapped location; creates the folder.
+    param([string]$Name)
+    $p = Join-Path $CsvDir (Get-CaseCsvPath $Name)
+    $d = Split-Path $p -Parent
+    if ($d -and -not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    return $p
+}
+
+function Import-CsvFlatMapped {
+    # Flat-first-then-mapped reader for ARBITRARY case csv dirs (canary B-side zips, fleet).
+    param([string]$Dir, [string]$Name)
+    $n = if ($Name -match '\.csv$') { $Name } else { "$Name.csv" }
+    foreach ($p in @((Join-Path $Dir $n), (Join-Path $Dir (Get-CaseCsvPath $Name)))) {
+        if (Test-Path -LiteralPath $p) { try { return @(Import-Csv -LiteralPath $p -ErrorAction Stop) } catch { return @() } }
+    }
+    return @()
+}
+
 function Save-Rows {
     param([string]$Name, $Rows)
-    $path = Join-Path $CsvDir "$Name.csv"
+    $path = Get-CaseCsvFullPath $Name
+    $rel = "$((Get-CaseCsvPath $Name))"
     try {
         if ($Rows -and @($Rows).Count -gt 0) {
             @($Rows) | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
-            Write-CaseLog ("    saved {0} rows -> csv\{1}.csv" -f @($Rows).Count, $Name) 'DarkGray'
+            Write-CaseLog ("    saved {0} rows -> csv\{1}" -f @($Rows).Count, $rel) 'DarkGray'
         } else {
             "# no entries" | Set-Content -LiteralPath $path -Encoding UTF8
-            Write-CaseLog "    csv\$Name.csv (empty)" 'DarkGray'
+            Write-CaseLog "    csv\$rel (empty)" 'DarkGray'
         }
     } catch {
         "FAILED: $($_.Exception.Message)" | Set-Content -LiteralPath $path -Encoding UTF8
-        Write-CaseLog "    csv\$Name.csv FAILED" 'DarkYellow'
+        Write-CaseLog "    csv\$rel FAILED" 'DarkYellow'
     }
 }
 
@@ -966,6 +1062,7 @@ function Invoke-AnalyzeMode {
             }
             foreach ($k in $map.Keys) {
                 $f = Join-Path $csvDir $k
+                if (-not (Test-Path $f)) { $f = Join-Path $csvDir (Get-CaseCsvPath $k) }
                 if ((Test-Path $f) -and -not ((Get-Content $f -First 1) -match '^#')) {
                     try {
                         $rows = Import-Csv $f
@@ -1596,7 +1693,7 @@ function Get-ParseNeeds {
     )
     $rows = @()
     foreach ($c in $caps) {
-        if (Test-Path (Join-Path $CsvDir $c.Artifact)) { continue }
+        if (Test-CaseCsv $c.Artifact) { continue }
         if ($c.Live) { $how = 'endpoint-only source - rerun collection elevated on the host' }
         elseif (-not (Test-Path (Join-Path $RawDir $c.Input))) { $how = 'raw evidence not collected (module skipped on endpoint)' }
         elseif ($c.Net -eq 'net9' -and -not $nineOk) { $how = 'endpoint lacks .NET 9 - run on analyst PC: Ophira.ps1 -Mode Parse -Path <case>' }
@@ -1609,6 +1706,7 @@ function Get-ParseNeeds {
 
 $script:SharedFunctions = @(
     'Get-KitRoot', 'Get-ToolsDir', 'Copy-LockedFile', 'Get-LogStart', 'Get-IocList', 'Test-TrustedPublisher',
+    'Get-CaseCsvPath', 'Test-CaseCsv', 'Get-CaseCsvFullPath',
     'Save-Rows', 'Out-RawText', 'Invoke-ExeCapture', 'Invoke-NativeTool', 'Get-WmiOrCim', 'Convert-WmiDate',
     'Test-IsPublicIp', 'Test-IsUserWritablePath', 'Get-SignatureInfo', 'Get-SysmonState',
     'Get-UserProfileList', 'Get-UserAssistRows', 'ConvertTo-Rot13', 'Get-FilteredEvents', 'Export-Evtx',
@@ -2411,8 +2509,8 @@ $script:Modules = @(
             if (-not $h) { Write-CaseLog "    hayabusa not in tools\ - skipping (or run: -Mode Setup / -Mode Links)" 'DarkGray'; return }
             $evtxDir = Join-Path $RawDir 'evtx'
             if (-not (Test-Path $evtxDir)) { Write-CaseLog "    no evtx exported - skipping" 'DarkGray'; return }
-            $out = Join-Path $CsvDir 'hayabusa_timeline.csv'
-            $html = Join-Path $CsvDir 'hayabusa_report.html'
+            $out = Get-CaseCsvFullPath 'hayabusa_timeline'
+            $html = Get-CaseCsvFullPath 'hayabusa_report'
             $hayArgs = @('dfir-timeline', '-p', 'verbose', '-d', "$evtxDir", '-o', "$out", '-H', "$html", '-q', '-w', '-U', '-C', '-K', '-m', 'low', '-E')
             $huntNote = 'full range'
             if ($script:LogStartDT) {
@@ -2427,9 +2525,9 @@ $script:Modules = @(
                 Write-CaseLog "    hayabusa: $n timeline rows (level>=low) in csv\hayabusa_timeline.csv" $(if ($n -gt 0) { 'Yellow' } else { 'Gray' })
             } else { Write-CaseLog "    hayabusa timeline produced no output" 'DarkYellow' }
             Write-CaseLog "    hayabusa logon-summary..." 'Cyan'
-            $lsPrefix = Join-Path $CsvDir 'logon_summary'
+            $lsPrefix = (Get-CaseCsvFullPath 'logon_summary') -replace '\.csv$', ''
             $null = Invoke-NativeTool -ExePath $h.FullName -ToolArgs @('logon-summary', '-d', "$evtxDir", '-o', "$lsPrefix", '-q', '-C', '-K') -WorkingDirectory $h.DirectoryName
-            $ps64 = Join-Path $CsvDir 'ps_decoded_commands.csv'
+            $ps64 = Get-CaseCsvFullPath 'ps_decoded_commands'
             $null = Invoke-NativeTool -ExePath $h.FullName -ToolArgs @('extract-base64', '-d', "$evtxDir", '-o', "$ps64", '-q', '-C', '-K', '-U') -WorkingDirectory $h.DirectoryName
             if (Test-Path $ps64) {
                 $n64 = @(Get-Content -LiteralPath $ps64 | Select-Object -Skip 1).Count
@@ -2451,7 +2549,7 @@ $script:Modules = @(
             $seen = @{}
             $targets = New-Object System.Collections.Generic.List[string]
             foreach ($src in @('flash_process_scored', 'processes_flagged', 'services_flagged', 'scheduled_tasks_flagged', 'autoruns_runkeys', 'autoruns_startup_folders', 'drivers_flagged', 'amcache')) {
-                $f = Join-Path $CsvDir "$src.csv"
+                $f = Get-CaseCsvFullPath $src
                 if (-not (Test-Path -LiteralPath $f)) { continue }
                 try { $rows = @(Import-Csv -LiteralPath $f -ErrorAction Stop) } catch { continue }
                 foreach ($r in $rows) {
@@ -2521,7 +2619,9 @@ $script:Modules = @(
     [pscustomobject]@{ Id = '4.8'; Cat = 'LOGS'; Name = 'C2 beaconing analysis (needs Sysmon network events)'; Default = $true; Quick = $false;
         Run = {
             $f = Join-Path $CsvDir 'sysmon_network.csv'
+            if (-not (Test-Path -LiteralPath $f)) { $f = Get-CaseCsvFullPath 'sysmon_network' }
             $fd = Join-Path $CsvDir 'sysmon_dns.csv'
+            if (-not (Test-Path -LiteralPath $fd)) { $fd = Get-CaseCsvFullPath 'sysmon_dns' }
             if (-not (Test-Path -LiteralPath $f) -and -not (Test-Path -LiteralPath $fd)) { Write-CaseLog "    no sysmon_network.csv / sysmon_dns.csv (no Sysmon / module 4.3 skipped) - beaconing not analyzable" 'DarkGray'; return }
             $all = @()
             try {
@@ -2546,6 +2646,7 @@ $script:Modules = @(
             if ($all.Count -lt 15) { Write-CaseLog "    too few Sysmon network/DNS events ($($all.Count)) for beaconing analysis" 'Gray'; Save-Rows -Name 'beacon_candidates' -Rows @(); Save-Rows -Name 'dns_beacon_candidates' -Rows @(); return }
             $flagged = @{}
             $fps = Join-Path $CsvDir 'flash_process_scored.csv'
+            if (-not (Test-Path -LiteralPath $fps)) { $fps = Get-CaseCsvFullPath 'flash_process_scored' }
             if (Test-Path -LiteralPath $fps) {
                 try { foreach ($fr in @(Import-Csv -LiteralPath $fps)) { if ("$($fr.Verdict)" -match '^(HIGH|MEDIUM)$' -and "$($fr.Path)") { $flagged["$($fr.Path)".ToLower()] = $true } } } catch { }
             }
@@ -2662,6 +2763,7 @@ $script:Modules = @(
                 Write-CaseLog "    PECmd: parsing prefetch (run counts + times)..." 'Cyan'
                 $null = Invoke-NativeTool -ExePath $peExe.FullName -ToolArgs @('-d', $dest, '--csv', $CsvDir, '--csvf', 'prefetch_parsed.csv')
                 $pp = Join-Path $CsvDir 'prefetch_parsed.csv'
+                if (-not (Test-Path -LiteralPath $pp)) { $pp = Get-CaseCsvFullPath 'prefetch_parsed' }
                 if (Test-Path -LiteralPath $pp) {
                     $n = @(Get-Content -LiteralPath $pp | Select-Object -Skip 1).Count
                     Write-CaseLog "    prefetch parsed: $n entries -> csv\prefetch_parsed.csv" 'Gray'
@@ -2710,7 +2812,7 @@ $script:Modules = @(
             $amc = Join-Path $regDir 'Amcache.hve'
             $sft = Join-Path $regDir 'SOFTWARE.hiv'
             if (-not (Test-Path $sys)) { Write-CaseLog "    registry hives not saved (enable module 5.2) - skipping" 'DarkGray'; return }
-            $out = Join-Path $CsvDir 'execution_timeline.csv'
+            $out = Get-CaseCsvFullPath 'execution_timeline'
             $amArgs = @()
             if (Test-Path $amc) { $amArgs = @('-a', $amc) }
             Write-CaseLog "    chainsaw: shimcache/amcache execution timeline..." 'Cyan'
@@ -2722,7 +2824,7 @@ $script:Modules = @(
             $sruCopy = Join-Path $RawDir 'sru\SRUDB.dat'
             if ((Test-Path $sruCopy) -and (Test-Path $sft)) {
                 Write-CaseLog "    chainsaw: SRUM usage analysis..." 'Cyan'
-                $null = Invoke-NativeTool -ExePath $cs.FullName -ToolArgs @('analyse', 'srum', '-s', $sft, $sruCopy, '-o', (Join-Path $CsvDir 'srum_usage.csv'), '-q')
+                $null = Invoke-NativeTool -ExePath $cs.FullName -ToolArgs @('analyse', 'srum', '-s', $sft, $sruCopy, '-o', (Get-CaseCsvFullPath 'srum_usage'), '-q')
             }
             $evtxDir = Join-Path $RawDir 'evtx'
             if (Test-Path $evtxDir) {
@@ -2942,12 +3044,13 @@ $script:Modules = @(
                     }
                     Write-CaseLog "    vol3: malfind (injected-code regions)..." 'Cyan'
                     $mfCsv = Join-Path $CsvDir 'memory_malfind.csv'
+                    if (-not (Test-Path -LiteralPath $mfCsv)) { $mfCsv = Get-CaseCsvFullPath 'memory_malfind' }
                     & $vol.FullName -f $dump -r csv windows.malfind.Malfind 2>$null | Set-Content -LiteralPath $mfCsv -Encoding UTF8
                     $mfN = 0
                     try { $mfN = @(Import-Csv -LiteralPath $mfCsv -ErrorAction Stop).Count } catch { $mfN = 0 }
                     if ($mfN -gt 0) {
                         Write-CaseLog "    MALFIND: $mfN suspicious memory region(s) -> csv\memory_malfind.csv" 'Red'
-                        & $vol.FullName -f $dump -r csv windows.netscan.NetScan 2>$null | Set-Content -LiteralPath (Join-Path $CsvDir 'memory_netscan.csv') -Encoding UTF8
+                        & $vol.FullName -f $dump -r csv windows.netscan.NetScan 2>$null | Set-Content -LiteralPath (Get-CaseCsvFullPath 'memory_netscan') -Encoding UTF8
                     } else {
                         Write-CaseLog "    vol3 malfind: no suspicious regions" 'Gray'
                         Remove-Item -LiteralPath $mfCsv -Force -ErrorAction SilentlyContinue
@@ -3166,6 +3269,7 @@ public class OphiraDump {
                 Write-CaseLog "    AmcacheParser: historical execution inventory..." 'Cyan'
                 $null = Invoke-NativeTool -ExePath $amcExe.FullName -ToolArgs @('-f', $amcHive, '--csv', $CsvDir, '--csvf', 'amcache.csv')
                 $amcCsv = Join-Path $CsvDir 'amcache.csv'
+                if (-not (Test-Path -LiteralPath $amcCsv)) { $amcCsv = Get-CaseCsvFullPath 'amcache' }
                 if (-not (Test-Path $amcCsv)) {
                     # AmcacheParser 2026+ writes split CSVs (amcache_UnassociatedFileEntries etc.) - merge the
                     # file-entry family back into amcache.csv so the IOC xref / hunt / timeline consumers work
@@ -3240,6 +3344,7 @@ public class OphiraDump {
                 Write-CaseLog "    LECmd: parsing recent LNK files..." 'Cyan'
                 $null = Invoke-NativeTool -ExePath $leExe.FullName -ToolArgs @('-d', $recDst, '--csv', $CsvDir, '--csvf', 'lnk_parsed.csv')
                 $lp = Join-Path $CsvDir 'lnk_parsed.csv'
+                if (-not (Test-Path -LiteralPath $lp)) { $lp = Get-CaseCsvFullPath 'lnk_parsed' }
                 if (Test-Path -LiteralPath $lp) { Write-CaseLog "    LNK parsed -> csv\lnk_parsed.csv" 'Gray' } else { Write-CaseLog "    LECmd produced no output" 'DarkYellow' }
             }
             if ($jlExe -and $nJl -gt 0) {
@@ -4184,7 +4289,8 @@ function Import-CaseCsv {
     param([string]$Name)
     if ($Name -notmatch '\.csv$') { $Name = "$Name.csv" }
     $f = Join-Path $CsvDir $Name
-    if ((Test-Path $f) -and -not ((Get-Content $f -First 1) -match '^#')) {
+    if (-not (Test-Path -LiteralPath $f)) { $f = Join-Path $CsvDir (Get-CaseCsvPath $Name) }
+    if ((Test-Path -LiteralPath $f) -and -not ((Get-Content $f -First 1) -match '^#')) {
         try { return @(Import-Csv $f) } catch { return @() }
     }
     return @()
@@ -4791,7 +4897,7 @@ tr.techrow{cursor:pointer}
     # ---------- connections: correlated entities ----------
     $null = $sb.AppendLine("<a name='entities'></a><h2>Connections - correlated entities</h2>")
     $null = $sb.AppendLine("<div class='meta'>Each entity below joins evidence from multiple independent sources (processes, execution history, persistence, network, SRUM usage, YARA, Sigma...) into one story. More categories touching one binary = stronger signal. Full data: csv\entities_binaries.csv / entities_accounts.csv / entities_remotes.csv</div>")
-    $entTop = @($entB | Where-Object { [int]"$($_.CatCount)" -ge 2 } | Select-Object -First 8)
+    $entTop = @($entB | Where-Object { [int]"$($_.CatCount)" -ge 2 } | Select-Object -First 12)
     if ($entTop.Count -gt 0) {
         # master-timeline context for the top cards: rows within +/-15 min of the entity's first seen
         $tlPre = @()
@@ -4815,10 +4921,10 @@ tr.techrow{cursor:pointer}
             $fs = $null
             try { $fs = ([datetime]$e.FirstSeen).ToUniversalTime() } catch { }
             if ($fs -and $tlPre.Count -gt 0) {
-                $lo = $fs.AddMinutes(-15); $hi = $fs.AddMinutes(15)
-                $ctx = @($tlPre | Where-Object { $_.T -ge $lo -and $_.T -le $hi } | Select-Object -First 8)
+                $lo = $fs.AddMinutes(-30); $hi = $fs.AddMinutes(30)
+                $ctx = @($tlPre | Where-Object { $_.T -ge $lo -and $_.T -le $hi } | Select-Object -First 15)
                 if ($ctx.Count -gt 0) {
-                    $null = $sb.AppendLine("<div class='meta'><b>Context: everything else happening &plusmn;15 min around first seen $($fs.ToString('yyyy-MM-dd HH:mm:ss'))</b> (full window: csv\supertimeline.csv)</div>")
+                    $null = $sb.AppendLine("<div class='meta'><b>Context: everything else happening &plusmn;30 min around first seen $($fs.ToString('yyyy-MM-dd HH:mm:ss'))</b> (full window: csv\$(Get-CaseCsvPath 'supertimeline') - build a per-entity dossier with <b>-Mode Focus -ProcessName $($e.Name)</b>)</div>")
                     $null = $sb.AppendLine("<table><tr><th>Time</th><th>Type</th><th>Actor</th><th>Detail</th></tr>")
                     foreach ($c2 in $ctx) {
                         $r2 = $c2.Row
@@ -4861,7 +4967,7 @@ tr.techrow{cursor:pointer}
                 $cells = ($numCols | Select-Object -First 4) | ForEach-Object { $p2 = $s2.PSObject.Properties[$_]; "<td>$(ConvertTo-HtmlEsc $(if ($p2) { $p2.Value }))</td>" }
                 $null = $sb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $s2.$appCol)</td>$($cells -join '')</tr>")
             }
-            $null = $sb.AppendLine("</table><div class='meta'>SRUM records ~30 days of per-application network/resource usage. High sustained upload from a user-path binary = exfiltration candidate. Source: csv\srum_usage.csv</div>")
+            $null = $sb.AppendLine("</table><div class='meta'>SRUM records ~30 days of per-application network/resource usage. High sustained upload from a user-path binary = exfiltration candidate. Source: csv\$(Get-CaseCsvPath 'srum_usage')</div>")
         }
     }
     # v2.21: process lineage + session-attributed activity
@@ -4871,7 +4977,7 @@ tr.techrow{cursor:pointer}
         foreach ($c in ($chains | Sort-Object { [int]"$($_.Steps)" } -Descending | Select-Object -First 15)) {
             $null = $sb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $c.Entity)</td><td>$($c.Steps)</td><td class='path'><b>$(ConvertTo-HtmlEsc $c.Chain)</b>$(if ("$($c.Evidence)") { "<br>$(ConvertTo-HtmlEsc $c.Evidence)" })</td></tr>")
         }
-        $null = $sb.AppendLine("</table><div class='meta'>Rebuilt from 4688 parent-child + live PPID map. A user-path binary whose ancestry runs through office/browser/interpreter processes is a phishing/exploit story; ancestry from services.exe with no matching install event is suspicious. Source: csv\process_chains.csv</div>")
+        $null = $sb.AppendLine("</table><div class='meta'>Rebuilt from 4688 parent-child + live PPID map. A user-path binary whose ancestry runs through office/browser/interpreter processes is a phishing/exploit story; ancestry from services.exe with no matching install event is suspicious. Source: csv\$(Get-CaseCsvPath 'process_chains')</div>")
     }
     $sessAct = @(Import-CaseCsv 'session_activity')
     if ($sessAct.Count -gt 0) {
@@ -4879,7 +4985,7 @@ tr.techrow{cursor:pointer}
         foreach ($s2 in ($sessAct | Select-Object -First 30)) {
             $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $s2.Time)</td><td><b>$(ConvertTo-HtmlEsc $s2.SessionAccount)</b></td><td>$(ConvertTo-HtmlEsc $s2.SourceIp)</td><td>$(ConvertTo-HtmlEsc $s2.Activity)</td><td>$(ConvertTo-HtmlEsc $s2.LogonType)</td><td class='path'>$(ConvertTo-HtmlEsc $s2.Detail)</td></tr>")
         }
-        $null = $sb.AppendLine("</table><div class='meta'>4624 LogonId joined to 4688/5145 SubjectLogonId: even service/shared accounts are tied back to the interactive/RDP/network session that created them. Source: csv\session_activity.csv</div>")
+        $null = $sb.AppendLine("</table><div class='meta'>4624 LogonId joined to 4688/5145 SubjectLogonId: even service/shared accounts are tied back to the interactive/RDP/network session that created them. Source: csv\$(Get-CaseCsvPath 'session_activity')</div>")
     }
 
     # ---------- host snapshot ----------
@@ -4962,11 +5068,23 @@ tr.techrow{cursor:pointer}
     }
     if (-not $snapAny) { $null = $sb.AppendLine("<div class='meta'>No snapshot data captured (relevant modules skipped).</div>") }
 
-    # ---------- timeline pointer (the chronology itself lives in the CSV) ----------
+    # ---------- timeline (v2.42: rendered chronology + filter, CSV stays the source of truth) ----------
     $tlAll = @(Import-CaseCsv 'supertimeline.csv')
     $tlSources = @($tlAll | ForEach-Object { "$($_.Source)" } | Sort-Object -Unique)
     $null = $sb.AppendLine("<a name='timeline'></a><h2>Master timeline (gathered evidence chronology)</h2>")
-    $null = $sb.AppendLine("<div class='card'>The full chronology lives in <b>csv\supertimeline.csv</b> ($(ConvertTo-HtmlEsc $tlAll.Count) events from $($tlSources.Count) evidence sources - open it in Excel/Timeline Explorer and filter by Timestamp). Evidence sources woven: $(ConvertTo-HtmlEsc ($tlSources -join ', ')). Scanner conclusions (Sigma detections, hunt findings, beacons) are intentionally NOT part of it - they have their own sections above. For windowed pivots with per-source/busiest-minute summaries run <b>-Mode Timeline</b>.</div>")
+    $null = $sb.AppendLine("<div class='card'>The full chronology lives in <b>csv\$(ConvertTo-HtmlEsc (Get-CaseCsvPath 'supertimeline'))</b> ($(ConvertTo-HtmlEsc $tlAll.Count) events from $($tlSources.Count) evidence sources - open it in Excel/Timeline Explorer and filter by Timestamp). Evidence sources woven: $(ConvertTo-HtmlEsc ($tlSources -join ', ')). Scanner conclusions (Sigma detections, hunt findings, beacons) are intentionally NOT part of it - they have their own sections above. For windowed pivots with per-source/busiest-minute summaries run <b>-Mode Timeline</b>.</div>")
+    if ($tlAll.Count -gt 0) {
+        $tlShow = @(@($tlAll | Sort-Object { "$($_.Timestamp)" } | Select-Object -Last 150))
+        [array]::Reverse($tlShow)
+        $null = $sb.AppendLine("<div class='meta'>Newest 150 of $($tlAll.Count) events, newest first:</div>")
+        $null = $sb.AppendLine("<input id='tlf' placeholder='filter events (entity / detail / source / actor)...' oninput='tlFilter()' style='width:96%;padding:6px;margin:6px 0;background:#1d2330;color:#cdd3dc;border:1px solid #2a3040;border-radius:4px'>")
+        $null = $sb.AppendLine("<table id='tlt'><thead><tr><th>Timestamp</th><th>Source</th><th>Type</th><th>Actor</th><th>Entity</th><th>Detail</th></tr></thead><tbody>")
+        foreach ($t in $tlShow) {
+            $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $t.Timestamp)</td><td>$(ConvertTo-HtmlEsc $t.Source)</td><td>$(ConvertTo-HtmlEsc $t.Type)</td><td>$(ConvertTo-HtmlEsc $t.Actor)</td><td class='path'>$(ConvertTo-HtmlEsc $t.Entity)</td><td>$(ConvertTo-HtmlEsc $t.Detail)</td></tr>")
+        }
+        $null = $sb.AppendLine("</tbody></table><div class='meta' id='tlcount'></div>")
+        $null = $sb.AppendLine("<script>function tlFilter(){var q=document.getElementById('tlf').value.toLowerCase();var n=0;var rs=document.querySelectorAll('#tlt tbody tr');for(var i=0;i<rs.length;i++){var hit=rs[i].textContent.toLowerCase().indexOf(q)>=0;rs[i].style.display=hit?'':'none';if(hit)n++;}document.getElementById('tlcount').textContent=q?('showing '+n+' matching of 150 shown'):'';}</script>")
+    }
 
     # ---------- focus dossier (v2.40: built by -Mode Focus / menu option 9) ----------
     $focusDirP = Join-Path (Split-Path -Parent $CsvDir) 'focus'
@@ -5168,7 +5286,7 @@ tr.techrow{cursor:pointer}
         'supertimeline'                   = 'MASTER TIMELINE: gathered evidence woven chronologically (logons, 4688/5145, Kerberos, Sysmon, prefetch, $MFT births, browser, WER, StartupInfo - scanner outputs excluded by design) with Timestamp/Source/Type/Actor/Entity/Detail - filter to any timeframe in Excel/Timeline Explorer'
     }
     $null = $sb.AppendLine("<table><tr><th>Artifact</th><th>Rows</th><th>What it is / what to look for</th></tr>")
-    foreach ($f in @(Get-ChildItem -Path $CsvDir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+    foreach ($f in @(Get-ChildItem -Path $CsvDir -Filter '*.csv' -File -Recurse -ErrorAction SilentlyContinue | Where-Object { @('sigma_rules', 'evtx_ecmd', 'recmd_out') -notcontains $_.Directory.Name } | Sort-Object Name)) {
         $rows = 0
         try {
             $first = Get-Content -LiteralPath $f.FullName -First 1
@@ -5176,7 +5294,8 @@ tr.techrow{cursor:pointer}
         } catch { }
         $base = $f.BaseName
         $d = if ($desc.ContainsKey($base)) { $desc[$base] } elseif ($base -match '^jumplist_parsed') { $desc['jumplist_parsed*'] } else { '' }
-        $null = $sb.AppendLine("<tr><td>csv\$(ConvertTo-HtmlEsc $f.Name)</td><td>$rows</td><td>$(ConvertTo-HtmlEsc $d)</td></tr>")
+        $rel = $f.FullName.Substring($CsvDir.Length).TrimStart('\')
+        $null = $sb.AppendLine("<tr><td>csv\$(ConvertTo-HtmlEsc $rel)</td><td>$rows</td><td>$(ConvertTo-HtmlEsc $d)</td></tr>")
     }
     $null = $sb.AppendLine("</table>")
     $null = $sb.AppendLine("<div class='meta'>Also in the case: <b>supertimeline.csv</b> (MASTER chronology - every artifact, filter by time), <b>csv\evtx_ecmd\</b> (full event-log CSVs for deep-dives, when EvtxECmd ran in Parse mode), <b>siem_export.ndjson</b> (Splunk/Elastic-ready records), <b>case_draft.txt</b> (auto-written executive draft - edit into your report), <b>verdict.json</b>, <b>attack_layer.json</b> (MITRE ATT&amp;CK Navigator layer - load at navigator.mitre.org), <b>case.json</b> (run metadata + module timings), raw evidence under <b>raw\</b> (evtx, registry hives, prefetch, recent/jumplists, browser DBs, firewall log, RDP bitmap cache tiles in <b>raw\rdp_cache</b> - reconstruct what inbound RDP sessions displayed with RdpCacheStudio), collection.log</div>")
@@ -5345,13 +5464,13 @@ function New-SuperTimeline {
     if ($rows.Count -eq 0) { return }
     $sorted = @($rows | Sort-Object { $t = [datetime]::MinValue; try { $t = [datetime]::Parse($_.Timestamp, [System.Globalization.CultureInfo]::InvariantCulture) } catch { }; $t })
     if ($sorted.Count -gt 120000) { $sorted = @($sorted | Select-Object -Last 120000) }
-    $out = Join-Path $CsvDir 'supertimeline.csv'
+    $out = Get-CaseCsvFullPath 'supertimeline'
     $sorted | Export-Csv -LiteralPath $out -NoTypeInformation -Encoding UTF8
     # hayabusa sort-csv: dedupe same-event rows coming from overlapping/backup evtx (PS sort above already orders by time)
     $hS = Get-HayabusaExe
     if ($hS) { $null = Invoke-NativeTool -ExePath $hS.FullName -ToolArgs @('sort-csv', '-f', $out, '-o', $out, '-C', '-q', '-K') -WorkingDirectory $hS.DirectoryName -QuietLog }
     $nFinal = @(Get-Content -LiteralPath $out | Select-Object -Skip 1).Count
-    Write-CaseLog "    MASTER TIMELINE: $($sorted.Count) evidence events, $nFinal after dedupe -> csv\supertimeline.csv (filter by Timestamp in Excel/Timeline Explorer)" 'DarkGray'
+    Write-CaseLog "    MASTER TIMELINE: $($sorted.Count) evidence events, $nFinal after dedupe -> csv\$(Get-CaseCsvPath 'supertimeline') (filter by Timestamp in Excel/Timeline Explorer)" 'DarkGray'
 }
 
 function New-SigmaRuleLogs {
@@ -6563,34 +6682,34 @@ function Get-CompromiseVerdict {
         $cov.Add([pscustomobject]@{ Source = $name; Collected = $present; Weight = $weight })
     }
     $evtxDir = Join-Path $RawDir 'evtx'
-    Add-Cov 'Volatile process inventory' (Test-Path (Join-Path $CsvDir 'flash_process_scored.csv')) 12
-    Add-Cov 'Live network connections' (Test-Path (Join-Path $CsvDir 'flash_public_connections.csv')) 8
-    $pers = (Test-Path (Join-Path $CsvDir 'autoruns_runkeys.csv')) -or (Test-Path (Join-Path $CsvDir 'services.csv')) -or (Test-Path (Join-Path $CsvDir 'scheduled_tasks.csv'))
+    Add-Cov 'Volatile process inventory' (Test-CaseCsv 'flash_process_scored') 12
+    Add-Cov 'Live network connections' (Test-CaseCsv 'flash_public_connections') 8
+    $pers = (Test-CaseCsv 'autoruns_runkeys') -or (Test-CaseCsv 'services') -or (Test-CaseCsv 'scheduled_tasks')
     Add-Cov 'Persistence surface (autoruns/services/tasks)' $pers 15
     Add-Cov 'Event log export' (Test-Path $evtxDir) 20
-    Add-Cov 'Sigma detection timeline' (Test-Path (Join-Path $CsvDir 'hayabusa_timeline.csv')) 10
-    Add-Cov 'Historical execution (amcache)' (Test-Path (Join-Path $CsvDir 'amcache.csv')) 12
-    Add-Cov 'Prefetch execution history' (Test-Path (Join-Path $CsvDir 'prefetch_index.csv')) 8
-    Add-Cov 'USN journal (file modification history)' (Test-Path (Join-Path $CsvDir 'usn_write_bursts.csv')) 10
-    Add-Cov 'MFT file timeline (filtered)' (Test-Path (Join-Path $CsvDir 'mft_recent.csv')) 8
-    Add-Cov 'ASEP deep sweep (IFEO/AppInit/COM/netsh/LSA)' (Test-Path (Join-Path $CsvDir 'asep_sweep.csv')) 5
-    Add-Cov 'Browser history artifacts' (Test-Path (Join-Path $CsvDir 'browser_files.csv')) 4
-    Add-Cov 'Defender status' (Test-Path (Join-Path $CsvDir 'defender_status.csv')) 5
-    Add-Cov 'YARA binary scan' (Test-Path (Join-Path $CsvDir 'yara_scanned.csv')) 5
-    Add-Cov 'DNS query telemetry (Sysmon EID 22)' (Test-Path (Join-Path $CsvDir 'sysmon_dns.csv')) 4
-    Add-Cov 'Entity correlation' (Test-Path (Join-Path $CsvDir 'entities_binaries.csv')) 3
-    Add-Cov 'Hunt rules' (Test-Path (Join-Path $CsvDir 'hunt_findings.csv')) 3
-    Add-Cov 'Svchost masquerade audit' (Test-Path (Join-Path $CsvDir 'svchost_audit.csv')) 2
-    Add-Cov 'Remote access sweep (tunnels/RA tools/SSH keys)' (Test-Path (Join-Path $CsvDir 'remote_access.csv')) 2
-    Add-Cov 'Structured telemetry (4688 / Sysmon 10-13)' ((Test-Path (Join-Path $CsvDir 'security_proc_events.csv')) -or (Test-Path (Join-Path $CsvDir 'sysmon_process_access.csv'))) 3
-    Add-Cov 'Kerberos/DS telemetry (DC role)' ((Test-Path (Join-Path $CsvDir 'security_kerberos.csv')) -or (Test-Path (Join-Path $CsvDir 'security_ds_access.csv'))) 3
-    Add-Cov 'Web telemetry (IIS)' (Test-Path (Join-Path $CsvDir 'iis_requests.csv')) 2
-    Add-Cov 'Session attribution + process lineage' ((Test-Path (Join-Path $CsvDir 'session_activity.csv')) -or (Test-Path (Join-Path $CsvDir 'process_chains.csv'))) 2
-    Add-Cov 'Host extras (WER/StartupInfo/QuickAssist/GPO)' ((Test-Path (Join-Path $CsvDir 'wer_reports.csv')) -or (Test-Path (Join-Path $CsvDir 'startup_info.csv'))) 2
+    Add-Cov 'Sigma detection timeline' (Test-CaseCsv 'hayabusa_timeline') 10
+    Add-Cov 'Historical execution (amcache)' (Test-CaseCsv 'amcache') 12
+    Add-Cov 'Prefetch execution history' (Test-CaseCsv 'prefetch_index') 8
+    Add-Cov 'USN journal (file modification history)' (Test-CaseCsv 'usn_write_bursts') 10
+    Add-Cov 'MFT file timeline (filtered)' (Test-CaseCsv 'mft_recent') 8
+    Add-Cov 'ASEP deep sweep (IFEO/AppInit/COM/netsh/LSA)' (Test-CaseCsv 'asep_sweep') 5
+    Add-Cov 'Browser history artifacts' (Test-CaseCsv 'browser_files') 4
+    Add-Cov 'Defender status' (Test-CaseCsv 'defender_status') 5
+    Add-Cov 'YARA binary scan' (Test-CaseCsv 'yara_scanned') 5
+    Add-Cov 'DNS query telemetry (Sysmon EID 22)' (Test-CaseCsv 'sysmon_dns') 4
+    Add-Cov 'Entity correlation' (Test-CaseCsv 'entities_binaries') 3
+    Add-Cov 'Hunt rules' (Test-CaseCsv 'hunt_findings') 3
+    Add-Cov 'Svchost masquerade audit' (Test-CaseCsv 'svchost_audit') 2
+    Add-Cov 'Remote access sweep (tunnels/RA tools/SSH keys)' (Test-CaseCsv 'remote_access') 2
+    Add-Cov 'Structured telemetry (4688 / Sysmon 10-13)' ((Test-CaseCsv 'security_proc_events') -or (Test-CaseCsv 'sysmon_process_access')) 3
+    Add-Cov 'Kerberos/DS telemetry (DC role)' ((Test-CaseCsv 'security_kerberos') -or (Test-CaseCsv 'security_ds_access')) 3
+    Add-Cov 'Web telemetry (IIS)' (Test-CaseCsv 'iis_requests') 2
+    Add-Cov 'Session attribution + process lineage' ((Test-CaseCsv 'session_activity') -or (Test-CaseCsv 'process_chains')) 2
+    Add-Cov 'Host extras (WER/StartupInfo/QuickAssist/GPO)' ((Test-CaseCsv 'wer_reports') -or (Test-CaseCsv 'startup_info')) 2
     $iocsLoaded = $false
     try { $iocsLoaded = ($null -ne (Get-IocList)) } catch { }
     Add-Cov 'IOC feeds loaded (iocs.txt/STIX/MISP)' $iocsLoaded 2
-    Add-Cov 'LOLDrivers driver hash check' (Test-Path (Join-Path $CsvDir 'loldrivers_hits.csv')) 3
+    Add-Cov 'LOLDrivers driver hash check' (Test-CaseCsv 'loldrivers_hits') 3
     Add-Cov 'Sysmon telemetry (bonus)' ([bool]$Sysmon) 5
     Add-Cov 'RAM capture (bonus)' (Test-Path $MemDir) 3
     $coverageRaw = 0
@@ -6618,8 +6737,8 @@ function Get-CompromiseVerdict {
         elseif ($LogHours -gt 0) { $caveats.Add("Event-log analysis covered only the last $([int]($LogHours/24)) days - older activity not assessed") }
     }
     if (-not (Test-Path $MemDir)) { $caveats.Add('No RAM capture - fileless / in-memory-only malware is not covered') }
-    if (-not (Test-Path (Join-Path $CsvDir 'prefetch_index.csv'))) { $caveats.Add('Prefetch unavailable - program execution history limited') }
-    if (-not (Test-Path (Join-Path $CsvDir 'amcache.csv'))) { $caveats.Add('Amcache unavailable - historical execution inventory missing') }
+    if (-not (Test-CaseCsv 'prefetch_index')) { $caveats.Add('Prefetch unavailable - program execution history limited') }
+    if (-not (Test-CaseCsv 'amcache')) { $caveats.Add('Amcache unavailable - historical execution inventory missing') }
     if (-not (Test-Path $evtxDir)) { $caveats.Add('Event logs not exported - Sigma detection could not run') }
     if ($rank -eq 0) { $caveats.Add('Too little evidence was collected to draw a conclusion') }
 
@@ -6694,6 +6813,17 @@ function Get-CaseNarrative {
         $L.Add(" - Absence of findings in these areas is NOT proof of absence.")
         $L.Add("")
     }
+    try {
+        $ftPath = Join-Path (Split-Path -Parent $CsvDir) 'focus\focus_terms.json'
+        if (Test-Path -LiteralPath $ftPath) {
+            $ft2 = $null
+            try { $ft2 = Get-Content -LiteralPath $ftPath -Raw | ConvertFrom-Json } catch { }
+            if ($ft2) {
+                $L.Add("FOCUSED ANALYSIS: a focus dossier was built for '$($ft2.Indicator)' - $($ft2.HitCount) evidence row(s) across $($ft2.SourcesHit.PSObject.Properties.Count) artifact source(s), $($ft2.InstanceCount) instance(s), $($ft2.Rounds) expansion round(s). Full activity chain and per-instance detail: focus\focus_report.html")
+                $L.Add("")
+            }
+        }
+    } catch { }
     if (@($v.Caveats).Count -gt 0) {
         $L.Add("CAVEATS")
         foreach ($c in @($v.Caveats)) { $L.Add(" - $c") }
@@ -7185,19 +7315,22 @@ function Invoke-ParseMode {
         $null = Invoke-NativeTool -ExePath $exe.FullName -ToolArgs $toolArgs -WorkingDirectory $exe.DirectoryName
     }
     $pfDst = Join-Path $script:RawDir 'prefetch'
-    if ((Test-Path $pfDst) -and -not (Test-Path (Join-Path $script:CsvDir 'prefetch_parsed.csv'))) {
-        & $runTool (& $findTool 'PECmd*.exe') @('-d', $pfDst, '--csv', $script:CsvDir, '--csvf', 'prefetch_parsed.csv') 'PECmd: prefetch run counts'
+    if ((Test-Path $pfDst) -and -not (Test-CaseCsv 'prefetch_parsed')) {
+        $pfOut = Get-CaseCsvFullPath 'prefetch_parsed'
+        & $runTool (& $findTool 'PECmd*.exe') @('-d', $pfDst, '--csv', (Split-Path $pfOut -Parent), '--csvf', 'prefetch_parsed.csv') 'PECmd: prefetch run counts'
     }
     $recDst = Join-Path $script:RawDir 'recent'
-    if ((Test-Path $recDst) -and -not (Test-Path (Join-Path $script:CsvDir 'lnk_parsed.csv'))) {
-        & $runTool (& $findTool 'LECmd*.exe') @('-d', $recDst, '--csv', $script:CsvDir, '--csvf', 'lnk_parsed.csv') 'LECmd: recent LNK files'
+    if ((Test-Path $recDst) -and -not (Test-CaseCsv 'lnk_parsed')) {
+        $lnkOut = Get-CaseCsvFullPath 'lnk_parsed'
+        & $runTool (& $findTool 'LECmd*.exe') @('-d', $recDst, '--csv', (Split-Path $lnkOut -Parent), '--csvf', 'lnk_parsed.csv') 'LECmd: recent LNK files'
     }
     $jlDst = Join-Path $script:RawDir 'jumplists'
-    if ((Test-Path $jlDst) -and -not (Test-Path (Join-Path $script:CsvDir 'jumplist_parsed*.csv'))) {
-        & $runTool (& $findTool 'JLECmd*.exe') @('-d', $jlDst, '--csv', $script:CsvDir, '--csvf', 'jumplist_parsed.csv') 'JLECmd: jump lists'
+    if ((Test-Path $jlDst) -and -not ((Test-CaseCsv 'jumplist_parsed') -or (Test-Path (Join-Path $script:CsvDir 'jumplist_parsed*.csv')))) {
+        $jlOut = Get-CaseCsvFullPath 'jumplist_parsed'
+        & $runTool (& $findTool 'JLECmd*.exe') @('-d', $jlDst, '--csv', (Split-Path $jlOut -Parent), '--csvf', 'jumplist_parsed.csv') 'JLECmd: jump lists'
     }
     $brDst = Join-Path $script:RawDir 'browser'
-    if ((Test-Path $brDst) -and -not (Test-Path (Join-Path $script:CsvDir 'browser_history.csv'))) {
+    if ((Test-Path $brDst) -and -not (Test-CaseCsv 'browser_history')) {
         $sqlExe = & $findTool 'SQLECmd*.exe'
         if ($sqlExe) {
             & $runTool $sqlExe @('-d', $brDst, '--csv', $script:CsvDir) 'SQLECmd: browser history/downloads'
@@ -7222,7 +7355,7 @@ function Invoke-ParseMode {
         $reExe = & $findTool 'RECmd*.exe'
         $bn = $null
         try { $bn = Join-Path (Get-KitRoot) 'tools\recmd\ophira-registry.bn' } catch { }
-        if ($reExe -and $bn -and (Test-Path $bn) -and -not (Test-Path (Join-Path $script:CsvDir 'registry_recmd.csv'))) {
+        if ($reExe -and $bn -and (Test-Path $bn) -and -not (Test-CaseCsv 'registry_recmd')) {
             Write-Host "  RECmd: batch registry deep-dive..." -ForegroundColor Cyan
             $outDir = Join-Path $script:CsvDir 'recmd_out'
             New-Item -ItemType Directory -Path $outDir -Force | Out-Null
@@ -7368,6 +7501,7 @@ function Invoke-FocusEngine {
     foreach ($hn in @('process_hashes.csv', 'entities_binaries.csv', 'amcache.csv')) {
         if ($hashes.Count -eq 0 -or ($names.Count -gt 0 -and $paths.Count -gt 0)) { break }
         $f = Join-Path $script:CsvDir $hn
+        if (-not (Test-Path -LiteralPath $f)) { $f = Join-Path $script:CsvDir (Get-CaseCsvPath $hn) }
         if (-not (Test-Path $f)) { continue }
         foreach ($r in @(Import-Csv -LiteralPath $f -ErrorAction SilentlyContinue)) {
             $rowTxt = ("$($r.Path) $($r.Image) $($r.FullPath) $($r.Application) $($r.Name) $($r.SHA256) $($r.Hash) $($r.Hashes)").ToLower()
@@ -7382,6 +7516,7 @@ function Invoke-FocusEngine {
     foreach ($src in @('processes.csv', 'sysmon_proc_create.csv', 'security_proc_events.csv')) {
         if ($pids.Count -eq 0 -or ($paths.Count -gt 0)) { break }
         $f = Join-Path $script:CsvDir $src
+        if (-not (Test-Path -LiteralPath $f)) { $f = Join-Path $script:CsvDir (Get-CaseCsvPath $src) }
         if (-not (Test-Path $f)) { continue }
         foreach ($r in @(Import-Csv -LiteralPath $f -ErrorAction SilentlyContinue)) {
             $vp = @("$($r.PID)", "$($r.ProcessId)", "$($r.NewProcessId)") | Where-Object { $_ -and ($pids.Contains($_.ToLower())) }
@@ -7393,8 +7528,8 @@ function Invoke-FocusEngine {
     }
 
     # ---- iterative scan ---------------------------------------------------
-    $files = @(Get-ChildItem -LiteralPath $script:CsvDir -Filter '*.csv' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.BaseName -notmatch '^(focus_|process_pivot|supertimeline|parse_needed)' } | Sort-Object Name)
+    $files = @(Get-ChildItem -LiteralPath $script:CsvDir -Filter '*.csv' -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { @('sigma_rules', 'evtx_ecmd', 'recmd_out') -notcontains $_.Directory.Name -and $_.BaseName -notmatch '^(focus_|process_pivot|supertimeline|parse_needed)' } | Sort-Object Name)
     $cache = @{}
     $hits = New-Object System.Collections.Generic.List[object]
     $hitKeys = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -7532,6 +7667,7 @@ function Invoke-FocusEngine {
     # ---- activity chain from the master timeline --------------------------
     $chain = New-Object System.Collections.Generic.List[object]
     $tlPath = Join-Path $script:CsvDir 'supertimeline.csv'
+    if (-not (Test-Path -LiteralPath $tlPath)) { $tlPath = Join-Path $script:CsvDir (Get-CaseCsvPath 'supertimeline') }
     if (Test-Path $tlPath) {
         foreach ($r in @(Import-Csv -LiteralPath $tlPath -ErrorAction SilentlyContinue)) {
             $blob = ("$($r.Timestamp) $($r.Source) $($r.Type) $($r.Actor) $($r.Entity) $($r.Detail)").ToLower()
@@ -7549,6 +7685,7 @@ function Invoke-FocusEngine {
     $groups = New-Object System.Collections.Generic.List[object]
     $hashByPath = @{}
     $phPath = Join-Path $script:CsvDir 'process_hashes.csv'
+    if (-not (Test-Path -LiteralPath $phPath)) { $phPath = Join-Path $script:CsvDir (Get-CaseCsvPath 'process_hashes') }
     if (Test-Path $phPath) {
         foreach ($r in @(Import-Csv -LiteralPath $phPath -ErrorAction SilentlyContinue)) {
             $pn = ("$($r.Path)" -replace '(?i)^\\device\\harddiskvolume\d+', 'C:').ToLower()
@@ -7844,6 +7981,7 @@ function Invoke-TimelineMode {
     if (-not $t0 -or -not $t1 -or ($t1 -eq [datetime]::MinValue)) { Write-Host "  invalid start/end - use 'yyyy-MM-dd HH:mm'" -ForegroundColor Red; return $false }
     if ($t1 -lt $t0) { $tmp = $t0; $t0 = $t1; $t1 = $tmp }
     $tlPath = Join-Path $script:CsvDir 'supertimeline.csv'
+    if (-not (Test-Path -LiteralPath $tlPath)) { $tlPath = Join-Path $script:CsvDir (Get-CaseCsvPath 'supertimeline') }
     if (-not (Test-Path $tlPath)) { Write-Host "  no supertimeline.csv in this case (collect first, or run -Mode Parse)" -ForegroundColor Red; return $false }
     $tl = @(Import-Csv -LiteralPath $tlPath -ErrorAction SilentlyContinue)
     $sel = New-Object System.Collections.Generic.List[object]
@@ -8078,12 +8216,12 @@ function Invoke-CanaryMode {
     Write-Host ""
     Write-Host "  [4/4] Scorecard - case: $(Split-Path $case.FullName -Leaf)" -ForegroundColor Cyan
     Write-Host ""
-    $hf = @(Import-Csv -LiteralPath (Join-Path $csv 'hunt_findings.csv') -ErrorAction SilentlyContinue)
-    $procRows = @(Import-Csv -LiteralPath (Join-Path $csv 'security_proc_events.csv') -ErrorAction SilentlyContinue)
-    $authRows = @(Import-Csv -LiteralPath (Join-Path $csv 'security_auth_events.csv') -ErrorAction SilentlyContinue)
-    $pcRows = @(Import-Csv -LiteralPath (Join-Path $csv 'sysmon_proc_create.csv') -ErrorAction SilentlyContinue)
-    $raRows = @(Import-Csv -LiteralPath (Join-Path $csv 'remote_access.csv') -ErrorAction SilentlyContinue)
-    $sysSvcRows = @(Import-Csv -LiteralPath (Join-Path $csv 'system_new_services.csv') -ErrorAction SilentlyContinue)
+    $hf = @(Import-CsvFlatMapped $csv 'hunt_findings')
+    $procRows = @(Import-CsvFlatMapped $csv 'security_proc_events')
+    $authRows = @(Import-CsvFlatMapped $csv 'security_auth_events')
+    $pcRows = @(Import-CsvFlatMapped $csv 'sysmon_proc_create')
+    $raRows = @(Import-CsvFlatMapped $csv 'remote_access')
+    $sysSvcRows = @(Import-CsvFlatMapped $csv 'system_new_services')
     $score = 0; $possible = 0
     $c4720 = @($authRows | Where-Object { "$($_.EventId)" -eq '4720' }).Count
     $c4732 = @($authRows | Where-Object { @('4728', '4732', '4756') -contains "$($_.EventId)" }).Count
@@ -8118,10 +8256,10 @@ function Invoke-CanaryMode {
         try { Expand-Archive -LiteralPath $bZip.FullName -DestinationPath $bDir -Force } catch { Write-Host "    cannot extract target case: $($_.Exception.Message)" -ForegroundColor Red; $bDir = $null }
         if ($bDir) {
             $bcsv = Join-Path $bDir 'csv'
-            $bAuth = @(Import-Csv -LiteralPath (Join-Path $bcsv 'security_auth_events.csv') -ErrorAction SilentlyContinue)
-            $bShare = @(Import-Csv -LiteralPath (Join-Path $bcsv 'security_share_access.csv') -ErrorAction SilentlyContinue)
-            $bSess = @(Import-Csv -LiteralPath (Join-Path $bcsv 'session_activity.csv') -ErrorAction SilentlyContinue)
-            $bHf = @(Import-Csv -LiteralPath (Join-Path $bcsv 'hunt_findings.csv') -ErrorAction SilentlyContinue)
+            $bAuth = @(Import-CsvFlatMapped $bcsv 'security_auth_events')
+            $bShare = @(Import-CsvFlatMapped $bcsv 'security_share_access')
+            $bSess = @(Import-CsvFlatMapped $bcsv 'session_activity')
+            $bHf = @(Import-CsvFlatMapped $bcsv 'hunt_findings')
             $bAcct = if ($tCred) { ($tCred.UserName -split '\\')[-1] } else { 'canary_test' }
             $c4624 = @($bAuth | Where-Object { "$($_.EventId)" -eq '4624' -and "$($_.LogonType)" -eq '3' -and "$($_.Account)" -match $bAcct }).Count
             $c5145 = @($bShare | Where-Object { $_ -match 'canary|C\$' }).Count

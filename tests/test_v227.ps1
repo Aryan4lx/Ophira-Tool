@@ -1,8 +1,9 @@
-$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
+﻿$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
 # v2.27 - real-host pilot fixes: worker kit-root seed, deploy empty-CaseID, VSS copy retry helper,
 # structured Sysmon EID1 + R1b renamed-LOLBin-at-rest rule + timeline weave
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 
 $pass = 0; $fail = 0
 function Check([string]$label, [bool]$ok) {
@@ -130,7 +131,8 @@ function Write-CaseLog { param([string]$Message, [string]$Color = 'Gray') $scrip
 $mod84 = [pscustomobject]@{ Id = '8.4'; Name = 'EZ parsers'; Run = $null }
 $mod84.Run = [scriptblock]::Create($m84.Groups[1].Value)
 & $mod84.Run
-$merged = Join-Path $CsvDir 'amcache.csv'
+$merged = Join-Path $CsvDir 'artifacts\amcache.csv'
+if (-not (Test-Path $merged)) { $merged = Join-Path $CsvDir 'amcache.csv' }
 Check "8.4: split CSVs merged into amcache.csv" (Test-Path $merged)
 $mr = @(Import-Csv -LiteralPath $merged -ErrorAction SilentlyContinue)
 Check "8.4: merged rows = file-entry family only (2 rows, DriveBinaries excluded)" ($mr.Count -eq 2 -and $mr[0].SHA1 -eq 'aabb')

@@ -1,8 +1,9 @@
-$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
+﻿$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
 # v2.34 - report timeline preview (client-side filter over the last 2000 supertimeline rows)
 # + release workflow (tag -> kit zip + SHA256SUMS + CHANGELOG notes) + hosts.txt.example.
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 
 $pass = 0; $fail = 0
 function Check([string]$label, [bool]$ok) {

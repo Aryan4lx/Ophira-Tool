@@ -1,8 +1,9 @@
-$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
+﻿$repoScript = Join-Path (Split-Path -Parent $PSScriptRoot) "Ophira.ps1"
 # v2.23 - KAPE parity pack: Application log (4.10), host extras (8.13), server logs + NTDS (8.14),
 # SDB persistence in ASEP sweep, StartupInfo/WER parsers
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -LiteralPath "$repoScript" -Raw
+. (Join-Path $PSScriptRoot '_casehelpers.ps1')
 
 $pass = 0; $fail = 0
 function Check([string]$label, [bool]$ok) {
