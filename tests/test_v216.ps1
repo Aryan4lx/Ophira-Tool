@@ -98,15 +98,17 @@ Check "rule lookup: GUID finds the yml" ($found -and (Split-Path $found -Leaf) -
 Check "rule lookup: unknown GUID returns null" ($null -eq (Find-SigmaRuleFile -RuleId '99999999-2222-3333-4444-555555555555' -HayabusaExe $fakeExeItem))
 
 # ============================================================================
-# PART 4 - Invoke-ProcessPivot: name + hash (with auto-pivot) on a case
+# PART 4 - Invoke-FocusEngine (v2.40, replaces the flat pivot): name + hash
+# (with auto-resolve) on a case
 # ============================================================================
 $defs = ''
-foreach ($n in @('Open-CaseSession', 'Invoke-ProcessPivot')) {
+foreach ($n in @('Open-CaseSession', 'Invoke-FocusEngine')) {
     $m2 = [regex]::Match($src, "(?s)function $n\b.*?\r?\n\}")
     if (-not $m2.Success) { throw "extract failed: $n" }
     $defs += $m2.Value + "`r`n"
 }
 Invoke-Expression $defs
+$ScriptVersion = '2.40'
 $case4 = Join-Path $env:TEMP "ophira_pivot_$stamp"
 $csv4 = Join-Path $case4 'csv'
 New-Item -ItemType Directory -Path $csv4 -Force | Out-Null
@@ -122,17 +124,19 @@ New-Csv (Join-Path $csv4 'process_hashes.csv') '"Name","Path","SHA256"' @(
     '"evil.exe","C:\Users\u\AppData\Roaming\evil.exe","AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"',
     '"notepad.exe","C:\Windows\notepad.exe","BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"'
 )
-$saved = @{}
-$okName = Invoke-ProcessPivot -Path $case4 -Indicator 'evil'
-$pivot1 = @($saved['process_pivot'])
-Check "pivot: name match returns success" ($okName -eq $true)
-Check "pivot: name hits across processes + services" (@($pivot1 | Where-Object Source -eq 'processes').Count -ge 1 -and @($pivot1 | Where-Object Source -eq 'services_flagged').Count -ge 1)
-Check "pivot: benign notepad not matched by 'evil'" (@($pivot1 | Where-Object { $_.Detail -match 'notepad' }).Count -eq 0)
-$okHash = Invoke-ProcessPivot -Path $case4 -Indicator 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-$pivot2 = @($saved['process_pivot'])
-Write-Host "DBG: okHash=$okHash pivot2=$($pivot2.Count) sources=$((@($pivot2) | ForEach-Object { $_.Source } | Sort-Object -Unique) -join ',') detail=$($pivot2[0].Detail)"
-Check "pivot: hash match + auto-pivot pulls services row" ($okHash -and @($pivot2 | Where-Object Source -eq 'services_flagged').Count -ge 1 -and $pivot2.Count -ge 3)
-Check "pivot: csv written into the case" (Test-Path (Join-Path $csv4 'process_pivot.csv'))
+$okName = Invoke-FocusEngine -Path $case4 -Indicator 'evil'
+$fDir = Join-Path $case4 'focus'
+$pivot1 = @()
+try { $pivot1 = @(Import-Csv -LiteralPath (Join-Path $fDir 'focus_hits.csv') -ErrorAction Stop) } catch { }
+Check "focus: name match returns success" ($okName -eq $true)
+Check "focus: name hits across processes + services" (@($pivot1 | Where-Object Source -eq 'processes').Count -ge 1 -and @($pivot1 | Where-Object Source -eq 'services_flagged').Count -ge 1)
+Check "focus: benign notepad not matched by 'evil'" (@($pivot1 | Where-Object { $_.Detail -match 'notepad' }).Count -eq 0)
+Check "focus: dossier + terms written into the case focus folder" ((Test-Path (Join-Path $fDir 'focus_report.html')) -and (Test-Path (Join-Path $fDir 'focus_terms.json')))
+$okHash = Invoke-FocusEngine -Path $case4 -Indicator 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+$pivot2 = @()
+try { $pivot2 = @(Import-Csv -LiteralPath (Join-Path $fDir 'focus_hits.csv') -ErrorAction Stop) } catch { }
+Check "focus: hash match + auto-resolve pulls services row" ($okHash -and @($pivot2 | Where-Object Source -eq 'services_flagged').Count -ge 1 -and $pivot2.Count -ge 3)
+Check "focus: hits csv written into the case" (Test-Path (Join-Path $fDir 'focus_hits.csv'))
 
 Write-Host ""
 Write-Host "RESULT: $pass passed, $fail failed" -ForegroundColor $(if ($fail -eq 0) { 'Green' } else { 'Red' })

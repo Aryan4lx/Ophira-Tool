@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.39  -  Windows Incident Response Triage Toolkit
+Ophira v2.41  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -7,7 +7,7 @@ by a responder during early triage / threat hunting.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links', 'UpdateRules', 'Tune', 'Parse', 'Process', 'Timeline', 'Canary')]
+    [ValidateSet('Collect', 'Deploy', 'Analyze', 'Setup', 'Links', 'UpdateRules', 'Tune', 'Parse', 'Process', 'Timeline', 'Canary', 'Focus')]
     [string]$Mode = 'Collect',
     [string]$CaseID = "",
     [string]$Analyst = "",
@@ -42,7 +42,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.39"
+$ScriptVersion = "2.41"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -2272,7 +2272,7 @@ $script:Modules = @(
                 ForEach-Object { [pscustomobject]@{ AccountSource = $_.Name; Count = $_.Count } })
             Save-Rows -Name 'security_auth_summary' -Rows $sum
             # v2.20 structured parses (fields need audit policy: 4688 cmdline needs "Include Command Line")
-            $procEv = Get-EventDataRows -LogName 'Security' -Id @(4688) -Start $start -Cap 4000 -Fields ([ordered]@{ Account = 'SubjectUserName'; LogonId = 'SubjectLogonId'; NewProcess = 'NewProcessName'; CommandLine = 'CommandLine'; ParentProcess = 'ParentProcessName' })
+            $procEv = Get-EventDataRows -LogName 'Security' -Id @(4688) -Start $start -Cap 4000 -Fields ([ordered]@{ Account = 'SubjectUserName'; LogonId = 'SubjectLogonId'; NewProcess = 'NewProcessName'; CommandLine = 'CommandLine'; ParentProcess = 'ParentProcessName'; NewProcessId = 'NewProcessId'; CreatorPid = 'ProcessId' })
             Save-Rows -Name 'security_proc_events' -Rows $procEv
             if ($procEv.Count -gt 0) { Write-CaseLog "    4688 process creations: $($procEv.Count) (empty CommandLine = cmdline audit off)" 'Gray' }
             $taskEv = Get-EventDataRows -LogName 'Security' -Id @(4698) -Start $start -Cap 500 -Fields ([ordered]@{ Account = 'SubjectUserName'; TaskName = 'TaskName'; TaskContent = 'TaskContent' })
@@ -2315,6 +2315,7 @@ $script:Modules = @(
                     $net += [pscustomobject]@{
                         Time = $e.TimeCreated; Image = $d['Image']; DestIp = $d['DestinationIp']
                         DestPort = $d['DestinationPort']; Protocol = $d['Protocol']
+                        ProcessGuid = $d['ProcessGuid']; ProcessId = $d['ProcessId']
                     }
                 }
             } catch { }
@@ -2330,7 +2331,7 @@ $script:Modules = @(
                     $x.Event.EventData.Data | ForEach-Object { $d[$_.Name] = $_.'#text' }
                     $dns += [pscustomobject]@{
                         Time = $e.TimeCreated; Image = $d['Image']; QueryName = $d['QueryName']
-                        QueryResults = $d['QueryResults']; ProcessId = $d['ProcessId']
+                        QueryResults = $d['QueryResults']; ProcessId = $d['ProcessId']; ProcessGuid = $d['ProcessGuid']
                     }
                 }
             } catch { }
@@ -2348,6 +2349,7 @@ $script:Modules = @(
                     $img += [pscustomobject]@{
                         Time = $e.TimeCreated; Process = $d['Image']; Dll = $d['ImageLoaded']
                         Signed = $d['Signed']; Signature = $d['Signature']; Company = $d['Company']; Description = $d['Description']
+                        ProcessId = $d['ProcessId']; ProcessGuid = $d['ProcessGuid']
                     }
                 }
             } catch { }
@@ -2357,13 +2359,13 @@ $script:Modules = @(
             $pa = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(10) -Start $start -Cap 3000 -Fields ([ordered]@{ SourceImage = 'SourceImage'; TargetImage = 'TargetImage'; GrantedAccess = 'GrantedAccess'; CallTrace = 'CallTrace' })
             Save-Rows -Name 'sysmon_process_access' -Rows $pa
             if ($pa.Count -ge 3000) { Write-CaseLog "    EID 10 process access: capped at 3000 - widen the Sysmon ProcessAccess filter" 'DarkGray' }
-            $reg = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(13) -Start $start -Cap 5000 -Fields ([ordered]@{ EventType = 'EventType'; TargetObject = 'TargetObject'; Image = 'Image' })
+            $reg = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(13) -Start $start -Cap 5000 -Fields ([ordered]@{ EventType = 'EventType'; TargetObject = 'TargetObject'; Image = 'Image'; ProcessId = 'ProcessId'; ProcessGuid = 'ProcessGuid' })
             Save-Rows -Name 'sysmon_registry' -Rows $reg
-            $ft = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(2) -Start $start -Cap 1000 -Fields ([ordered]@{ Image = 'Image'; TargetFilename = 'TargetFilename'; CreationUtcTime = 'CreationUtcTime'; PreviousCreationUtcTime = 'PreviousCreationUtcTime' })
+            $ft = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(2) -Start $start -Cap 1000 -Fields ([ordered]@{ Image = 'Image'; TargetFilename = 'TargetFilename'; CreationUtcTime = 'CreationUtcTime'; PreviousCreationUtcTime = 'PreviousCreationUtcTime'; ProcessId = 'ProcessId'; ProcessGuid = 'ProcessGuid' })
             Save-Rows -Name 'sysmon_file_time' -Rows $ft
             if ($ft.Count -gt 0) { Write-CaseLog "    EID 2 file creation-time changes: $($ft.Count) (timestomping data source)" 'Yellow' }
             # v2.27: EID 1 process create - OriginalFileName vs Image feeds the renamed-LOLBIN at-rest rule
-            $pc = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(1) -Start $start -Cap 5000 -Fields ([ordered]@{ Image = 'Image'; OriginalFileName = 'OriginalFileName'; CommandLine = 'CommandLine'; User = 'User' })
+            $pc = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(1) -Start $start -Cap 5000 -Fields ([ordered]@{ Image = 'Image'; OriginalFileName = 'OriginalFileName'; CommandLine = 'CommandLine'; User = 'User'; ProcessId = 'ProcessId'; ProcessGuid = 'ProcessGuid'; ParentImage = 'ParentImage'; ParentProcessGuid = 'ParentProcessGuid' })
             Save-Rows -Name 'sysmon_proc_create' -Rows $pc
             Export-Evtx -LogName 'Microsoft-Windows-Sysmon/Operational' -FileName 'Sysmon_Operational.evtx'
         } }
@@ -4276,7 +4278,7 @@ tr.techrow{cursor:pointer}
     $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
     $null = $sb.AppendLine("<h1>OPHIRA COMPROMISE ASSESSMENT REPORT</h1>")
     $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' }) &nbsp;|&nbsp; Elevated: $(if (Test-IsAdmin) { 'yes' } else { 'NO' })</div>")
-    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#timeline'>Timeline</a><a href='#snapshot'>Snapshot</a><a href='#drivers'>Drivers</a><a href='#hunt'>Hunt</a><a href='#entities'>Connections</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
+    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#timeline'>Timeline</a><a href='#snapshot'>Snapshot</a><a href='#drivers'>Drivers</a><a href='#hunt'>Hunt</a><a href='#entities'>Connections</a><a href='#focus'>Focus</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
 
     # ---------- verdict banner ----------
     $null = $sb.AppendLine("<a name='verdict'></a><h2>Verdict</h2>")
@@ -4965,6 +4967,46 @@ tr.techrow{cursor:pointer}
     $tlSources = @($tlAll | ForEach-Object { "$($_.Source)" } | Sort-Object -Unique)
     $null = $sb.AppendLine("<a name='timeline'></a><h2>Master timeline (gathered evidence chronology)</h2>")
     $null = $sb.AppendLine("<div class='card'>The full chronology lives in <b>csv\supertimeline.csv</b> ($(ConvertTo-HtmlEsc $tlAll.Count) events from $($tlSources.Count) evidence sources - open it in Excel/Timeline Explorer and filter by Timestamp). Evidence sources woven: $(ConvertTo-HtmlEsc ($tlSources -join ', ')). Scanner conclusions (Sigma detections, hunt findings, beacons) are intentionally NOT part of it - they have their own sections above. For windowed pivots with per-source/busiest-minute summaries run <b>-Mode Timeline</b>.</div>")
+
+    # ---------- focus dossier (v2.40: built by -Mode Focus / menu option 9) ----------
+    $focusDirP = Join-Path (Split-Path -Parent $CsvDir) 'focus'
+    if (Test-Path -LiteralPath (Join-Path $focusDirP 'focus_terms.json')) {
+        $ft = $null
+        try { $ft = Get-Content -LiteralPath (Join-Path $focusDirP 'focus_terms.json') -Raw | ConvertFrom-Json } catch { }
+        if ($ft) {
+            $fHits = @()
+            try { $fHits = @(Import-Csv -LiteralPath (Join-Path $focusDirP 'focus_hits.csv') -ErrorAction Stop) } catch { }
+            $fInst = @()
+            try { $fInst = @(Import-Csv -LiteralPath (Join-Path $focusDirP 'focus_instances.csv') -ErrorAction Stop) } catch { }
+            $null = $sb.AppendLine("<a name='focus'></a><h2>Focus dossier - $(ConvertTo-HtmlEsc $ft.Indicator)</h2>")
+            $degr = if ($ft.Degraded) { " <span class='med'>instance attribution degraded - no ProcessGuid captured in this case</span>" } else { '' }
+            $null = $sb.AppendLine("<div class='meta'>Focused on '<b>$(ConvertTo-HtmlEsc $ft.Indicator)</b>' ($($ft.Rounds) expansion round(s), $($ft.HitCount) evidence row(s), $($ft.InstanceCount) instance(s))$degr. Full dossier: <b>focus\focus_report.html</b> - activity chain: focus\focus_chain.csv</div>")
+            if (@($ft.Paths).Count -gt 0) {
+                $null = $sb.AppendLine("<h3>Entity groups (path + hash keyed - same-name binaries at different paths are separate groups)</h3><table><tr><th>Path</th><th>SHA256</th><th>Hits</th><th>First seen</th><th>Last seen</th></tr>")
+                foreach ($p in @($ft.Paths | Select-Object -First 20)) {
+                    $g = @($fHits | Where-Object { "$($_.Detail)".ToLower().Contains("$p") })
+                    $fs = ($g | Where-Object { "$($_.Time)" } | Sort-Object { "$($_.Time)" } | Select-Object -First 1).Time
+                    $ls = ($g | Where-Object { "$($_.Time)" } | Sort-Object { "$($_.Time)" } | Select-Object -Last 1).Time
+                    $null = $sb.AppendLine("<tr><td class='path'>$(ConvertTo-HtmlEsc $p)</td><td class='path'>$(ConvertTo-HtmlEsc ($ft.Hashes | Select-Object -First 1))</td><td>$($g.Count)</td><td>$(ConvertTo-HtmlEsc $fs)</td><td>$(ConvertTo-HtmlEsc $ls)</td></tr>")
+                }
+                $null = $sb.AppendLine("</table>")
+            }
+            if ($fInst.Count -gt 0) {
+                $null = $sb.AppendLine("<h3>Instances</h3><table><tr><th>PID</th><th>ProcessGuid</th><th>Started</th><th>Image</th><th>Parent</th><th>User</th></tr>")
+                foreach ($i in @($fInst | Select-Object -First 25)) {
+                    $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $i.Pid)</td><td class='path'>$(ConvertTo-HtmlEsc $i.Guid)</td><td>$(ConvertTo-HtmlEsc $i.Started)</td><td class='path'>$(ConvertTo-HtmlEsc $i.Image)</td><td>$(ConvertTo-HtmlEsc $i.Parent)</td><td>$(ConvertTo-HtmlEsc $i.User)</td></tr>")
+                }
+                $null = $sb.AppendLine("</table><div class='meta'>Multiple instances of one name group per path+hash; a same-name binary at another path would appear as its own group (masquerade split).</div>")
+            }
+            if ($fHits.Count -gt 0) {
+                $null = $sb.AppendLine("<h3>Evidence by artifact</h3><table><tr><th>Artifact</th><th>Rows</th></tr>")
+                foreach ($g in ($fHits | Group-Object Source | Sort-Object Count -Descending | Select-Object -First 25)) {
+                    $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $g.Name)</td><td>$($g.Count)</td></tr>")
+                }
+                $null = $sb.AppendLine("</table>")
+            }
+        }
+    }
 
     # ---------- recommendations ----------
     $null = $sb.AppendLine("<a name='recommendations'></a><h2>Recommendations</h2>")
@@ -6457,9 +6499,20 @@ function Get-CompromiseVerdict {
         if ($count -gt 0) { $signals.Add([pscustomobject]@{ Signal = $name; Weight = $floor; Count = $count; Detail = $detail }) }
     }
 
-    $hayCrit = @($hay | Where-Object { "$($_.Level)" -match 'crit' }).Count
-    $hayHigh = @($hay | Where-Object { "$($_.Level)" -match '^high$' }).Count
-    $hayHighRules = @($hay | Where-Object { "$($_.Level)" -match '^high$' } | Group-Object RuleTitle).Count
+    # v2.41 FP fix: Defender-channel sigma rows are excluded here - they are already covered
+    # by the dedicated 'Defender detection history' signal (floor 2). Counting them twice let
+    # ONE old Defender alert declare LIKELY COMPROMISED on clean systems (sigma-crit floor 3
+    # + defender-history floor 2 double-counting the same underlying event).
+    $hayNonDef = @($hay | Where-Object { "$($_.Channel)" -notmatch '(?i)^defender' })
+    $hayCrit = @($hayNonDef | Where-Object { "$($_.Level)" -match 'crit' })
+    $hayHigh = @($hayNonDef | Where-Object { "$($_.Level)" -match '^high$' })
+    $hayHighRules = @($hayHigh | Group-Object RuleTitle).Count
+    # v2.41 FP fix: a critical signal only reaches floor 3 (LIKELY COMPROMISED) when a STORM of
+    # independent critical rules fires (>=3 events from >=2 distinct rules - real incidents trip
+    # many rules at once). A single noisy crit rule (1-2 events, 1 rule) demotes to floor 2
+    # SUSPICIOUS - visible, weighty, but not a compromise declaration on its own.
+    $hayCritRules = @($hayCrit | Group-Object RuleTitle).Count
+    $critFloor = if ($hayCrit.Count -ge 3 -and $hayCritRules -ge 2) { 3 } else { 2 }
     $procHigh = @($proc | Where-Object { "$($_.Verdict)" -eq 'HIGH' }).Count
     $procMed = @($proc | Where-Object { "$($_.Verdict)" -eq 'MEDIUM' }).Count
     $yaraHi = @($yara | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' }).Count
@@ -6493,11 +6546,11 @@ function Get-CompromiseVerdict {
     $mftIoc = @(Import-CaseCsv 'ioc_hits_mft')
     Add-Signal 'IOC hit - known-bad filename on disk ($MFT)' 2 @($mftIoc).Count (($mftIoc | Select-Object -First 3 | ForEach-Object { $_.Path }) -join '; ')
     Add-Signal 'IOC hit - live system' 3 @($iocLive).Count (($iocLive | Select-Object -First 3 | ForEach-Object { $_.Indicator }) -join '; ')
-    Add-Signal 'Sigma detection - critical' 3 $hayCrit (($hay | Where-Object { "$($_.Level)" -match 'crit' } | Select-Object -First 3 | ForEach-Object { $_.RuleTitle }) -join '; ')
+    Add-Signal 'Sigma detection - critical' $critFloor $hayCrit.Count (($hayCrit | Select-Object -First 3 | ForEach-Object { $_.RuleTitle }) -join '; ')
     Add-Signal 'YARA hit - medium rule' 2 $yaraMed (($yara | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'C2 beaconing - periodic callbacks' 2 $beaconMed (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'C2 DNS beaconing - periodic domain queries' 2 $dnsMed (($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.Domain) every ~$($_.MedianIntervalSec)s" }) -join '; ')
-    Add-Signal 'Sigma detection - high' 2 $hayHigh "$hayHigh events from $hayHighRules distinct rules"
+    Add-Signal 'Sigma detection - high' 2 $hayHigh.Count "$($hayHigh.Count) events from $hayHighRules distinct rules"
     Add-Signal 'Process anomaly verdict HIGH' 2 $procHigh (($proc | Where-Object { "$($_.Verdict)" -eq 'HIGH' } | Select-Object -First 3 | ForEach-Object { $_.Name }) -join '; ')
     Add-Signal 'Defender detection history' 2 @($def).Count "antivirus detected something during retention window"
     Add-Signal 'Security tooling tampering / log clearing' 2 $gapTamper "log cleared or security service stopped"
@@ -6580,7 +6633,7 @@ function Get-CompromiseVerdict {
 
     $counts = [pscustomobject]@{
         IocLive = @($iocLive).Count; IocAmcache = @($iocAmc).Count; YaraHigh = $yaraHi; YaraMedium = $yaraMed
-        SigmaCritical = $hayCrit; SigmaHigh = $hayHigh; ProcessHigh = $procHigh; ProcessMedium = $procMed
+        SigmaCritical = $hayCrit.Count; SigmaHigh = $hayHigh.Count; ProcessHigh = $procHigh; ProcessMedium = $procMed
         DefenderDetections = @($def).Count; TamperEvents = $gapTamper; BruteForceSources = @($brute).Count
         BeaconHigh = $beaconHi; BeaconMedium = $beaconMed
         DnsBeaconHigh = $dnsHi; DnsBeaconMedium = $dnsMed; LolDriversMalicious = $lolMal
@@ -6864,7 +6917,7 @@ function Show-TaskMenu {
         Write-Host "   [6]  Tune Sigma rules (reduce false positives)" -ForegroundColor Yellow
         Write-Host "   [7]  Tool links" -ForegroundColor Yellow
         Write-Host "   [8]  Finish a collected case (parse evidence analyst-side)" -ForegroundColor Yellow
-        Write-Host "   [9]  Analyze a single process (pivot on a case)" -ForegroundColor Yellow
+        Write-Host "   [9]  Focus on one entity (build its activity chain from a case)" -ForegroundColor Yellow
         Write-Host "   [C]  Detection canary (self-test the pipeline on this PC)" -ForegroundColor Yellow
         Write-Host "   [T]  Timeline pivot (filter the master timeline to a window)" -ForegroundColor Yellow
         Write-Host ""
@@ -6881,7 +6934,7 @@ function Show-TaskMenu {
             '^(?i)6$' { return 'Tune' }
             '^(?i)7$' { return 'Links' }
             '^(?i)8$' { return 'Parse' }
-            '^(?i)9$' { return 'Process' }
+            '^(?i)9$' { return 'Focus' }
             '^(?i)c$' { return 'Canary' }
             '^(?i)t$' { return 'Timeline' }
             '^(?i)q$' { return $null }
@@ -7230,80 +7283,546 @@ function Invoke-ParseMode {
     return $true
 }
 
-function Invoke-ProcessPivot {
-    # Analyst-side single-process analysis: search every CSV in a collected case for one
-    # indicator (name, path fragment or hash) and group what the evidence says about it.
+function Invoke-FocusEngine {
+    # Analyst-side focus dossier: seed with a process name, PID, path fragment or hash and
+    # iteratively expand the entity set across every collected CSV (name -> path -> hash ->
+    # parent/child -> DLL -> network) until the activity chain closes. Writes focus\ inside
+    # the case folder: focus_terms.json, focus_hits.csv, focus_chain.csv, focus_report.html.
+    # Replaces the old flat process_pivot grep (v2.40).
+    # Multi-instance handling: entity groups are keyed by normalized path + hash, so several
+    # live/historical instances of one name group together while a same-name binary at a
+    # different path (masquerade) splits into its own group. Instances are listed per
+    # PID/ProcessGuid where the collectors captured them; name-level artifacts
+    # (prefetch/amcache/autoruns/yara) stay in the shared view.
     param([string]$Path, [string]$Indicator)
     Write-Host ""
-    Write-Host "=== Analyze a single process (case pivot) ===" -ForegroundColor Cyan
+    Write-Host "=== Focus engine (build one entity's activity chain) ===" -ForegroundColor Cyan
     if (-not $Path) { $Path = (Read-Host "  Case folder or OPHIRA_*.zip path").Trim(' "') }
     $meta = Open-CaseSession -Path $Path
     if (-not $meta) { return $false }
-    if (-not $Indicator) { $Indicator = (Read-Host "  Process name, path fragment or hash (sha256/sha1/md5)").Trim() }
+    if (-not $Indicator) { $Indicator = (Read-Host "  Process name, PID, path fragment or hash").Trim() }
     if (-not $Indicator) { Write-Host "  no indicator given" -ForegroundColor Red; return $false }
-    $ind = $Indicator.ToLower()
-    $isHash = $ind -match '^[a-f0-9]{32}$|^[a-f0-9]{40}$|^[a-f0-9]{64}$'
+    $focusDir = Join-Path $script:CaseDir 'focus'
+    New-Item -ItemType Directory -Path $focusDir -Force | Out-Null
     Write-Host "  Case: $($meta.Computer)  indicator: $Indicator" -ForegroundColor Gray
 
-    $scan = {
-        param([string]$term)
-        $found = New-Object System.Collections.Generic.List[object]
-        foreach ($f in @(Get-ChildItem -LiteralPath $script:CsvDir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Where-Object { @('process_pivot.csv', 'supertimeline.csv') -notcontains $_.Name } | Sort-Object Name)) {
+    # OS-infra process names: matched as evidence, but never seeded as new expansion terms
+    # (otherwise the chain explodes into everything that ever had explorer.exe as a parent).
+    $guard = '^(?i)(explorer|cmd|conhost|svchost|services|lsass|smss|winlogon|csrss|dllhost|runtimebroker|taskhostw|wmiprvse|sihost|ctfmon|fontdrvhost|audiodg|dwm|dwm\.screenclip|searchapp|searchindexer|searchhost|spoolsv|msmpeng|nissrv|wudfhost|memcompression|system|idle|werfault|werfaultsecure|backgroundtaskhost|applicationframehost|textinputhost|startmenuexperiencehost|shellexperiencehost|smartscreen|securityhealthservice|securityhealthsystray|logonui|nx |\d+)\.(exe|sys)$'
+    $nameCols = '^(?i)(Name|Process|Image|Application|NewProcess|ParentProcess|Dll|ImageLoaded|SourceImage|TargetImage|OriginalFileName|Binary|Executable|Service|Driver)$'
+    $pathCols = '^(?i)(Path|ImagePath|FullPath|Application|Image|Process|NewProcess|ParentProcess|TargetFilename|ImageLoaded|Dll|SourceImage|ExecutablePath|Binary|ProcessPath)$'
+    $hashCols = '^(?i)(SHA256|SHA1|MD5|Hashes|Hash)$'
+    $pidCols = '^(?i)(PID|PPID|ProcessId|NewProcessId|ParentProcessId|CreatorPid)$'
+    $ipCols = '^(?i)(DestIp|DestinationIp|SourceIp|RemoteIp|IpAddress|IP)$'
+    $guidRe = '^(?i)ProcessGuid$'
+
+    # ---- seed terms -------------------------------------------------------
+    $names = New-Object System.Collections.Generic.List[string]
+    $paths = New-Object System.Collections.Generic.List[string]
+    $hashes = New-Object System.Collections.Generic.List[string]
+    $pids = New-Object System.Collections.Generic.List[string]
+    $guids = New-Object System.Collections.Generic.List[string]
+    $ips = New-Object System.Collections.Generic.List[string]
+    $ind = "$Indicator".Trim().ToLower()
+    if ($ind -match '^[a-f0-9]{32}$|^[a-f0-9]{40}$|^[a-f0-9]{64}$') {
+        $hashes.Add($ind)
+    } elseif ($ind -match '^\d{1,10}$') {
+        $pids.Add($ind)
+        $pids.Add(('0x{0:x}' -f ([int64]$ind)))
+    } elseif ($ind.Contains('\')) {
+        $paths.Add((("$ind" -replace '(?i)^\\device\\harddiskvolume\d+', 'C:' -replace '/', '\').ToLower()))
+    } else {
+        $names.Add($ind)
+    }
+
+    $addName = {
+        param([string]$v)
+        $x = "$v".Trim().ToLower()
+        if ($x.Length -lt 4 -or $x.Length -gt 260) { return }
+        if ($x -match $guard) { return }
+        if (-not $names.Contains($x) -and $names.Count -lt 60) { $names.Add($x) }
+    }
+    $addPath = {
+        param([string]$v)
+        $x = ("$v" -replace '(?i)^\\device\\harddiskvolume\d+', 'C:' -replace '/', '\').ToLower()
+        if ($x.Length -lt 5 -or -not $x.Contains('\')) { return }
+        if (-not $paths.Contains($x) -and $paths.Count -lt 60) { $paths.Add($x) }
+    }
+    $addHash = {
+        param([string]$v)
+        $x = "$v".Trim().ToLower()
+        if ($x -notmatch '^[a-f0-9]{32}$|^[a-f0-9]{40}$|^[a-f0-9]{64}$') { return }
+        if (-not $hashes.Contains($x) -and $hashes.Count -lt 12) { $hashes.Add($x) }
+    }
+    $addIp = {
+        # network pivot: remote IPs from matched rows pull in beacon/connection evidence
+        # that never carries the process name itself
+        param([string]$v)
+        $x = "$v".Trim().ToLower()
+        if ($x -notmatch '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') { return }
+        if ($x -match '^(0\.0\.0\.0|255\.255\.255\.255|22[4-9]\.|2[3-5]\d\.)') { return }
+        if (-not $ips.Contains($x) -and $ips.Count -lt 20) { $ips.Add($x) }
+    }
+
+    # hash seed -> resolve to the binary's path/name so one hash pulls the whole story
+    foreach ($hn in @('process_hashes.csv', 'entities_binaries.csv', 'amcache.csv')) {
+        if ($hashes.Count -eq 0 -or ($names.Count -gt 0 -and $paths.Count -gt 0)) { break }
+        $f = Join-Path $script:CsvDir $hn
+        if (-not (Test-Path $f)) { continue }
+        foreach ($r in @(Import-Csv -LiteralPath $f -ErrorAction SilentlyContinue)) {
+            $rowTxt = ("$($r.Path) $($r.Image) $($r.FullPath) $($r.Application) $($r.Name) $($r.SHA256) $($r.Hash) $($r.Hashes)").ToLower()
+            $hitH = $false
+            foreach ($h in $hashes) { if ($rowTxt.Contains($h)) { $hitH = $true; break } }
+            if (-not $hitH) { continue }
+            foreach ($pv in (@("$($r.Path)", "$($r.Image)", "$($r.FullPath)", "$($r.Application)") | Where-Object { "$_" -match '[\\/]|\S+\.\w+$' })) { & $addPath "$pv" }
+            & $addName "$($r.Name)"
+        }
+    }
+    # PID seed -> resolve to the image path/name (live snapshot first, then history)
+    foreach ($src in @('processes.csv', 'sysmon_proc_create.csv', 'security_proc_events.csv')) {
+        if ($pids.Count -eq 0 -or ($paths.Count -gt 0)) { break }
+        $f = Join-Path $script:CsvDir $src
+        if (-not (Test-Path $f)) { continue }
+        foreach ($r in @(Import-Csv -LiteralPath $f -ErrorAction SilentlyContinue)) {
+            $vp = @("$($r.PID)", "$($r.ProcessId)", "$($r.NewProcessId)") | Where-Object { $_ -and ($pids.Contains($_.ToLower())) }
+            if (-not $vp) { continue }
+            & $addPath "$($r.Path)"; & $addPath "$($r.Image)"; & $addPath "$($r.NewProcess)"
+            & $addName "$($r.Name)"; & $addName "$($r.Image)"; & $addName "$($r.NewProcess)"
+            if ($src -eq 'sysmon_proc_create' -and "$($r.ProcessGuid)") { $guids.Add("$($r.ProcessGuid)".ToLower()) }
+        }
+    }
+
+    # ---- iterative scan ---------------------------------------------------
+    $files = @(Get-ChildItem -LiteralPath $script:CsvDir -Filter '*.csv' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.BaseName -notmatch '^(focus_|process_pivot|supertimeline|parse_needed)' } | Sort-Object Name)
+    $cache = @{}
+    $hits = New-Object System.Collections.Generic.List[object]
+    $hitKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+    $instances = New-Object System.Collections.Generic.List[object]
+    $instKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+    $sourcesHit = @{}
+
+    $matchRow = {
+        # returns the matched-on descriptor or $null
+        param($r)
+        foreach ($p in $r.PSObject.Properties) {
+            $v = "$($p.Value)"
+            if (-not $v -or $v -eq '@{') { continue }
+            $vl = $v.ToLower()
+            foreach ($h in $hashes) { if ($vl.Contains($h)) { return "hash $h" } }
+            if ("$($p.Name)" -match $pidCols) {
+                foreach ($pd in $pids) { if ($vl -eq $pd) { return "pid $pd" } }
+            }
+            foreach ($pn in $names) { if ($vl.Contains($pn)) { return "name $pn" } }
+            foreach ($pt in $paths) { if ($vl.Contains($pt)) { return "path $pt" } }
+            foreach ($ip in $ips) { if ($vl -eq $ip) { return "ip $ip" } }
+        }
+        return $null
+    }
+
+    for ($round = 1; $round -le 4; $round++) {
+        $termCount = $names.Count + $paths.Count + $hashes.Count
+        if ($termCount -eq 0) { break }
+        $newHits = 0
+        foreach ($f in $files) {
+            if (-not $cache.ContainsKey($f.BaseName)) {
+                $rr = @()
+                try { $rr = @(Import-Csv -LiteralPath $f.FullName -ErrorAction Stop) } catch { }
+                $cache[$f.BaseName] = $rr
+            }
+            $rr = $cache[$f.BaseName]
+            if ($rr.Count -eq 0) { continue }
             $src = $f.BaseName
-            $rr = $null
-            try { $rr = @(Import-Csv -LiteralPath $f.FullName -ErrorAction Stop) } catch { continue }
             foreach ($r in $rr) {
-                $matchProps = @()
-                $pivotVals = @()
+                $on = & $matchRow $r
+                if (-not $on) { continue }
+                # expansion: pull new entity terms out of the matched row
+                foreach ($p in $r.PSObject.Properties) {
+                    $nm = "$($p.Name)"; $v = "$($p.Value)"
+                    if (-not $v) { continue }
+                    if ($nm -match $guidRe) { $gl = $v.ToLower(); if (-not $guids.Contains($gl)) { $guids.Add($gl) } }
+                    if ($nm -match $hashCols) { & $addHash $v }
+                    if ($nm -match $pathCols) { & $addPath $v }
+                    if ($nm -match $nameCols) { & $addName $v }
+                    if ($nm -match $ipCols) { & $addIp $v }
+                }
+                # instance record from the identity sources
+                if ($src -eq 'processes' -or $src -eq 'sysmon_proc_create' -or $src -eq 'security_proc_events') {
+                    $iPid = ''; $iGuid = ''; $iParent = ''; $iUser = ''; $iStart = ''; $iImg = ''
+                    if ($src -eq 'processes') {
+                        $iPid = "$($r.PID)"; $iParent = "PPID $($r.PPID)"; $iStart = "$($r.Created)"; $iImg = "$($r.Path)"
+                    } elseif ($src -eq 'sysmon_proc_create') {
+                        $iPid = "$($r.ProcessId)"; $iGuid = "$($r.ProcessGuid)"; $iStart = "$($r.Time)"; $iImg = "$($r.Image)"; $iParent = "$($r.ParentImage)"; $iUser = "$($r.User)"
+                    } else {
+                        $iPid = "$($r.NewProcessId)"; $iStart = "$($r.Time)"; $iImg = "$($r.NewProcess)"; $iParent = "$($r.ParentProcess)"; $iUser = "$($r.Account)"
+                    }
+                    $ik = "$iPid|$iImg".ToLower()
+                    if (($iPid -or $iGuid) -and $instKeys.Add($ik)) {
+                        $instances.Add([pscustomobject]@{ Pid = $iPid; Guid = $iGuid; Started = $iStart; Image = $iImg; Parent = $iParent; User = $iUser; Source = $src })
+                    } elseif ($instances.Count -gt 0) {
+                        # same instance seen in another source -> enrich the existing row
+                        # (sysmon rows carry guid/user/parent, the live snapshot carries PPID)
+                        foreach ($ex in $instances) {
+                            if ("$($ex.Pid)|$($ex.Image)".ToLower() -eq $ik) {
+                                if ($iGuid -and -not "$($ex.Guid)") { $ex | Add-Member -NotePropertyName Guid -NotePropertyValue $iGuid -Force }
+                                if ($iUser -and -not "$($ex.User)") { $ex | Add-Member -NotePropertyName User -NotePropertyValue $iUser -Force }
+                                if ($iParent -and -not "$($ex.Parent)") { $ex | Add-Member -NotePropertyName Parent -NotePropertyValue $iParent -Force }
+                                if ($iStart -and -not "$($ex.Started)") { $ex | Add-Member -NotePropertyName Started -NotePropertyValue $iStart -Force }
+                                break
+                            }
+                        }
+                    }
+                }
+                # hit record (deduped across rounds)
+                $detail = ''
                 foreach ($p in $r.PSObject.Properties) {
                     $v = "$($p.Value)"
-                    if ($v -and $v.ToLower().Contains($term)) { $matchProps += "$($p.Name)=$v" }
-                    if ($v -and $p.Name -match '^(?i)(Name|Path|Application|Process|Image)$') { $pivotVals += $v }
+                    if ($v -and $v -ne '@{') { $detail += "$($p.Name)=$v | " }
                 }
-                if ($matchProps.Count -gt 0) {
-                    $detail = ($matchProps -join ' | ')
-                    if ($detail.Length -gt 400) { $detail = $detail.Substring(0, 400) + '...' }
-                    $found.Add([pscustomobject]@{ Indicator = $Indicator; Source = $src; Detail = $detail; Pivot = (($pivotVals | Select-Object -First 4) -join '|') })
+                if ($detail.Length -gt 400) { $detail = $detail.Substring(0, 400) + '...' }
+                $t = ''
+                foreach ($tc in @('Time', 'TimeCreated', 'Timestamp', 'Started', 'LastWrite')) {
+                    if ($r.PSObject.Properties[$tc] -and "$($r.$tc)") { $t = "$($r.$tc)"; break }
+                }
+                $hk = "$src|$detail"
+                if ($hitKeys.Add($hk.ToLower())) {
+                    $hits.Add([pscustomobject]@{ Indicator = $Indicator; Source = $src; Time = $t; MatchedOn = $on; Detail = $detail })
+                    $sourcesHit[$src] = [int]$sourcesHit[$src] + 1
+                    $newHits++
                 }
             }
         }
-        return $found
+        Write-Host ("  round {0}: {1} name / {2} path / {3} hash / {4} ip terms -> {5} new hit(s), {6} instance(s)" -f $round, $names.Count, $paths.Count, $hashes.Count, $ips.Count, $newHits, $instances.Count) -ForegroundColor DarkGray
+        if ($newHits -eq 0 -and $names.Count + $paths.Count + $hashes.Count -eq $termCount) { break }
     }
 
-    $hits = [System.Collections.Generic.List[object]]@(& $scan $ind)
-    # hash given -> also pivot on the matching binary's name/path so one hash pulls the whole story
-    if ($isHash -and $hits.Count -gt 0) {
-        $extra = @()
-        foreach ($h in $hits) {
-            foreach ($v in (@("$($h.Pivot)" -split '\|') | Where-Object { $_ })) {
-                $vl = $v.ToLower()
-                if ($vl.Length -ge 4 -and $vl -ne $ind -and $extra -notcontains $vl) { $extra += $vl }
-            }
+    # ---- per-instance detail (ProcessGuid joins into the structured Sysmon CSVs; PID fallback) ----
+    # Everything ONE instance did: children, network, DNS, loaded DLLs, file-time changes, registry.
+    $perInst = New-Object System.Collections.Generic.List[object]
+    $guidFilter = {
+        param($name, $gl, $pl)
+        if (-not $cache.ContainsKey($name)) { return @() }
+        $rows = $cache[$name]
+        if ($gl) { return @($rows | Where-Object { "$($_.ProcessGuid)".ToLower() -eq $gl }) }
+        if ($pl) { return @($rows | Where-Object { "$($_.ProcessId)" -eq $pl -or "$($_.PID)" -eq $pl }) }
+        return @()
+    }
+    foreach ($i in $instances) {
+        $gl = "$($i.Guid)".ToLower()
+        $pl = "$($i.Pid)"
+        $kids = @()
+        if ($cache.ContainsKey('sysmon_proc_create')) {
+            if ($gl) { $kids = @($cache['sysmon_proc_create'] | Where-Object { "$($_.ParentProcessGuid)".ToLower() -eq $gl }) }
+            elseif ($pl) { $kids = @($cache['sysmon_proc_create'] | Where-Object { "$($_.ParentImage)".ToLower() -eq "$($i.Image)".ToLower() }) }
         }
-        foreach ($term in (@($extra | Select-Object -First 3))) {
-            foreach ($h2 in (& $scan $term)) {
-                if (@($hits | Where-Object { $_.Source -eq $h2.Source -and $_.Detail -eq $h2.Detail }).Count -eq 0) { $hits.Add($h2) }
-            }
+        $det = [pscustomobject]@{
+            Instance = $i
+            Children = $kids
+            Net = (& $guidFilter 'sysmon_network' $gl $pl)
+            Dns = (& $guidFilter 'sysmon_dns' $gl $pl)
+            Dll = (& $guidFilter 'sysmon_image_load' $gl $pl)
+            Reg = (& $guidFilter 'sysmon_registry' $gl $pl)
+            File = (& $guidFilter 'sysmon_file_time' $gl $pl)
+        }
+        if ($det.Children.Count -gt 0 -or $det.Net.Count -gt 0 -or $det.Dns.Count -gt 0 -or $det.Dll.Count -gt 0 -or $det.Reg.Count -gt 0 -or $det.File.Count -gt 0) {
+            $perInst.Add($det)
         }
     }
 
-    Save-Rows -Name 'process_pivot' -Rows @($hits)
+    # ---- activity chain from the master timeline --------------------------
+    $chain = New-Object System.Collections.Generic.List[object]
+    $tlPath = Join-Path $script:CsvDir 'supertimeline.csv'
+    if (Test-Path $tlPath) {
+        foreach ($r in @(Import-Csv -LiteralPath $tlPath -ErrorAction SilentlyContinue)) {
+            $blob = ("$($r.Timestamp) $($r.Source) $($r.Type) $($r.Actor) $($r.Entity) $($r.Detail)").ToLower()
+            $hit = $false
+            foreach ($pn in $names) { if ($pn.Length -ge 4 -and $blob.Contains($pn)) { $hit = $true; break } }
+            if (-not $hit) { foreach ($pt in $paths) { if ($blob.Contains($pt)) { $hit = $true; break } } }
+            if (-not $hit) { foreach ($h in $hashes) { if ($blob.Contains($h)) { $hit = $true; break } } }
+            if (-not $hit) { foreach ($ip in $ips) { if ($blob.Contains($ip)) { $hit = $true; break } } }
+            if ($hit) { $chain.Add($r) }
+        }
+    }
+    $chain = [System.Collections.Generic.List[object]]@($chain | Sort-Object { "$($_.Timestamp)" } | Select-Object -First 500)
+
+    # ---- entity groups (path+hash keyed; masquerade split) ----------------
+    $groups = New-Object System.Collections.Generic.List[object]
+    $hashByPath = @{}
+    $phPath = Join-Path $script:CsvDir 'process_hashes.csv'
+    if (Test-Path $phPath) {
+        foreach ($r in @(Import-Csv -LiteralPath $phPath -ErrorAction SilentlyContinue)) {
+            $pn = ("$($r.Path)" -replace '(?i)^\\device\\harddiskvolume\d+', 'C:').ToLower()
+            if ($pn -and -not $hashByPath[$pn]) { $hashByPath[$pn] = "$($r.SHA256)" }
+        }
+    }
+    foreach ($pt in $paths) {
+        $gHits = @($hits | Where-Object { "$($_.Detail)".ToLower().Contains($pt) })
+        $gName = (Split-Path $pt -Leaf)
+        if (-not $gName) { $gName = $pt }
+        $groups.Add([pscustomobject]@{
+            Key = $pt; Name = $gName; Path = $pt
+            Hash = $hashByPath[$pt]
+            HitCount = $gHits.Count
+            FirstSeen = ($gHits | Where-Object { "$($_.Time)" } | Sort-Object { "$($_.Time)" } | Select-Object -First 1).Time
+            LastSeen = ($gHits | Where-Object { "$($_.Time)" } | Sort-Object { "$($_.Time)" } | Select-Object -Last 1).Time
+        })
+    }
+    $masq = @()
+    $byLeaf = @($groups | Group-Object Name | Where-Object { $_.Count -gt 1 })
+    foreach ($m in $byLeaf) { $masq += $m.Name }
+
+    # ---- write outputs ----------------------------------------------------
+    $hits.ToArray() | Export-Csv -LiteralPath (Join-Path $focusDir 'focus_hits.csv') -NoTypeInformation -Encoding UTF8
+    $chain.ToArray() | Export-Csv -LiteralPath (Join-Path $focusDir 'focus_chain.csv') -NoTypeInformation -Encoding UTF8
+    $instances.ToArray() | Export-Csv -LiteralPath (Join-Path $focusDir 'focus_instances.csv') -NoTypeInformation -Encoding UTF8
+    @{
+        Indicator = $Indicator
+        GeneratedUTC = (Get-Date).ToUniversalTime().ToString('o')
+        Computer = "$($meta.Computer)"
+        CaseID = "$($meta.CaseID)"
+        Rounds = $round
+        Names = $names.ToArray()
+        Paths = $paths.ToArray()
+        Hashes = $hashes.ToArray()
+        Pids = $pids.ToArray()
+        Guids = $guids.ToArray()
+        Ips = $ips.ToArray()
+        SourcesHit = $sourcesHit
+        HitCount = $hits.Count
+        InstanceCount = $instances.Count
+        Degraded = (-not ($guids.Count -gt 0))
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $focusDir 'focus_terms.json') -Encoding UTF8
+
+    # ---- standalone dossier ------------------------------------------------
+    $esc = { param($s) ("$s" -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;') }
+    $buildGraph = {
+        # deterministic layered activity map: parents -> instances -> children -> what they did.
+        # Pure inline SVG - no JS, no external dependency, prints and screenshots fine.
+        $E2 = { param($s) ("$s" -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;') }
+        $clip = { param($s, $n) $t = "$s"; if ($t.Length -gt $n) { $t.Substring(0, [Math]::Max(1, $n - 1)) + '...' } else { $t } }
+        $XP = 16; $XI = 290; $XC = 570; $XA = 820; $WI = 240
+        $nodes = New-Object System.Collections.Generic.List[object]
+        $edges = New-Object System.Collections.Generic.List[object]
+        $yP = 50; $yI = 50; $yC = 50; $yA = 50
+        $parents = New-Object System.Collections.Generic.List[string]
+        foreach ($p in $instances) { $pv = "$($p.Parent)".Trim(); if ($pv -and -not $parents.Contains($pv) -and $parents.Count -lt 8) { $parents.Add($pv) } }
+        foreach ($pv in $parents) {
+            $nodes.Add([pscustomobject]@{ Id = "p:$pv"; X = $XP; Y = $yP; W = 240; H = 38; Label = (& $clip $pv 34); Sub = 'parent process'; Fill = '#253044'; Stroke = '#3a4a63' })
+            $yP += 52
+        }
+        $instNodes = @{}
+        $shown = 0
+        foreach ($i in $instances) {
+            if ($shown -ge 12) { break }
+            $shown++
+            $leaf = Split-Path "$($i.Image)" -Leaf
+            if (-not $leaf) { $leaf = "$($i.Image)" }
+            $nodes.Add([pscustomobject]@{ Id = "i:$($i.Pid)|$($i.Image)".ToLower(); X = $XI; Y = $yI; W = $WI; H = 44; Label = (& $clip $leaf 24); Sub = (& $clip "PID $($i.Pid) $($i.User)" 34); Fill = '#3a1518'; Stroke = '#a33' })
+            $instNodes["$($i.Pid)|$($i.Image)".ToLower()] = "i:$($i.Pid)|$($i.Image)".ToLower()
+            $yI += 58
+        }
+        if ($instances.Count -gt 12) {
+            $nodes.Add([pscustomobject]@{ Id = 'i:more'; X = $XI; Y = $yI; W = $WI; H = 24; Label = "+ $($instances.Count - 12) more instance(s)"; Sub = ''; Fill = '#1d2330'; Stroke = '#345' })
+            $yI += 38
+        }
+        foreach ($pd in $perInst) {
+            $srcInst = $instNodes["$($pd.Instance.Pid)|$($pd.Instance.Image)".ToLower()]
+            foreach ($k in $pd.Children) {
+                $kk = "$($k.ProcessId)|$($k.Image)".ToLower()
+                $nid = "c:$kk"
+                if (-not (@($nodes | Where-Object Id -eq $nid).Count)) {
+                    if ((@($nodes | Where-Object { "$($_.Id)" -like 'c:*' }).Count) -ge 14) { break }
+                    $leaf = Split-Path "$($k.Image)" -Leaf
+                    if (-not $leaf) { $leaf = "$($k.Image)" }
+                    $nodes.Add([pscustomobject]@{ Id = $nid; X = $XC; Y = $yC; W = 240; H = 38; Label = (& $clip $leaf 24); Sub = (& $clip "child PID $($k.ProcessId)" 32); Fill = '#33290f'; Stroke = '#c93' })
+                    $yC += 52
+                }
+                if ($srcInst) { $edges.Add(@{ F = $srcInst; T = $nid }) }
+            }
+            if (-not $srcInst) { continue }
+            $chips = New-Object System.Collections.Generic.List[string]
+            foreach ($n in @($pd.Net | Select-Object -First 2)) { $chips.Add("NET $($n.DestIp):$($n.DestPort)") }
+            foreach ($d in @($pd.Dns | Select-Object -First 2)) { $chips.Add("DNS $(& $clip $d.QueryName 26)") }
+            foreach ($d in @($pd.Dll | Select-Object -First 2)) { $chips.Add("DLL $(& $clip (Split-Path "$($d.Dll)" -Leaf) 26)") }
+            foreach ($f in @($pd.File | Select-Object -First 2)) { $chips.Add("FILE $(& $clip (Split-Path "$($f.TargetFilename)" -Leaf) 26)") }
+            foreach ($r in @($pd.Reg | Select-Object -First 1)) { $chips.Add("REG $(& $clip (Split-Path "$($r.TargetObject)" -Leaf) 26)") }
+            $n2 = 0
+            foreach ($chip in $chips) {
+                if ($n2 -ge 8) { break }
+                $nid = "a:$($pd.Instance.Pid):$n2"
+                $nodes.Add([pscustomobject]@{ Id = $nid; X = $XA; Y = $yA; W = 300; H = 24; Label = (& $clip $chip 40); Sub = ''; Fill = '#1f2a3d'; Stroke = '#3a5a83' })
+                $edges.Add(@{ F = $srcInst; T = $nid })
+                $yA += 30
+                $n2++
+            }
+        }
+        $H = [Math]::Max($yP, [Math]::Max($yI, [Math]::Max($yC, $yA))) + 20
+        $g = New-Object System.Text.StringBuilder
+        [void]$g.AppendLine("<svg viewBox='0 0 1140 $H' style='width:100%;max-width:1140px;background:#10141c;border:1px solid #2a3040;border-radius:6px'>")
+        foreach ($c in @(@('PARENTS', $($XP + 4)), @('INSTANCES', $($XI + 4)), @('CHILDREN', $($XC + 4)), @('WHAT IT DID', $($XA + 4)))) {
+            [void]$g.AppendLine("<text x='$($c[1])' y='28' fill='#6b7a91' font-size='11' font-weight='bold' font-family='Segoe UI,sans-serif'>$($c[0])</text>")
+        }
+        foreach ($e in $edges) {
+            $f = @($nodes | Where-Object Id -eq $e.F)[0]
+            $t = @($nodes | Where-Object Id -eq $e.T)[0]
+            if (-not $f -or -not $t) { continue }
+            $x1 = $f.X + $f.W; $y1 = $f.Y + [Math]::Floor($f.H / 2); $x2 = $t.X; $y2 = $t.Y + [Math]::Floor($t.H / 2)
+            [void]$g.AppendLine("<line x1='$x1' y1='$y1' x2='$x2' y2='$y2' stroke='#3a4a63' stroke-width='1'/>")
+        }
+        foreach ($n in $nodes) {
+            [void]$g.AppendLine("<rect x='$($n.X)' y='$($n.Y)' width='$($n.W)' height='$($n.H)' rx='6' fill='$($n.Fill)' stroke='$($n.Stroke)'/>")
+            if ($n.Sub) {
+                [void]$g.AppendLine("<text x='$($n.X + 10)' y='$($n.Y + 17)' fill='#e0e6ee' font-size='12' font-family='Segoe UI,sans-serif'>$(& $E2 $n.Label)</text>")
+                [void]$g.AppendLine("<text x='$($n.X + 10)' y='$($n.Y + 33)' fill='#8a97a8' font-size='10' font-family='Segoe UI,sans-serif'>$(& $E2 $n.Sub)</text>")
+            } else {
+                $mid = $n.Y + [Math]::Floor($n.H / 2) + 4
+                [void]$g.AppendLine("<text x='$($n.X + 10)' y='$mid' fill='#c5cdda' font-size='11' font-family='Consolas,monospace'>$(& $E2 $n.Label)</text>")
+            }
+        }
+        [void]$g.AppendLine('</svg>')
+        return $g.ToString()
+    }
+    if ($hits.Count -gt 0) {
+        $detSrcs = '^(yara_hits|defender_threats|flash_ioc_hits|ioc_hits_|memory_malfind)'
+        $sigSrcs = '^(beacon_candidates|dns_beacon_candidates|hunt_findings|hayabusa_timeline|flash_process_scored|loldrivers_hits)'
+        $detHits = @($hits | Where-Object { "$($_.Source)" -match $detSrcs })
+        $sigHits = @($hits | Where-Object { "$($_.Source)" -match $sigSrcs })
+        $hint = 'REVIEW'; $hintCls = 'info'; $hintTxt = 'No scanner/detection sources corroborated this entity in this case - review the evidence manually (absence of detections is not absence of malware).'
+        if ($detHits.Count -gt 0) { $hint = 'CORROBORATED'; $hintCls = 'crit'; $hintTxt = "Detection sources flagged this entity ($($detHits.Count) row(s)): YARA/Defender/IOC/malfind. Treat as malicious until proven otherwise." }
+        elseif ($sigHits.Count -gt 0) { $hint = 'SUSPICIOUS'; $hintCls = 'med'; $hintTxt = "Sigma/hunt/beacon sources light up around this entity ($($sigHits.Count) row(s)). Strong investigation candidate." }
+        $h = New-Object System.Text.StringBuilder
+        [void]$h.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira focus - $Indicator</title><style>body{background:#141821;color:#cdd3dc;font:13px/1.45 'Segoe UI',sans-serif;margin:20px}h1{color:#eee;font-size:20px}h2{color:#7ab;font-size:15px;border-bottom:1px solid #2a3040;padding-bottom:4px;margin-top:26px}h3{color:#9bd;font-size:13px;margin-top:18px}table{border-collapse:collapse;margin:8px 0;width:100%}th,td{border:1px solid #2a3040;padding:4px 8px;text-align:left;vertical-align:top}th{background:#1d2330;color:#9ab}.path{font-family:Consolas,monospace;font-size:12px;word-break:break-all}td{word-break:break-word}.banner{padding:12px 16px;border-radius:6px;margin:12px 0;font-weight:bold}.crit{background:#3a1518;color:#f88;border:1px solid #722}.med{background:#33290f;color:#fc6;border:1px solid #663}.info{background:#1d2330;color:#8ac;border:1px solid #345}.meta{color:#788;font-size:12px;margin:6px 0}.warn{color:#fc6}</style></head><body>")
+        [void]$h.AppendLine("<h1>FOCUS DOSSIER - $(& $esc $Indicator)</h1>")
+        [void]$h.AppendLine("<div class='meta'>Host: $(& $esc $meta.Computer) | Case: $(& $esc $meta.CaseID) | Generated: $((Get-Date).ToUniversalTime().ToString('u')) | Ophira v$ScriptVersion | $($hits.Count) evidence row(s) in $($round) round(s) | entity terms: $($names.Count) name / $($paths.Count) path / $($hashes.Count) hash</div>")
+        if (-not ($guids.Count -gt 0)) { [void]$h.AppendLine("<div class='banner info'><span class='warn'>Instance attribution degraded</span> - no ProcessGuid captured in this case (legacy collect or no Sysmon). Per-instance chains below are best-effort.</div>") }
+        [void]$h.AppendLine("<div class='banner $hintCls'>$hint - $hintTxt</div>")
+        if ($masq.Count -gt 0) { [void]$h.AppendLine("<div class='banner med'><span class='warn'>MASQUERADE WARNING:</span> the name appears at multiple paths - $($(& $esc ($masq -join ', '))). Compare the groups below; only one of them is probably the real OS binary.</div>") }
+        if ($perInst.Count -gt 0) {
+            [void]$h.AppendLine("<h2>Activity graph</h2>")
+            [void]$h.AppendLine((& $buildGraph))
+            [void]$h.AppendLine("<div class='meta'>Left to right: parent processes -> the focused instances (red) -> child processes they spawned (amber) -> what each instance did (blue chips: network/DNS/DLL/file/registry). Per-instance detail tables below the instance list. Degraded cases (no ProcessGuid) show fewer joins.</div>")
+        }
+        if ($groups.Count -gt 0) {
+            [void]$h.AppendLine("<h2>Entity groups (path + hash keyed)</h2><table><tr><th>Name</th><th>Path</th><th>SHA256</th><th>Hits</th><th>First seen</th><th>Last seen</th></tr>")
+            foreach ($g in $groups) {
+                [void]$h.AppendLine("<tr><td>$(& $esc $g.Name)</td><td class='path'>$(& $esc $g.Path)</td><td class='path'>$(& $esc $g.Hash)</td><td>$($g.HitCount)</td><td>$(& $esc $g.FirstSeen)</td><td>$(& $esc $g.LastSeen)</td></tr>")
+            }
+            [void]$h.AppendLine("</table>")
+        }
+        if ($instances.Count -gt 0) {
+            [void]$h.AppendLine("<h2>Instances (PID / ProcessGuid where captured)</h2><table><tr><th>PID</th><th>ProcessGuid</th><th>Started</th><th>Image</th><th>Parent</th><th>User</th><th>Source</th></tr>")
+            foreach ($i in $instances) {
+                [void]$h.AppendLine("<tr><td>$(& $esc $i.Pid)</td><td class='path'>$(& $esc $i.Guid)</td><td>$(& $esc $i.Started)</td><td class='path'>$(& $esc $i.Image)</td><td>$(& $esc $i.Parent)</td><td>$(& $esc $i.User)</td><td>$(& $esc $i.Source)</td></tr>")
+            }
+            [void]$h.AppendLine("</table>")
+        }
+        foreach ($pd in $perInst) {
+            $i3 = $pd.Instance
+            $hdr = "Instance PID $($i3.Pid)"
+            if ("$($i3.Guid)") { $hdr += " - $($i3.Guid)" }
+            if ("$($i3.User)") { $hdr += " ($($i3.User))" }
+            [void]$h.AppendLine("<h3>$(& $esc $hdr) - everything it did</h3>")
+            if ($pd.Children.Count -gt 0) {
+                [void]$h.AppendLine("<h4>Child processes ($($pd.Children.Count))</h4><table><tr><th>Time</th><th>Child</th><th>PID</th><th>User</th><th>CommandLine</th></tr>")
+                foreach ($x in @($pd.Children | Select-Object -First 25)) {
+                    [void]$h.AppendLine("<tr><td>$(& $esc $x.Time)</td><td class='path'>$(& $esc $x.Image)</td><td>$(& $esc $x.ProcessId)</td><td>$(& $esc $x.User)</td><td>$(& $esc $x.CommandLine)</td></tr>")
+                }
+                [void]$h.AppendLine("</table>")
+            }
+            if ($pd.Net.Count -gt 0) {
+                [void]$h.AppendLine("<h4>Network connections ($($pd.Net.Count))</h4><table><tr><th>Time</th><th>Destination</th><th>Protocol</th></tr>")
+                foreach ($x in @($pd.Net | Select-Object -First 25)) {
+                    [void]$h.AppendLine("<tr><td>$(& $esc $x.Time)</td><td class='path'>$(& $esc ($x.DestIp + ':' + $x.DestPort))</td><td>$(& $esc $x.Protocol)</td></tr>")
+                }
+                [void]$h.AppendLine("</table>")
+            }
+            if ($pd.Dns.Count -gt 0) {
+                [void]$h.AppendLine("<h4>DNS queries ($($pd.Dns.Count))</h4><table><tr><th>Time</th><th>Query</th><th>Results</th></tr>")
+                foreach ($x in @($pd.Dns | Select-Object -First 25)) {
+                    [void]$h.AppendLine("<tr><td>$(& $esc $x.Time)</td><td class='path'>$(& $esc $x.QueryName)</td><td class='path'>$(& $esc $x.QueryResults)</td></tr>")
+                }
+                [void]$h.AppendLine("</table>")
+            }
+            if ($pd.Dll.Count -gt 0) {
+                [void]$h.AppendLine("<h4>Modules / DLLs loaded ($($pd.Dll.Count))</h4><table><tr><th>Time</th><th>Module</th><th>Signed</th><th>Signature</th></tr>")
+                foreach ($x in @($pd.Dll | Select-Object -First 25)) {
+                    [void]$h.AppendLine("<tr><td>$(& $esc $x.Time)</td><td class='path'>$(& $esc $x.Dll)</td><td>$(& $esc $x.Signed)</td><td>$(& $esc $x.Signature)</td></tr>")
+                }
+                [void]$h.AppendLine("</table>")
+            }
+            if ($pd.File.Count -gt 0) {
+                [void]$h.AppendLine("<h4>File timestamp events ($($pd.File.Count))</h4><table><tr><th>Time</th><th>File</th><th>Previous time</th></tr>")
+                foreach ($x in @($pd.File | Select-Object -First 25)) {
+                    [void]$h.AppendLine("<tr><td>$(& $esc $x.Time)</td><td class='path'>$(& $esc $x.TargetFilename)</td><td>$(& $esc $x.PreviousCreationUtcTime)</td></tr>")
+                }
+                [void]$h.AppendLine("</table>")
+            }
+            if ($pd.Reg.Count -gt 0) {
+                [void]$h.AppendLine("<h4>Registry events ($($pd.Reg.Count))</h4><table><tr><th>Time</th><th>Type</th><th>Key</th></tr>")
+                foreach ($x in @($pd.Reg | Select-Object -First 25)) {
+                    [void]$h.AppendLine("<tr><td>$(& $esc $x.Time)</td><td>$(& $esc $x.EventType)</td><td class='path'>$(& $esc $x.TargetObject)</td></tr>")
+                }
+                [void]$h.AppendLine("</table>")
+            }
+        }
+        if ($chain.Count -gt 0) {
+            [void]$h.AppendLine("<h2>Activity chain (master timeline filtered to the entity set, oldest first)</h2><table><tr><th>Timestamp</th><th>Source</th><th>Type</th><th>Actor</th><th>Entity</th><th>Detail</th></tr>")
+            foreach ($c in @($chain | Select-Object -First 300)) {
+                [void]$h.AppendLine("<tr><td>$(& $esc $c.Timestamp)</td><td>$(& $esc $c.Source)</td><td>$(& $esc $c.Type)</td><td>$(& $esc $c.Actor)</td><td class='path'>$(& $esc $c.Entity)</td><td>$(& $esc $c.Detail)</td></tr>")
+            }
+            [void]$h.AppendLine("</table><div class='meta'>Full chain: focus\focus_chain.csv ($($chain.Count) row(s))</div>")
+        }
+        $secMap = @(
+            @{ Title = 'Detection surface'; Re = '^(yara_hits|defender_threats|flash_ioc_hits|ioc_hits_|memory_malfind|hayabusa_timeline|flash_process_scored|hunt_findings|loldrivers_hits)' },
+            @{ Title = 'Network activity'; Re = '^(sysmon_network|sysmon_dns|connections|dns_cache|net_active_probes|firewall|beacon_candidates|dns_beacon_candidates)' },
+            @{ Title = 'DLLs and image loads'; Re = '^(sysmon_image_load|sysmon_process_access)' },
+            @{ Title = 'Files and execution history'; Re = '^(sysmon_file_time|mft_recent|usn_write_bursts|prefetch|amcache|userassist|bam_lastexec|execution_timeline|recyclebin|recentfilecache|lnk_parsed|jumplist)' },
+            @{ Title = 'Registry and persistence'; Re = '^(sysmon_registry|registry_recmd|asep_sweep|autoruns|services|scheduled_tasks|wmi_|security_task_install|startup_info)' },
+            @{ Title = 'Process events'; Re = '^(security_proc_events|sysmon_proc_create|processes|process_hashes|process_chains|entities_binaries|sysmon_events)' },
+            @{ Title = 'Accounts and sessions'; Re = '^(security_auth|security_kerberos|security_ds_|session_activity|logon_sessions|saved_credentials)' },
+            @{ Title = 'Other evidence'; Re = '' }
+        )
+        $claimed = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($sec in $secMap) {
+            if ("$($sec.Re)") {
+                $secHits = @($hits | Where-Object { "$($_.Source)" -match $sec.Re -and -not $claimed.Contains("$($_.Source)") })
+            } else {
+                $secHits = @($hits | Where-Object { -not $claimed.Contains("$($_.Source)") })
+            }
+            foreach ($x in $secHits) { $null = $claimed.Add("$($x.Source)") }
+            if ($secHits.Count -eq 0) { continue }
+            [void]$h.AppendLine("<h2>$($sec.Title) ($($secHits.Count))</h2><table><tr><th>Time</th><th>Source</th><th>Matched on</th><th>Detail</th></tr>")
+            foreach ($x in @($secHits | Sort-Object { "$($_.Time)" } | Select-Object -First 200)) {
+                [void]$h.AppendLine("<tr><td>$(& $esc $x.Time)</td><td>$(& $esc $x.Source)</td><td>$(& $esc $x.MatchedOn)</td><td>$(& $esc ("$($x.Detail)" -replace ' \| ', '<br>'))</td></tr>")
+            }
+            [void]$h.AppendLine("</table>")
+        }
+        [void]$h.AppendLine("<div class='meta'>Rebuild: <b>Ophira.ps1 -Mode Focus -ParsePath &lt;case&gt; -ProcessName &lt;indicator&gt;</b> (name, PID, path fragment or hash). Chain CSV: focus\focus_chain.csv - raw hits: focus\focus_hits.csv</div>")
+        [void]$h.AppendLine("</body></html>")
+        Set-Content -LiteralPath (Join-Path $focusDir 'focus_report.html') -Value $h.ToString() -Encoding UTF8
+    }
+
+    # ---- console summary --------------------------------------------------
     Write-Host ""
     if ($hits.Count -eq 0) {
         Write-Host "No evidence found for '$Indicator' in this case." -ForegroundColor Yellow
         return $true
     }
-    Write-Host "EVIDENCE FOR '$Indicator' - $($hits.Count) row(s) across $($hits | Group-Object Source | Select-Object -ExpandProperty Count) artifact(s):" -ForegroundColor Cyan
-    foreach ($g in ($hits | Group-Object Source | Sort-Object Count -Descending)) {
-        Write-Host ("  {0,-32} x{1}" -f $g.Name, $g.Count) -ForegroundColor White
-        foreach ($h in ($g.Group | Select-Object -First 2)) {
-            $d = $h.Detail
-            if ($d.Length -gt 160) { $d = $d.Substring(0, 160) + '...' }
-            Write-Host "      $d" -ForegroundColor DarkGray
-        }
+    Write-Host "FOCUS '$Indicator' - $($hits.Count) evidence row(s) across $($sourcesHit.Keys.Count) artifact(s), $($groups.Count) entity group(s), $($instances.Count) instance(s):" -ForegroundColor Cyan
+    foreach ($g in $groups) {
+        $h = if ($g.Hash) { " sha256:$($g.Hash.Substring(0, [Math]::Min(16, $g.Hash.Length)))..." } else { '' }
+        Write-Host ("  [{0}] {1}{2}  hits:{3}" -f $g.Name, $g.Path, $h, $g.HitCount) -ForegroundColor White
     }
+    if ($masq.Count -gt 0) { Write-Host "  MASQUERADE WARNING: same name at multiple paths -> $($masq -join ', ')" -ForegroundColor Yellow }
+    foreach ($g in ($sourcesHit.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 12)) {
+        Write-Host ("  {0,-32} x{1}" -f $g.Key, $g.Value) -ForegroundColor Gray
+    }
+    if (-not ($guids.Count -gt 0)) {
+        Write-Host "  note: no ProcessGuid in this case (legacy/no-Sysmon collect) - per-instance attribution is limited" -ForegroundColor DarkYellow
+    }
+    if ($perInst.Count -gt 0) { Write-Host ("  per-instance detail joined for {0} instance(s): children / network / DNS / DLLs / file / registry" -f $perInst.Count) -ForegroundColor Gray }
     Write-Host ""
-    Write-Host "Full pivot -> csv\process_pivot.csv (in the case folder). Timeline view: csv\supertimeline.csv" -ForegroundColor Gray
+    Write-Host "Dossier -> focus\focus_report.html  (chain: focus\focus_chain.csv, hits: focus\focus_hits.csv)" -ForegroundColor Green
     return $true
 }
 
@@ -7826,6 +8345,7 @@ function Invoke-AnalyzeWizard {
     Write-Host "================================================================" -ForegroundColor Cyan
     Write-Host "  Merges OPHIRA_*.zip case files in a folder into one fleet report"
     Write-Host "  (deploy pulls results into 'collections' by default)."
+    Write-Host "  A single case folder/zip is finished automatically (parse + regenerate)."
     Write-Host "================================================================" -ForegroundColor Cyan
     while ($true) {
         $pIn = (Read-Host "  Folder with case ZIPs [$def]").Trim()
@@ -7836,6 +8356,21 @@ function Invoke-AnalyzeWizard {
             if (-not $retry) { return }
             $def = $retry
             continue
+        }
+        # v2.40 auto-parse: one case (a case.json folder, a single zip, or a folder with exactly
+        # one zip) goes straight to the parse flow - it completes what the endpoint couldn't
+        # finish and regenerates every derived artifact (report, verdict, focus).
+        $single = $null
+        if ((Test-Path -LiteralPath $path -PathType Leaf) -and $path -match '\.zip$') { $single = $path }
+        elseif (Test-Path -LiteralPath (Join-Path $path 'case.json')) { $single = $path }
+        else {
+            $zips = @(Get-ChildItem -LiteralPath $path -Filter 'OPHIRA_*.zip' -File -ErrorAction SilentlyContinue)
+            if ($zips.Count -eq 1) { $single = $zips[0].FullName }
+        }
+        if ($single) {
+            Write-Host "  Single case detected -> finishing it (analyst-side parse + regenerate)" -ForegroundColor Cyan
+            Invoke-ParseMode -Path $single | Out-Null
+            return
         }
         Invoke-AnalyzeMode -Path $path -HayabusaExe $HayabusaPath
         return
@@ -7863,7 +8398,8 @@ if ($bareLaunch -and [Environment]::UserInteractive) {
         'UpdateRules' { if (-not (Invoke-UpdateRulesMode)) { exit 1 } }
                 'Tune' { Invoke-TuneMode | Out-Null }
                 'Parse' { Invoke-ParseMode | Out-Null }
-                'Process' { Invoke-ProcessPivot | Out-Null }
+                'Focus' { Invoke-FocusEngine | Out-Null }
+                'Process' { Invoke-FocusEngine | Out-Null }
                 'Timeline' { Invoke-TimelineMode | Out-Null }
                 'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging -Target $CanaryTarget -TargetUser $CanaryTargetUser | Out-Null }
                 'Links' { Show-ToolLinks }
@@ -7890,7 +8426,8 @@ if ($Mode -ne 'Collect') {
         'UpdateRules' { Invoke-UpdateRulesMode }
         'Tune' { Invoke-TuneMode | Out-Null }
         'Parse' { Invoke-ParseMode -Path $ParsePath | Out-Null }
-        'Process' { Invoke-ProcessPivot -Path $ParsePath -Indicator $ProcessName | Out-Null }
+        'Process' { Invoke-FocusEngine -Path $ParsePath -Indicator $ProcessName | Out-Null }
+        'Focus' { Invoke-FocusEngine -Path $ParsePath -Indicator $ProcessName | Out-Null }
         'Timeline' { Invoke-TimelineMode -Path $ParsePath -Start $TimelineStart -End $TimelineEnd | Out-Null }
         'Canary' { Invoke-CanaryMode -KeepLogging:$KeepLogging -Target $CanaryTarget -TargetUser $CanaryTargetUser | Out-Null }
     }
