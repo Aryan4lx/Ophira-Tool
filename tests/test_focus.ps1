@@ -91,6 +91,13 @@ New-Csv (Join-Path $csv 'sysmon_registry.csv') '"Time","EventId","EventType","Ta
 New-Csv (Join-Path $csv 'sysmon_file_time.csv') '"Time","EventId","Image","TargetFilename","CreationUtcTime","PreviousCreationUtcTime","ProcessId","ProcessGuid"' @(
     '"2026-10-05 14:02:30.000","2","C:\Users\dev\AppData\Roaming\malware.exe","C:\Users\dev\AppData\Roaming\malware.cfg","2026-10-05 14:02:30.000","2020-01-01 00:00:00.000","4812","{7a1f-aaaa}"'
 )
+New-Csv (Join-Path $csv 'sysmon_file_create.csv') '"Time","EventId","Image","TargetFilename","CreationUtcTime","ProcessId","ProcessGuid","Hashes"' @(
+    '"2026-10-05 14:02:28.000","11","C:\Users\dev\AppData\Roaming\malware.exe","C:\Users\dev\AppData\Roaming\payload.dll","2026-10-05 14:02:28.000","4812","{7a1f-aaaa}","SHA256=DEADBEEF00000000000000000000000000000000000000000000000000001234"',
+    '"2026-10-05 14:02:29.000","11","C:\Windows\System32\notepad.exe","C:\Users\dev\AppData\Local\Temp\benign.txt","2026-10-05 14:02:29.000","777","{9999-zzzz}","SHA256=AAAA"'
+)
+New-Csv (Join-Path $csv 'sysmon_file_delete.csv') '"Time","EventId","Image","TargetFilename","ProcessId","ProcessGuid","Hashes","Archived"' @(
+    '"2026-10-05 14:21:00.000","23","C:\Users\dev\AppData\Roaming\malware.exe","C:\Users\dev\AppData\Roaming\logs.txt","4812","{7a1f-aaaa}","SHA256=CAFEBABE","false"'
+)
 
 $ok = Invoke-FocusEngine -Path $case -Indicator 'malware.exe'
 $fDir = Join-Path $case 'focus'
@@ -122,7 +129,10 @@ Check "dossier: instance rows carry PIDs" ($html -match '4812' -and $html -match
 Check "dossier: sections include detection surface + network" (($html -match 'Detection surface') -and ($html -match 'Network activity'))
 Check "dossier: corroborated hint banner from yara hit" ($html -match 'CORROBORATED')
 Check "per-instance: guid-joined detail in dossier (dns/dll/reg/file/child)" (($html -match 'evil-c2\.example') -and ($html -match 'wininet\.dll') -and ($html -match 'Run\\Malware') -and ($html -match 'malware\.cfg') -and ($html -match 'everything it did'))
+Check "per-instance: EID11 file creates joined by guid - dropped files listed" (($html -match 'Files created \(') -and ($html -match 'payload\.dll') -and ($html -match 'DEADBEEF') -and ($html -notmatch 'benign\.txt'))
+Check "per-instance: EID23 file deletes rendered as anti-forensics evidence" (($html -match 'Files deleted \(') -and ($html -match 'logs\.txt') -and ($html -match 'anti-forensics'))
 Check "graph: layered SVG with instance/child/network nodes" (($html -match '<svg') -and ($html -match 'Activity graph') -and ($html -match 'child PID 4900') -and ($html -match 'NET 185\.199\.10\.7:443'))
+Check "graph: file-drop and delete chips rendered" (($html -match 'DROP payload\.dll') -and ($html -match 'DEL logs\.txt'))
 
 # PID seed: resolves via the live snapshot to the same entity
 $ok2 = Invoke-FocusEngine -Path $case -Indicator '4812'

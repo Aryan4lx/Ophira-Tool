@@ -119,6 +119,40 @@ Check "wizard: banner mentions back" ($src -match 'Answer ''B'' at any question 
 Check "supertimeline: total cap 120000" ($src -match 'if \(\$sorted\.Count -gt 120000\)')
 Check "supertimeline: timeline preview embed removed (v2.39)" (($src -match 'Select-Object -Last 10000' -eq $false) -and ($src -match 'var TL = ' -eq $false))
 
+# ============================================================================
+# PART 6 - v2.43 config-driven analysis window (owner handoff)
+# ============================================================================
+Check "config: LOGWINDOW/LOGSTART/LOGEND/LOGHOURS keys parsed" (($src.Contains("'LOGWINDOW' { if (-not ") -and $src.Contains("'LOGSTART' { if (-not ") -and $src.Contains("'LOGEND' { if (-not ") -and $src.Contains("'LOGHOURS' {")))
+Check "config: keys honor explicit flags (not-explicitly-bound guards)" (([regex]::Matches($src, "ContainsKey\('Log(Window|Start|End|Hours)'\)")).Count -ge 4)
+Check "config: validation still exits loudly via Resolve-LogWindow" ($src -match [regex]::Escape('if ($rwErr) { Write-Host "  Ophira: $rwErr" -ForegroundColor Red; exit 1 }'))
+Check "simpleui: DONE screen shows the checked range" ($src -match [regex]::Escape('"     Checked: $(Get-LogRangeText)"'))
+
+# behavioral: config-style values through the real resolver
+$LogStart = ''; $LogEnd = ''; $LogWindow = '30d'; $LogHours = 168
+$null = Resolve-LogWindow
+$expect = (Get-Date).AddDays(-30)
+Check "config window: 30d resolves ~30 days back" ($script:LogStartDT -and [Math]::Abs(($script:LogStartDT - $expect).TotalMinutes) -lt 120)
+$LogWindow = '0'
+$null = Resolve-LogWindow
+Check "config window: 0 = all time (LogHours cleared)" ($script:LogHours -eq 0 -and -not $script:LogStartDT)
+$LogHours = 168
+$LogStart = '2026-09-20'; $LogEnd = '2026-09-28'; $LogWindow = '30d'
+$err2 = Resolve-LogWindow
+Check "config window: explicit start+end pair wins and validates" ($err2 -eq '' -and $script:LogStartDT -eq [datetime]'2026-09-20' -and $script:LogEndDT -eq [datetime]'2026-09-28')
+$LogEnd = '2026-09-10'
+$err3 = Resolve-LogWindow
+Check "config window: end before start rejected loudly" ("$err3" -match 'after')
+
+# ============================================================================
+# PART 7 - v2.43 structured Sysmon EID 11/23
+# ============================================================================
+Check "A0c: EID 11 file-create parse saved" ($src -match [regex]::Escape("Save-Rows -Name 'sysmon_file_create' -Rows"))
+Check "A0c: EID 23 file-delete parse saved" ($src -match [regex]::Escape("Save-Rows -Name 'sysmon_file_delete' -Rows"))
+Check "A0c: both carry ProcessGuid for focus joins" (($src -match [regex]::Escape('-Id @(11)')) -and ($src -match [regex]::Escape('-Id @(23)')) -and ($src -match [regex]::Escape("ProcessGuid = 'ProcessGuid'; Hashes = 'Hashes'")))
+Check "A0c: focus per-instance joins + dossier sections + DROP chips" (($src -match [regex]::Escape("FileCreate = @(& `$guidFilter 'sysmon_file_create' `$gl `$pl)")) -and ($src -match 'Files created \(') -and ($src -match 'Files deleted \(') -and ($src -match [regex]::Escape('"DROP $(& $clip')))
+Check "A0c: file create/delete woven into the master timeline" (($src -match [regex]::Escape("weave 'sysmon_file_create'")) -and ($src -match [regex]::Escape("weave 'sysmon_file_delete'")))
+Check "A0c: sortment map + evidence index cover the new CSVs" (($src -match [regex]::Escape("'sysmon_file_create' = 'logs'")) -and ($src -match [regex]::Escape("'sysmon_file_create'              = ")))
+
 Write-Host ""
 Write-Host "RESULT: $pass passed, $fail failed" -ForegroundColor $(if ($fail -eq 0) { 'Green' } else { 'Red' })
 if ($fail -gt 0) { exit 1 }

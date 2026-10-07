@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.42  -  Windows Incident Response Triage Toolkit
+Ophira v2.43  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -42,7 +42,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.42"
+$ScriptVersion = "2.43"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -109,7 +109,7 @@ if (Test-Path -LiteralPath $cfgFile) {
     try {
         foreach ($line in (Get-Content -LiteralPath $cfgFile)) {
             $l = ($line -replace '#.*$', '').Trim()
-            if ($l -match '^(SHARE|CASE|ANALYST|ROLE|TARGETS|PRESET|PUSHTOOLS|DEPLOYSHARE|THREADS)\s*=\s*(.+)$') {
+            if ($l -match '^(SHARE|CASE|ANALYST|ROLE|TARGETS|PRESET|PUSHTOOLS|DEPLOYSHARE|THREADS|LOGWINDOW|LOGSTART|LOGEND|LOGHOURS)\s*=\s*(.+)$') {
                 $val = $Matches[2].Trim()
                 switch ($Matches[1]) {
                     'SHARE' { if (-not $PSBoundParameters.ContainsKey('SharePath') -and $val) { $SharePath = $val } }
@@ -121,6 +121,12 @@ if (Test-Path -LiteralPath $cfgFile) {
                     'PUSHTOOLS' { $script:CfgPushTools = ($val -match '^(?i)(1|y|yes|true|t)$') }
                     'DEPLOYSHARE' { $script:CfgDeployShare = $val }
                     'THREADS' { $n = 0; if ([int]::TryParse($val, [ref]$n) -and $n -gt 0) { $script:CfgThreads = $n } }
+                    # v2.43 analysis-window keys for the owner handoff: pre-fill before sending the
+                    # folder; explicit flags always win; validated by Resolve-LogWindow downstream
+                    'LOGWINDOW' { if (-not $PSBoundParameters.ContainsKey('LogWindow') -and $val) { $LogWindow = $val } }
+                    'LOGSTART' { if (-not $PSBoundParameters.ContainsKey('LogStart') -and $val) { $LogStart = $val } }
+                    'LOGEND' { if (-not $PSBoundParameters.ContainsKey('LogEnd') -and $val) { $LogEnd = $val } }
+                    'LOGHOURS' { $n2 = 0; if ([int]::TryParse($val, [ref]$n2) -and $n2 -ge 0 -and -not $PSBoundParameters.ContainsKey('LogHours')) { $LogHours = $n2 } }
                 }
             }
         }
@@ -187,6 +193,7 @@ $script:CsvCatMap = @{
     'powershell_events' = 'logs'; 'sysmon_events' = 'logs'; 'sysmon_network' = 'logs'; 'sysmon_dns' = 'logs'
     'sysmon_image_load' = 'logs'; 'sysmon_process_access' = 'logs'; 'sysmon_registry' = 'logs'
     'sysmon_file_time' = 'logs'; 'sysmon_proc_create' = 'logs'
+    'sysmon_file_create' = 'logs'; 'sysmon_file_delete' = 'logs'
     'rdp_localsession' = 'logs'; 'rdp_connections' = 'logs'; 'system_events' = 'logs'; 'system_new_services' = 'logs'
     'hayabusa_timeline' = 'logs'; 'hayabusa_report' = 'logs'; 'logon_summary' = 'logs'
     'ps_decoded_commands' = 'logs'; 'yara_hits' = 'logs'; 'yara_scanned' = 'logs'
@@ -2465,6 +2472,14 @@ $script:Modules = @(
             # v2.27: EID 1 process create - OriginalFileName vs Image feeds the renamed-LOLBIN at-rest rule
             $pc = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(1) -Start $start -Cap 5000 -Fields ([ordered]@{ Image = 'Image'; OriginalFileName = 'OriginalFileName'; CommandLine = 'CommandLine'; User = 'User'; ProcessId = 'ProcessId'; ProcessGuid = 'ProcessGuid'; ParentImage = 'ParentImage'; ParentProcessGuid = 'ParentProcessGuid' })
             Save-Rows -Name 'sysmon_proc_create' -Rows $pc
+            # v2.43: EID 11 file create + EID 23 file delete w/ overwrite - the per-instance
+            # "what files did this process drop / clean up" sources (ProcessGuid joins into Focus)
+            $fc = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(11) -Start $start -Cap 5000 -Fields ([ordered]@{ Image = 'Image'; TargetFilename = 'TargetFilename'; CreationUtcTime = 'CreationUtcTime'; ProcessId = 'ProcessId'; ProcessGuid = 'ProcessGuid'; Hashes = 'Hashes' })
+            Save-Rows -Name 'sysmon_file_create' -Rows $fc
+            if ($fc.Count -ge 5000) { Write-CaseLog "    EID 11 file creates: capped at 5000 - busy box or noisy filter" 'DarkGray' }
+            $fdel = Get-EventDataRows -LogName 'Microsoft-Windows-Sysmon/Operational' -Id @(23) -Start $start -Cap 2000 -Fields ([ordered]@{ Image = 'Image'; TargetFilename = 'TargetFilename'; ProcessId = 'ProcessId'; ProcessGuid = 'ProcessGuid'; Hashes = 'Hashes'; Archived = 'Archived' })
+            Save-Rows -Name 'sysmon_file_delete' -Rows $fdel
+            if ($fdel.Count -gt 0) { Write-CaseLog "    EID 23 file deletions: $($fdel.Count) (anti-forensics / cleanup evidence)" 'Yellow' }
             Export-Evtx -LogName 'Microsoft-Windows-Sysmon/Operational' -FileName 'Sysmon_Operational.evtx'
         } }
     [pscustomobject]@{ Id = '4.4'; Cat = 'LOGS'; Name = 'RDP logs (LocalSessionManager + ConnectionManager)'; Default = $true; Quick = $false;
@@ -5265,6 +5280,8 @@ tr.techrow{cursor:pointer}
         'sysmon_proc_create'              = 'Sysmon EID 1 process create with OriginalFileName - renamed-binary at-rest evidence'
         'sysmon_registry'                 = 'Sysmon EID 13 RegistryEvent - UAC bypass / persistence data source'
         'sysmon_file_time'                = 'Sysmon EID 2 file creation-time changes - timestomping evidence'
+        'sysmon_file_create'              = 'Sysmon EID 11 file creates - what each process dropped on disk (per-instance joins in Focus)'
+        'sysmon_file_delete'              = 'Sysmon EID 23 file deletions - anti-forensics / cleanup evidence per process'
         'defender_config_events'          = 'Defender 5001/5007 - real-time protection disabled / exclusion changes (tamper)'
         'security_kerberos'               = 'Kerberos events (DC: 4768/4769/4771/4776) - Kerberoasting/spray/AS-REP data source'
         'security_ds_access'              = 'Directory-service access (DC: 4662/5136) - DCSync + AD object changes'
@@ -5406,6 +5423,8 @@ function New-SuperTimeline {
     & $weave 'sysmon_process_access' 3000 { param($r) @("$($r.Time)", 'process access (Sysmon 10)', (& $leaf $r.SourceImage), (& $leaf $r.TargetImage), "granted=$($r.GrantedAccess) trace=$(("$($r.CallTrace)" -replace '\+.*', ''))") }
     & $weave 'sysmon_registry' 3000 { param($r) @("$($r.Time)", "registry event (Sysmon 13)", (& $leaf $r.Image), "$($r.TargetObject)", "$($r.EventType)") }
     & $weave 'sysmon_file_time' 1000 { param($r) @("$($r.Time)", 'file creation time changed (Sysmon 2)', (& $leaf $r.Image), (& $leaf $r.TargetFilename), "$($r.PreviousCreationUtcTime) -> $($r.CreationUtcTime)") }
+    & $weave 'sysmon_file_create' 3000 { param($r) @("$($r.Time)", 'file created (Sysmon 11)', (& $leaf $r.Image), (& $leaf $r.TargetFilename), "$($r.TargetFilename)") }
+    & $weave 'sysmon_file_delete' 1000 { param($r) @("$($r.Time)", 'file deleted (Sysmon 23)', (& $leaf $r.Image), (& $leaf $r.TargetFilename), 'deleted by process - anti-forensics / cleanup lead') }
     # execution evidence
     $exec = Import-CaseCsv 'execution_timeline'
     if ($exec.Count -gt 0) {
@@ -6701,7 +6720,7 @@ function Get-CompromiseVerdict {
     Add-Cov 'Hunt rules' (Test-CaseCsv 'hunt_findings') 3
     Add-Cov 'Svchost masquerade audit' (Test-CaseCsv 'svchost_audit') 2
     Add-Cov 'Remote access sweep (tunnels/RA tools/SSH keys)' (Test-CaseCsv 'remote_access') 2
-    Add-Cov 'Structured telemetry (4688 / Sysmon 10-13)' ((Test-CaseCsv 'security_proc_events') -or (Test-CaseCsv 'sysmon_process_access')) 3
+    Add-Cov 'Structured telemetry (4688 / Sysmon 2-13)' ((Test-CaseCsv 'security_proc_events') -or (Test-CaseCsv 'sysmon_process_access') -or (Test-CaseCsv 'sysmon_file_create')) 3
     Add-Cov 'Kerberos/DS telemetry (DC role)' ((Test-CaseCsv 'security_kerberos') -or (Test-CaseCsv 'security_ds_access')) 3
     Add-Cov 'Web telemetry (IIS)' (Test-CaseCsv 'iis_requests') 2
     Add-Cov 'Session attribution + process lineage' ((Test-CaseCsv 'session_activity') -or (Test-CaseCsv 'process_chains')) 2
@@ -7650,16 +7669,19 @@ function Invoke-FocusEngine {
             if ($gl) { $kids = @($cache['sysmon_proc_create'] | Where-Object { "$($_.ParentProcessGuid)".ToLower() -eq $gl }) }
             elseif ($pl) { $kids = @($cache['sysmon_proc_create'] | Where-Object { "$($_.ParentImage)".ToLower() -eq "$($i.Image)".ToLower() }) }
         }
+        # @() wrappers: & scriptblock unrolls single-element results -> .Count must stay an int
         $det = [pscustomobject]@{
             Instance = $i
             Children = $kids
-            Net = (& $guidFilter 'sysmon_network' $gl $pl)
-            Dns = (& $guidFilter 'sysmon_dns' $gl $pl)
-            Dll = (& $guidFilter 'sysmon_image_load' $gl $pl)
-            Reg = (& $guidFilter 'sysmon_registry' $gl $pl)
-            File = (& $guidFilter 'sysmon_file_time' $gl $pl)
+            Net = @(& $guidFilter 'sysmon_network' $gl $pl)
+            Dns = @(& $guidFilter 'sysmon_dns' $gl $pl)
+            Dll = @(& $guidFilter 'sysmon_image_load' $gl $pl)
+            Reg = @(& $guidFilter 'sysmon_registry' $gl $pl)
+            File = @(& $guidFilter 'sysmon_file_time' $gl $pl)
+            FileCreate = @(& $guidFilter 'sysmon_file_create' $gl $pl)
+            FileDelete = @(& $guidFilter 'sysmon_file_delete' $gl $pl)
         }
-        if ($det.Children.Count -gt 0 -or $det.Net.Count -gt 0 -or $det.Dns.Count -gt 0 -or $det.Dll.Count -gt 0 -or $det.Reg.Count -gt 0 -or $det.File.Count -gt 0) {
+        if ($det.Children.Count -gt 0 -or $det.Net.Count -gt 0 -or $det.Dns.Count -gt 0 -or $det.Dll.Count -gt 0 -or $det.Reg.Count -gt 0 -or $det.File.Count -gt 0 -or $det.FileCreate.Count -gt 0 -or $det.FileDelete.Count -gt 0) {
             $perInst.Add($det)
         }
     }
@@ -7782,6 +7804,8 @@ function Invoke-FocusEngine {
             foreach ($d in @($pd.Dns | Select-Object -First 2)) { $chips.Add("DNS $(& $clip $d.QueryName 26)") }
             foreach ($d in @($pd.Dll | Select-Object -First 2)) { $chips.Add("DLL $(& $clip (Split-Path "$($d.Dll)" -Leaf) 26)") }
             foreach ($f in @($pd.File | Select-Object -First 2)) { $chips.Add("FILE $(& $clip (Split-Path "$($f.TargetFilename)" -Leaf) 26)") }
+            foreach ($f2 in @($pd.FileCreate | Select-Object -First 2)) { $chips.Add("DROP $(& $clip (Split-Path "$($f2.TargetFilename)" -Leaf) 26)") }
+            foreach ($f2 in @($pd.FileDelete | Select-Object -First 1)) { $chips.Add("DEL $(& $clip (Split-Path "$($f2.TargetFilename)" -Leaf) 26)") }
             foreach ($r in @($pd.Reg | Select-Object -First 1)) { $chips.Add("REG $(& $clip (Split-Path "$($r.TargetObject)" -Leaf) 26)") }
             $n2 = 0
             foreach ($chip in $chips) {
@@ -7894,6 +7918,20 @@ function Invoke-FocusEngine {
                 }
                 [void]$h.AppendLine("</table>")
             }
+            if ($pd.FileCreate.Count -gt 0) {
+                [void]$h.AppendLine("<h4>Files created ($($pd.FileCreate.Count))</h4><table><tr><th>Time</th><th>File</th><th>Hashes</th></tr>")
+                foreach ($x in @($pd.FileCreate | Select-Object -First 25)) {
+                    [void]$h.AppendLine("<tr><td>$(& $esc $x.Time)</td><td class='path'>$(& $esc $x.TargetFilename)</td><td class='path'>$(& $esc $x.Hashes)</td></tr>")
+                }
+                [void]$h.AppendLine("</table>")
+            }
+            if ($pd.FileDelete.Count -gt 0) {
+                [void]$h.AppendLine("<h4>Files deleted ($($pd.FileDelete.Count)) - anti-forensics / cleanup evidence</h4><table><tr><th>Time</th><th>File</th><th>Hashes</th></tr>")
+                foreach ($x in @($pd.FileDelete | Select-Object -First 25)) {
+                    [void]$h.AppendLine("<tr><td>$(& $esc $x.Time)</td><td class='path'>$(& $esc $x.TargetFilename)</td><td class='path'>$(& $esc $x.Hashes)</td></tr>")
+                }
+                [void]$h.AppendLine("</table>")
+            }
             if ($pd.Reg.Count -gt 0) {
                 [void]$h.AppendLine("<h4>Registry events ($($pd.Reg.Count))</h4><table><tr><th>Time</th><th>Type</th><th>Key</th></tr>")
                 foreach ($x in @($pd.Reg | Select-Object -First 25)) {
@@ -7913,7 +7951,7 @@ function Invoke-FocusEngine {
             @{ Title = 'Detection surface'; Re = '^(yara_hits|defender_threats|flash_ioc_hits|ioc_hits_|memory_malfind|hayabusa_timeline|flash_process_scored|hunt_findings|loldrivers_hits)' },
             @{ Title = 'Network activity'; Re = '^(sysmon_network|sysmon_dns|connections|dns_cache|net_active_probes|firewall|beacon_candidates|dns_beacon_candidates)' },
             @{ Title = 'DLLs and image loads'; Re = '^(sysmon_image_load|sysmon_process_access)' },
-            @{ Title = 'Files and execution history'; Re = '^(sysmon_file_time|mft_recent|usn_write_bursts|prefetch|amcache|userassist|bam_lastexec|execution_timeline|recyclebin|recentfilecache|lnk_parsed|jumplist)' },
+            @{ Title = 'Files and execution history'; Re = '^(sysmon_file_time|sysmon_file_create|sysmon_file_delete|mft_recent|usn_write_bursts|prefetch|amcache|userassist|bam_lastexec|execution_timeline|recyclebin|recentfilecache|lnk_parsed|jumplist)' },
             @{ Title = 'Registry and persistence'; Re = '^(sysmon_registry|registry_recmd|asep_sweep|autoruns|services|scheduled_tasks|wmi_|security_task_install|startup_info)' },
             @{ Title = 'Process events'; Re = '^(security_proc_events|sysmon_proc_create|processes|process_hashes|process_chains|entities_binaries|sysmon_events)' },
             @{ Title = 'Accounts and sessions'; Re = '^(security_auth|security_kerberos|security_ds_|session_activity|logon_sessions|saved_credentials)' },
@@ -8663,6 +8701,7 @@ if ($script:SimpleUI) {
     Write-Host ""
     Write-Host "     DONE! Everything was collected successfully." -ForegroundColor Green
     Write-Host ""
+    Write-Host "     Checked: $(Get-LogRangeText)" -ForegroundColor Gray
     if ($script:Verdict) {
         $vColor = switch ($script:Verdict.LevelRank) { 4 { 'Red' } 3 { 'Red' } 2 { 'Yellow' } 1 { 'Green' } default { 'DarkYellow' } }
         Write-Host "     RESULT: $($script:Verdict.OwnerLine)" $vColor

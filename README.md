@@ -55,7 +55,7 @@ or 7-Zip ("Extract" from the context menu).
 #   (Focus accepts a name, PID, path fragment or hash; -Mode Process is kept as an alias)
 ```
 
-**Owner handoff:** send the whole folder. They double-click `RUN-OPHIRA.bat`, accept UAC, wait 3-5 minutes. A folder window opens with the result file selected and its path is copied to the clipboard — they paste it into an email. If you pre-fill `ophira.config.txt` (SHARE=/CASE=/ANALYST=), results upload to your share automatically and there's literally nothing to send.
+**Owner handoff:** send the whole folder. They double-click `RUN-OPHIRA.bat`, accept UAC, wait 3-5 minutes. A folder window opens with the result file selected and its path is copied to the clipboard — they paste it into an email. If you pre-fill `ophira.config.txt` (SHARE=/CASE=/ANALYST=), results upload to your share automatically and there's literally nothing to send. Pre-fill `LOGWINDOW=30d` (or `LOGSTART=`/`LOGEND=` for an exact range) to widen the analysis window beyond the default 7 days - the owner's DONE screen prints the resolved range (`Checked: Last 30d`) so you can confirm it took.
 
 ## Interactive launcher (role gate + task menu)
 
@@ -71,6 +71,9 @@ Flags always win: `-SimpleUI`, `-NoMenu`, or any explicit `-Mode` skips the gate
 | Key | Effect |
 |---|---|
 | `SHARE=` / `CASE=` / `ANALYST=` | collect-mode defaults (as before) |
+| `LOGWINDOW=` | analysis window for every collection from this folder (`30d`, `3m`, `90h`, `0` = all, or a start date) - **pre-fill before owner handoff**; default 7d |
+| `LOGSTART=` / `LOGEND=` | explicit analysis range (e.g. `2026-09-20`, wins over `LOGWINDOW`) |
+| `LOGHOURS=` | plain-hours alias for the window (e.g. `720`) |
 | `ROLE=responder\|owner` | pre-selects the gate — never asked |
 | `TARGETS=` | deploy wizard default (host list or `hosts.txt`) |
 | `PRESET=Quick\|Standard` | deploy wizard depth default |
