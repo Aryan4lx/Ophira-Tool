@@ -87,6 +87,29 @@ $sigC = @(@($v.Signals) | Where-Object { $_.Signal -eq 'Sigma detection - critic
 Check "case C: single-rule crit pair demotes to floor 2" ($sigC.Count -eq 1 -and $sigC[0].Weight -eq 2)
 Check "case C: verdict SUSPICIOUS" ($v.LevelRank -eq 2)
 
+# Case D (v2.44) - single-rule HIGH storm (the live dev-box FP: 196 explicit-logon events from
+# one 4648 rule): carries NO verdict weight - a lone signature repeating is noise, not an incident
+$caseData['hayabusa_timeline.csv'] = @(1..196 | ForEach-Object {
+    [pscustomobject]@{ Timestamp = "2026-10-05 12:00:$('{0:d2}' -f ($_ % 60))"; Level = 'high'; RuleTitle = 'Explicit Logon Attempt (Susp Proc)'; RuleID = 'r4648'; Channel = 'Sec'; Details = '' }
+})
+$v = Get-CompromiseVerdict
+$sigD = @(@($v.Signals) | Where-Object { $_.Signal -eq 'Sigma detection - high' })
+Check "case D: single-rule high storm carries weight 0 (report-only)" ($sigD.Count -eq 1 -and $sigD[0].Weight -eq 0)
+Check "case D: storm detail names the Tune escape hatch" ("$($sigD[0].Detail)" -match 'single-rule storm')
+Check "case D: verdict NOT escalated by the storm" ($v.LevelRank -le 1)
+
+# Case E (v2.44) - multi-rule high corroboration (>=3 events, >=2 rules) keeps floor 2
+$caseData['hayabusa_timeline.csv'] = @(
+    [pscustomobject]@{ Timestamp = '2026-10-05 13:00:00'; Level = 'high'; RuleTitle = 'Suspicious Download'; RuleID = 'ra'; Channel = 'Sec'; Details = '' },
+    [pscustomobject]@{ Timestamp = '2026-10-05 13:01:00'; Level = 'high'; RuleTitle = 'Suspicious Download'; RuleID = 'ra'; Channel = 'Sec'; Details = '' },
+    [pscustomobject]@{ Timestamp = '2026-10-05 13:02:00'; Level = 'high'; RuleTitle = 'Mimikatz Pattern'; RuleID = 'rb'; Channel = 'Sys'; Details = '' },
+    [pscustomobject]@{ Timestamp = '2026-10-05 13:03:00'; Level = 'high'; RuleTitle = 'Mimikatz Pattern'; RuleID = 'rb'; Channel = 'Sys'; Details = '' }
+)
+$v = Get-CompromiseVerdict
+$sigE = @(@($v.Signals) | Where-Object { $_.Signal -eq 'Sigma detection - high' })
+Check "case E: multi-rule high storm keeps floor 2" ($sigE.Count -eq 1 -and $sigE[0].Weight -eq 2)
+Check "case E: verdict SUSPICIOUS from the high signal" ($v.LevelRank -eq 2)
+
 Write-Host ""
 Write-Host "RESULT: $pass passed, $fail failed" -ForegroundColor $(if ($fail -eq 0) { 'Green' } else { 'Red' })
 Remove-Item -LiteralPath $case -Recurse -Force -ErrorAction SilentlyContinue

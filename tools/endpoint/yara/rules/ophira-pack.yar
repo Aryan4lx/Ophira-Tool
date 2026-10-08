@@ -251,11 +251,17 @@ rule OPHIRA_Suspicious_Keylogger_Strings
 {
     meta:
         severity = "medium"
-        description = "Keylogger-indicative API/keyword cluster"
+        description = "Keylogger-indicative API/keyword cluster (proximity-gated: strings must sit together, e.g. one import table or code region)"
     strings:
         $a1 = "GetAsyncKeyState" wide ascii
         $a2 = "SetWindowsHookEx" wide ascii
         $a3 = "keylog" nocase wide ascii
     condition:
+        // v2.44 FP fix: all-three-anywhere matched huge legit app bundles (Electron/Node carry
+        // these strings in unrelated embedded modules - OpenCode.exe tripped it on a clean host).
+        // Real keyloggers reference both APIs inside one import table or one code region; require
+        // the cluster: APIs within 8KB of each other, the keylog keyword within 32KB of either.
         uint16(0) == 0x5A4D and all of them
+        and ((@a1 - @a2 < 8192) and (@a2 - @a1 < 8192))
+        and ((@a1 - @a3 < 32768) and (@a3 - @a1 < 32768))
 }

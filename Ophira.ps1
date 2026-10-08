@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.43  -  Windows Incident Response Triage Toolkit
+Ophira v2.44  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -42,7 +42,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.43"
+$ScriptVersion = "2.44"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -345,7 +345,12 @@ function Test-IsPublicIp {
 function Test-IsUserWritablePath {
     param([string]$Path)
     if (-not $Path) { return $false }
-    return ($Path -match '(?i)\\Users\\|\\ProgramData\\|\\Windows\\Temp\\|\\Temp\\|\\AppData\\|\\Users\\Public\\|\\PerfLogs\\|\\Intel\\|\\AMD\\|\\Windows\\Tasks\\|\\Downloads\\|\\Desktop\\|\\Temporary Internet')
+    # v2.44 FP fix: Store-app payloads under WindowsApps are TrustedInstaller-only - never flag
+    if ($Path -match '(?i)\\WindowsApps\\') { return $false }
+    # C:\Intel, C:\AMD, C:\Windows\Tasks are only user-writable AT THE DRIVE ROOT - unanchored
+    # \Intel\ also matched Store VFS paths (...\VFS\ProgramFilesX64\Intel\...) and flagged
+    # Intel's signed graphics service as running from a user-writable path
+    return ($Path -match '(?i)\\Users\\|\\ProgramData\\|\\Windows\\Temp\\|\\Temp\\|\\AppData\\|\\Users\\Public\\|\\PerfLogs\\|^[A-Za-z]:\\Intel\\|^[A-Za-z]:\\AMD\\|^[A-Za-z]:\\Windows\\Tasks\\|\\Downloads\\|\\Desktop\\|\\Temporary Internet')
 }
 
 function Get-SignatureInfo {
@@ -6301,24 +6306,34 @@ function New-HuntFindings {
     }
     $now = (Get-Date).ToUniversalTime()
     $tfSeen = @{}
+    # v2.44 FP exclusions (verified on a clean dev box): Windows servicing stages binaries in
+    # WinSxS\Temp\InFlight (FILE_NAME birth = staging time, $Si = original catalog time - the
+    # skew is legitimate), browser updaters re-create binaries under \updated\ / versioned
+    # \Application\<ver>\ dirs (amcache remembers the OLD file - "ran before it existed" is the
+    # updater, not timestomping), Store VFS lives under WindowsApps, and .lnk copies keep their
+    # original $Si (870-day "skews" on Start-Menu shortcuts are normal). The two birth-attribute
+    # checks therefore run on PE files outside those paths only; future-birth stays unconditional.
+    $tfSkipRe = '(?i)\\WinSxS\\Temp\\InFlight\\|\\WinSxS\\Backup\\|\\WindowsApps\\|\\(Mozilla Firefox|Mozilla Thunderbird|Google\\Chrome|Microsoft\\Edge|BraveSoftware\\Brave-Browser)\\(updated|Application\\[0-9][0-9.]*\\)'
+    $tfPeRe = '(?i)\.(exe|dll|sys|ocx|scr|cpl)$'
     foreach ($m in (@($mftByLeaf.Values) | Select-Object -First 200)) {
         $lf = ''
         try { $lf = (Split-Path "$($m.Path)" -Leaf).ToLower() } catch { }
         if (-not $lf -or $tfSeen.ContainsKey($lf)) { continue }
         $birth = $null; try { $birth = [datetime]"$($m.Created)" } catch { }
         if (-not $birth) { continue }
+        $attrOk = ("$($m.Path)" -notmatch $tfSkipRe) -and ("$($m.Path)" -match $tfPeRe)
         $checks = New-Object System.Collections.Generic.List[string]
         if (($birth - $now).TotalDays -gt 1) {
             $null = $checks.Add("birth '$($m.Created)' is in the future (backdated or clock-skewed)")
         }
-        if ("$($m.CreatedFN)") {
+        if ($attrOk -and "$($m.CreatedFN)") {
             $bfn = $null; try { $bfn = [datetime]"$($m.CreatedFN)" } catch { }
             if ($bfn -and ([math]::Abs(($birth - $bfn).TotalDays) -gt 90)) {
                 $null = $checks.Add("birth attributes disagree: `$Si $($m.Created) vs FILE_NAME $($m.CreatedFN) ($([math]::Abs([math]::Round(($birth - $bfn).TotalDays))) day skew - classic backdated `$Si)")
             }
         }
         $am = $amcByLeaf[$lf]
-        if ($am -and $am.T -and (($birth - $am.T).TotalDays -gt 1)) {
+        if ($attrOk -and $am -and $am.T -and (($birth - $am.T).TotalDays -gt 1)) {
             $null = $checks.Add("execution evidence ($($am.Src)) at $($am.T.ToString('s')) predates claimed birth $($m.Created) (ran before it existed)")
         }
         if ($checks.Count -eq 0) { continue }
@@ -6651,6 +6666,12 @@ function Get-CompromiseVerdict {
     # SUSPICIOUS - visible, weighty, but not a compromise declaration on its own.
     $hayCritRules = @($hayCrit | Group-Object RuleTitle).Count
     $critFloor = if ($hayCrit.Count -ge 3 -and $hayCritRules -ge 2) { 3 } else { 2 }
+    # v2.44 FP fix: same storm gate for high - one rule can never carry verdict weight at any
+    # level. 196 events from ONE high rule is one noisy signature (e.g. 4648-explicit-logon
+    # firing on an admin workstation's every remote PowerShell), not an incident. Multi-rule
+    # corroboration (>=3 events from >=2 rules) earns floor 2; single-rule highs stay
+    # report-only (weight 0 row keeps the story visible in the verdict).
+    $highFloor = if ($hayHigh.Count -ge 3 -and $hayHighRules -ge 2) { 2 } else { 0 }
     $procHigh = @($proc | Where-Object { "$($_.Verdict)" -eq 'HIGH' }).Count
     $procMed = @($proc | Where-Object { "$($_.Verdict)" -eq 'MEDIUM' }).Count
     $yaraHi = @($yara | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' }).Count
@@ -6688,7 +6709,7 @@ function Get-CompromiseVerdict {
     Add-Signal 'YARA hit - medium rule' 2 $yaraMed (($yara | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { $_.Rule }) -join '; ')
     Add-Signal 'C2 beaconing - periodic callbacks' 2 $beaconMed (($beacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.RemoteIp) every ~$($_.MedianIntervalSec)s" }) -join '; ')
     Add-Signal 'C2 DNS beaconing - periodic domain queries' 2 $dnsMed (($dnsBeacons | Where-Object { "$($_.Severity)" -match '^(?i)medium$' } | Select-Object -First 3 | ForEach-Object { "$($_.Process) -> $($_.Domain) every ~$($_.MedianIntervalSec)s" }) -join '; ')
-    Add-Signal 'Sigma detection - high' 2 $hayHigh.Count "$($hayHigh.Count) events from $hayHighRules distinct rules"
+    Add-Signal 'Sigma detection - high' $highFloor $hayHigh.Count "$($hayHigh.Count) events from $hayHighRules distinct rules$(if ($highFloor -eq 0 -and $hayHigh.Count -gt 0) { ' - single-rule storm carries no verdict weight (see -Mode Tune)' })"
     Add-Signal 'Process anomaly verdict HIGH' 2 $procHigh (($proc | Where-Object { "$($_.Verdict)" -eq 'HIGH' } | Select-Object -First 3 | ForEach-Object { $_.Name }) -join '; ')
     Add-Signal 'Defender detection history' 2 @($def).Count "antivirus detected something during retention window"
     Add-Signal 'Security tooling tampering / log clearing' 2 $gapTamper "log cleared or security service stopped"
