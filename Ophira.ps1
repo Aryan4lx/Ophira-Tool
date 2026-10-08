@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.44  -  Windows Incident Response Triage Toolkit
+Ophira v2.45  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -42,7 +42,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.44"
+$ScriptVersion = "2.45"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -750,6 +750,7 @@ function Invoke-SetupMode {
             if ($t.Zip) {
                 $dest = Join-Path (Join-Path $toolsDir $target) $t.Name
                 $keepRules = $null
+                if ($t.Name -eq 'hayabusa') { $keepTuning = Join-Path $dest 'ophira-level-tuning.txt' } else { $keepTuning = $null }
                 if ($t.Name -eq 'yara') {
                     $keepRules = Join-Path $dest 'rules'
                     if (Test-Path $keepRules) {
@@ -757,11 +758,20 @@ function Invoke-SetupMode {
                         if (Test-Path $bak) { Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue }
                         Move-Item -LiteralPath $keepRules -Destination $bak -Force -ErrorAction SilentlyContinue
                     } else { $keepRules = $null }
+                } else { $keepRules = $null }
+                if ($keepTuning -and (Test-Path $keepTuning)) {
+                    $bak2 = "$keepTuning.bak"
+                    Move-Item -LiteralPath $keepTuning -Destination $bak2 -Force -ErrorAction SilentlyContinue
                 }
                 if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
                 Expand-Archive -LiteralPath $tmp -DestinationPath $dest -Force -ErrorAction Stop
                 Get-ChildItem -Path $dest -Recurse -File -ErrorAction SilentlyContinue | Unblock-File
                 if ($keepRules -and (Test-Path "$keepRules.bak")) { Move-Item -LiteralPath "$keepRules.bak" -Destination $keepRules -Force -ErrorAction SilentlyContinue }
+                if ($keepTuning -and (Test-Path "$keepTuning.bak")) {
+                    Move-Item -LiteralPath "$keepTuning.bak" -Destination $keepTuning -Force -ErrorAction SilentlyContinue
+                    $hExe = Get-ChildItem -Path $dest -Recurse -Filter 'hayabusa*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch 'live-response' } | Select-Object -First 1
+                    Apply-ShippedRuleTuning -HayabusaExe $hExe
+                }
                 Write-Host "  extracted -> tools\$($t.Name)\" -ForegroundColor Green
             } else {
                 Copy-Item -LiteralPath $tmp -Destination (Join-Path $toolsDir $assetName) -Force -ErrorAction Stop
@@ -4385,6 +4395,13 @@ a{color:#8ab4f8} .foot{margin-top:40px;color:#565e6b;font-size:11px}
 .confbar{height:18px}
 .conftext{position:absolute;left:10px;top:1px;font-size:12px;font-weight:700;color:#d7dce3}
 .sig{display:inline-block;background:#232833;border:1px solid #333b49;border-radius:6px;padding:6px 10px;margin:3px 6px 3px 0;font-size:12px}
+.donow{background:#3a2a10;border:1px solid #b93;border-radius:8px;padding:10px 14px;margin-top:12px;font-size:13px;color:#ffd57a}
+.lead{background:#181b21;border:1px solid #2a2f3a;border-left:4px solid #666;border-radius:8px;padding:12px 16px;margin:10px 0}
+.lead-crit{border-left-color:#e05252;background:#221418}
+.lead-med{border-left-color:#c9a227;background:#211d12}
+.leadtitle{font-size:15px;font-weight:700;color:#e8ecf2}
+.leadclass{font-size:12px;font-weight:400;color:#9aa6b6;margin-left:8px}
+.chip{display:inline-block;background:#243447;color:#9ec1f0;border-radius:10px;padding:2px 10px;margin:2px 4px 2px 0;font-size:11px}
 .cov-ok{color:#7ee2a8}.cov-miss{color:#ff8789}
 .tac{display:inline-block;padding:5px 12px;border-radius:14px;margin:3px 6px 3px 0;font-size:12px;font-weight:600;background:#243447;color:#9ec1f0}
 .tac.hi{background:#5c1a1e;color:#ff8789}.tac.md{background:#5c470f;color:#ffce6b}
@@ -4404,7 +4421,7 @@ tr.techrow{cursor:pointer}
     $null = $sb.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Ophira - $Computer</title>$css</head><body>")
     $null = $sb.AppendLine("<h1>OPHIRA COMPROMISE ASSESSMENT REPORT</h1>")
     $null = $sb.AppendLine("<div class='meta'>Host: $Computer &nbsp;|&nbsp; Case: $(ConvertTo-HtmlEsc $script:CurrentCaseID) &nbsp;|&nbsp; Analyst: $(ConvertTo-HtmlEsc $script:CurrentAnalyst) &nbsp;|&nbsp; Collected: $($StartTime.ToString('u')) &nbsp;|&nbsp; Ophira v$ScriptVersion &nbsp;|&nbsp; Sysmon: $(if ($Sysmon) { 'yes' } else { 'no' }) &nbsp;|&nbsp; Elevated: $(if (Test-IsAdmin) { 'yes' } else { 'NO' })</div>")
-    $null = $sb.AppendLine("<div class='nav'><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#timeline'>Timeline</a><a href='#snapshot'>Snapshot</a><a href='#drivers'>Drivers</a><a href='#hunt'>Hunt</a><a href='#entities'>Connections</a><a href='#focus'>Focus</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
+    $null = $sb.AppendLine("<div class='nav'><a href='#leads'>Leads</a><a href='#verdict'>Verdict</a><a href='#coverage'>Coverage</a><a href='#attack'>ATT&CK</a><a href='#ioc'>IOCs</a><a href='#tactics'>Findings by tactic</a><a href='#yara'>YARA</a><a href='#processes'>Processes</a><a href='#sigma'>Sigma</a><a href='#logons'>Logons</a><a href='#persistence'>Persistence</a><a href='#filesystem'>File system</a><a href='#beacons'>Beaconing</a><a href='#network'>Network</a><a href='#timeline'>Timeline</a><a href='#snapshot'>Snapshot</a><a href='#drivers'>Drivers</a><a href='#hunt'>Hunt</a><a href='#entities'>Connections</a><a href='#focus'>Focus</a><a href='#recommendations'>Recommendations</a><a href='#evidence'>Evidence index</a></div>")
 
     # ---------- verdict banner ----------
     $null = $sb.AppendLine("<a name='verdict'></a><h2>Verdict</h2>")
@@ -4414,11 +4431,34 @@ tr.techrow{cursor:pointer}
         $null = $sb.AppendLine("<p class='vtitle'>$(ConvertTo-HtmlEsc $v.Level)</p>")
         $null = $sb.AppendLine("<p class='vowner'>$(ConvertTo-HtmlEsc $v.OwnerLine) &nbsp; Confidence: $($v.ConfidencePercent)% (evidence coverage)</p>")
         $null = $sb.AppendLine("<div class='confwrap'><div class='confbar' style='width:$([math]::Min(100, [int]$v.ConfidencePercent))%;background:#b93'></div><div class='conftext'>$($v.ConfidencePercent)% of weighted evidence sources collected</div></div>")
+        # v2.45: rank-specific first actions - the 30-minute decision starts here
+        $donow = @{
+            4 = 'Isolate the host from the network NOW. Capture RAM before any reboot. Treat every credential used on this host as compromised and start scoping other hosts.'
+            3 = 'Isolate or network-restrict this host and preserve volatile evidence (RAM) before any reboot. Work the leads below top-down; verify each against the cited evidence.'
+            2 = 'Enough suspicious evidence exists to justify a closer look before this host returns to service - work the leads below.'
+        }
+        if ($donow[[int]$v.LevelRank]) { $null = $sb.AppendLine("<div class='donow'><b>Do now:</b> $(ConvertTo-HtmlEsc $donow[[int]$v.LevelRank])</div>") }
         if (@($v.Signals).Count -gt 0) {
-            $null = $sb.AppendLine("<p style='margin-top:12px'><b>Contributing signals</b></p>")
+            $null = $sb.AppendLine("<p style='margin-top:12px'><b>Contributing signals</b> (click a signal to jump to its evidence)</p>")
             foreach ($s in @($v.Signals)) {
                 $wcol = if ($s.Weight -ge 4) { 'crit' } elseif ($s.Weight -ge 3) { 'high' } elseif ($s.Weight -ge 2) { 'med' } else { 'info' }
-                $null = $sb.AppendLine("<div class='sig'><span class='$wcol'>[w$($s.Weight)]</span> $(ConvertTo-HtmlEsc $s.Signal) x$($s.Count) $(if ("$($s.Detail)") { " - <span class='path'>$(ConvertTo-HtmlEsc $s.Detail)</span>" })</div>")
+                $anc = ''
+                if ("$($s.Signal)" -match '^YARA') { $anc = 'yara' }
+                elseif ("$($s.Signal)" -match '^Sigma') { $anc = 'sigma' }
+                elseif ("$($s.Signal)" -match '^C2') { $anc = 'beacons' }
+                elseif ("$($s.Signal)" -match '^Process anomaly') { $anc = 'processes' }
+                elseif ("$($s.Signal)" -match '^IOC') { $anc = 'ioc' }
+                elseif ("$($s.Signal)" -match '^Hunt technique') { $anc = 'hunt' }
+                elseif ("$($s.Signal)" -match '^Uncommon persistence') { $anc = 'persistence' }
+                elseif ("$($s.Signal)" -match '^Ransomware') { $anc = 'filesystem' }
+                elseif ("$($s.Signal)" -match '^Memory malfind') { $anc = 'snapshot' }
+                elseif ("$($s.Signal)" -match '^Known-malicious driver') { $anc = 'drivers' }
+                elseif ("$($s.Signal)" -match '^Defender detection') { $anc = 'snapshot' }
+                elseif ("$($s.Signal)" -match '^Security tooling') { $anc = 'coverage' }
+                elseif ("$($s.Signal)" -match '^Brute') { $anc = 'logons' }
+                $sigTxt = "$(ConvertTo-HtmlEsc $s.Signal) x$($s.Count)$(if ("$($s.Detail)") { " - <span class='path'>$(ConvertTo-HtmlEsc $s.Detail)</span>" })"
+                if ($anc) { $null = $sb.AppendLine("<div class='sig'><span class='$wcol'>[w$($s.Weight)]</span> <a href='#$anc' style='color:inherit'>$sigTxt</a></div>") }
+                else { $null = $sb.AppendLine("<div class='sig'><span class='$wcol'>[w$($s.Weight)]</span> $sigTxt</div>") }
             }
         } else {
             $null = $sb.AppendLine("<p style='margin-top:12px' class='meta'>No compromising signals were observed in the collected evidence.</p>")
@@ -4432,6 +4472,68 @@ tr.techrow{cursor:pointer}
     } else {
         $null = $sb.AppendLine("<div class='vbanner v0'><p class='vtitle'>VERDICT UNAVAILABLE</p><p class='vowner'>The verdict engine did not run - review the raw sections below.</p></div>")
     }
+
+    # ---------- triage leads (v2.45: decide these first) ----------
+    # The 30-minute TP/FP workflow: the strongest signals as ranked lead cards, pure evidence -
+    # identity, why it was flagged, which evidence categories corroborate it, and the auto-built
+    # correlation story one click away in the Focus section.
+    try {
+        $leads = New-Object System.Collections.Generic.List[object]
+        foreach ($p in @(Import-CaseCsv 'flash_process_scored' | Where-Object { "$($_.Verdict)" -eq 'HIGH' -and "$($_.Name)" } | Sort-Object { ([int]"$($_.Score)") } -Descending | Select-Object -First 3)) {
+            $leads.Add([pscustomobject]@{ Rank = 'crit'; Title = "$($p.Name) (PID $($p.PID))"; Class = "malicious process - correlation score $($p.Score)"; Why = "$($p.Evidence)"; Ident = "$($p.Path)"; Extra = "signer: $(if ("$($p.Signer)") { $p.Signer } else { 'NONE' })"; Anchor = 'processes' })
+        }
+        foreach ($y in @(Import-CaseCsv 'yara_hits' | Where-Object { "$($_.File)" } | Select-Object -First 3)) {
+            $rk = if ("$($y.Severity)" -match '^(?i)(high|critical)$') { 'crit' } else { 'med' }
+            $leads.Add([pscustomobject]@{ Rank = $rk; Title = (Split-Path "$($y.File)" -Leaf); Class = "YARA $($y.Severity): $($y.Rule)"; Why = "$($y.Description)"; Ident = "$($y.File)"; Extra = ''; Anchor = 'yara' })
+        }
+        foreach ($b in @(Import-CaseCsv 'beacon_candidates' | Where-Object { "$($_.Severity)" -match '^(?i)high$' } | Select-Object -First 2)) {
+            $leads.Add([pscustomobject]@{ Rank = 'crit'; Title = "$($b.Process) -> $($b.RemoteIp):$($b.Port)"; Class = 'C2 beacon (regular callbacks)'; Why = "$($b.Events) connections over $($b.SpanMin) min, median interval ~$($b.MedianIntervalSec)s, regularity $([math]::Round(([double]"$($b.Regularity)"), 2))"; Ident = "$($b.RemoteIp)"; Extra = ''; Anchor = 'beacons' })
+        }
+        foreach ($h2 in @(Import-CaseCsv 'hunt_findings' | Where-Object { "$($_.Severity)" -eq 'high' } | Select-Object -First 2)) {
+            $leads.Add([pscustomobject]@{ Rank = 'crit'; Title = "$($h2.Entity)"; Class = "hunt rule: $($h2.Rule)"; Why = "$($h2.Evidence)"; Ident = "$($h2.Entity)"; Extra = "ATT&CK $($h2.Attck)"; Anchor = 'hunt' })
+        }
+        foreach ($io in @(Import-CaseCsv 'ioc_hits_amcache' | Select-Object -First 2)) {
+            $leads.Add([pscustomobject]@{ Rank = 'crit'; Title = "$($io.Application)"; Class = 'IOC hash match (known-bad binary ran on this host)'; Why = "SHA1 $($io.Indicator) matched the IOC feed"; Ident = "$($io.SourceFile)"; Extra = ''; Anchor = 'ioc' })
+        }
+        $leads = [System.Collections.Generic.List[object]]@(
+            @($leads | Sort-Object @{e = { if ($_.Rank -eq 'crit') { 0 } else { 1 } } } | Group-Object Title, Class | ForEach-Object { $_.Group[0] } | Select-Object -First 5)
+        )
+        $null = $sb.AppendLine("<a name='leads'></a><h2>Triage leads - decide these first</h2>")
+        if ($leads.Count -eq 0) {
+            $null = $sb.AppendLine("<div class='meta'>No signal rose to lead level - nothing here demands a decision before the reference sections.</div>")
+        } else {
+            $entByPath = @{}
+            foreach ($e2 in @(Import-CaseCsv 'entities_binaries')) { $entByPath["$($e2.Path)".ToLower()] = $e2 }
+            $ftAll = $null
+            try { $ftAll = Get-Content -LiteralPath (Join-Path (Join-Path (Split-Path -Parent $CsvDir) 'focus') 'focus_terms.json') -Raw | ConvertFrom-Json } catch { }
+            $n2 = 0
+            foreach ($ld in $leads) {
+                $n2++
+                $cls = if ($ld.Rank -eq 'crit') { 'lead lead-crit' } else { 'lead lead-med' }
+                $null = $sb.AppendLine("<div class='$cls'><div class='leadtitle'>$n2. $(ConvertTo-HtmlEsc $ld.Title) <span class='leadclass'>$(ConvertTo-HtmlEsc $ld.Class)</span></div>")
+                if ("$($ld.Ident)") { $null = $sb.AppendLine("<div class='path' style='word-break:break-all'>$(ConvertTo-HtmlEsc $ld.Ident)$(if ($ld.Extra) { " - $(ConvertTo-HtmlEsc $ld.Extra)" })</div>") }
+                if ("$($ld.Why)") { $null = $sb.AppendLine("<div style='margin-top:4px'>$(ConvertTo-HtmlEsc $ld.Why)</div>") }
+                $ent2 = $entByPath["$($ld.Ident)".ToLower()]
+                if ($ent2 -and "$($ent2.Categories)") {
+                    $chips = @("$($ent2.Categories)" -split ';' | Where-Object { $_ })
+                    $null = $sb.AppendLine("<div style='margin-top:5px' class='meta'>corroborated by $($chips.Count) evidence categories:</div><div>")
+                    foreach ($ch in $chips) { $null = $sb.AppendLine("<span class='chip'>$(ConvertTo-HtmlEsc $ch)</span>") }
+                    $null = $sb.AppendLine("</div>")
+                }
+                $focusHit = $false
+                if ($ftAll -and "$($ftAll.Indicator)") {
+                    $ind2 = "$($ftAll.Indicator)".ToLower()
+                    if ("$($ld.Title)".ToLower().Contains($ind2) -or "$($ld.Ident)".ToLower().Contains($ind2)) { $focusHit = $true }
+                }
+                if ($focusHit) {
+                    $null = $sb.AppendLine("<div style='margin-top:5px'><a href='#focus'>-> full correlation story (instances, activity graph, everything it did) in the Focus section</a></div>")
+                } else {
+                    $null = $sb.AppendLine("<div style='margin-top:5px'><a href='#$($ld.Anchor)'>-> evidence in the $(ConvertTo-HtmlEsc $ld.Anchor) section</a></div>")
+                }
+                $null = $sb.AppendLine("</div>")
+            }
+        }
+    } catch { }
     # ---------- narrative case draft (v2.31) ----------
     try {
         $draft = @(Get-CaseNarrative)
@@ -5142,6 +5244,41 @@ tr.techrow{cursor:pointer}
                     $null = $sb.AppendLine("<tr><td>$(ConvertTo-HtmlEsc $g.Name)</td><td>$($g.Count)</td></tr>")
                 }
                 $null = $sb.AppendLine("</table>")
+            }
+            # v2.45: the full correlation story embedded - activity graph + per-instance joins
+            # (from focus_instances_detail.json, written by the focus engine core)
+            $fDetail = $null
+            try { $fDetail = Get-Content -LiteralPath (Join-Path $focusDirP 'focus_instances_detail.json') -Raw | ConvertFrom-Json } catch { }
+            if ($fDetail -and "$($fDetail.GraphSvg)") {
+                $null = $sb.AppendLine("<h3>Activity graph (parents -> instances -> children -> what they did)</h3>")
+                $null = $sb.AppendLine("$($fDetail.GraphSvg)")
+                $null = $sb.AppendLine("<div class='meta'>Blue chips per instance: network / DNS / loaded DLLs / file events / drops / deletions / registry writes. Full-size version: focus\focus_report.html</div>")
+            }
+            foreach ($pd2 in @($fDetail.Instances)) {
+                if (-not $pd2) { continue }
+                $hdr2 = "Instance PID $($pd2.Pid)"
+                if ("$($pd2.Guid)") { $hdr2 += " - $($pd2.Guid)" }
+                if ("$($pd2.User)") { $hdr2 += " ($($pd2.User))" }
+                $null = $sb.AppendLine("<h3>$(ConvertTo-HtmlEsc $hdr2) - everything it did</h3>")
+                foreach ($secDef in @(
+                    @('Child processes', 'Children', @('Time', 'Child', 'PID', 'User'), { param($x) @("$($x.Time)", "$($x.Image)", "$($x.ProcessId)", "$($x.User)") }),
+                    @('Network connections', 'Net', @('Time', 'Destination', 'Process'), { param($x) @("$($x.Time)", "$($x.DestIp):$($x.DestPort)", "$($x.Image)") }),
+                    @('DNS queries', 'Dns', @('Time', 'Query', 'Process'), { param($x) @("$($x.Time)", "$($x.QueryName)", "$($x.Image)") }),
+                    @('Loaded DLLs', 'Dll', @('Time', 'DLL', 'Process'), { param($x) @("$($x.Time)", "$($x.Dll)", "$($x.Image)") }),
+                    @('Registry writes', 'Reg', @('Time', 'Key', 'Process'), { param($x) @("$($x.Time)", "$($x.TargetObject)", "$($x.Image)") }),
+                    @('File timestamp events', 'File', @('Time', 'File', 'Change'), { param($x) @("$($x.Time)", "$($x.TargetFilename)", "$($x.CreationUtcTime) <- $($x.PreviousCreationUtcTime)") }),
+                    @('Files dropped', 'FileCreate', @('Time', 'File', 'Hashes'), { param($x) @("$($x.Time)", "$($x.TargetFilename)", "$($x.Hashes)") }),
+                    @('Files deleted (anti-forensics)', 'FileDelete', @('Time', 'File', 'Archived'), { param($x) @("$($x.Time)", "$($x.TargetFilename)", "$($x.Archived)") })
+                )) {
+                    $rows2 = @($pd2.($secDef[1]))
+                    if ($rows2.Count -eq 0) { continue }
+                    $null = $sb.AppendLine("<h4>$($secDef[0]) ($($rows2.Count))</h4><table><tr>$(@($secDef[2] | ForEach-Object { "<th>$_</th>" }) -join '')</tr>")
+                    foreach ($x2 in @($rows2 | Select-Object -First 10)) {
+                        $cells = & $secDef[3] $x2
+                        $null = $sb.AppendLine("<tr>$(@($cells | ForEach-Object { "<td class='path'>$(ConvertTo-HtmlEsc $_)</td>" }) -join '')</tr>")
+                    }
+                    $null = $sb.AppendLine("</table>")
+                }
             }
         }
     }
@@ -6065,10 +6202,13 @@ function New-HuntFindings {
     $usb = @(Import-CaseCsv 'usb_devices')
     if ($usb.Count -gt 0) {
         $nonC = @()
+        # v2.45: skip the kit's own raw copies (values pointing into the case folder are the
+        # parser's .lnk preserves, not user USB activity on a non-C: drive)
         foreach ($src in @('lnk_parsed', 'shellbags')) {
             foreach ($r in (Import-CaseCsv $src)) {
                 foreach ($p2 in $r.PSObject.Properties) {
                     $v = "$($p2.Value)"
+                    if (($CaseDir -and $v -match [regex]::Escape($CaseDir)) -or $v -match '(?i)\\OPHIRA_[^\\]*\\raw\\') { continue }
                     if ($v -match '(?i)^([d-z]):\\' -and $Matches[1].ToUpper() -ne 'C:') { $nonC += "$($src.Substring(0, 3))/$($p2.Name): $v"; break }
                 }
                 if ($nonC.Count -ge 3) { break }
@@ -6903,6 +7043,30 @@ function Invoke-RegenerateOutputs {
             Write-CaseLog "    VERDICT: $($script:Verdict.Level) (confidence $($script:Verdict.ConfidencePercent)%) - $($script:Verdict.Signals.Count) signal(s), $($script:Verdict.Caveats.Count) caveat(s) -> verdict.json" $vColor
         }
     } catch { Write-CaseLog "    verdict engine failed: $($_.Exception.Message)" 'DarkYellow' }
+    # v2.45 auto-correlation: when the scoring calls a process malicious (HIGH) - or a YARA-high
+    # / live IOC fires - the focus dossier builds itself so the case ships with the "everything
+    # it did" story pre-assembled. Skipped when the analyst already focused something manually
+    # (their pick wins) and on clean cases with no seed (zero cost there).
+    try {
+        $focusTermsP = Join-Path (Join-Path $CaseDir 'focus') 'focus_terms.json'
+        if (-not (Test-Path -LiteralPath $focusTermsP)) {
+            $seed = $null; $seedWhy = ''
+            $hiProc = @(Import-CaseCsv 'flash_process_scored' | Where-Object { "$($_.Verdict)" -eq 'HIGH' -and "$($_.Name)" } | Sort-Object { ([int]"$($_.Score)") } -Descending)
+            if ($hiProc.Count -gt 0) { $seed = "$($hiProc[0].Name)"; $seedWhy = "malicious process score $($hiProc[0].Score)" }
+            if (-not $seed) {
+                $yh = @(Import-CaseCsv 'yara_hits' | Where-Object { "$($_.Severity)" -match '^(?i)(high|critical)$' -and "$($_.File)" } | Select-Object -First 1)
+                if ($yh) { $seed = (Split-Path "$($yh[0].File)" -Leaf); $seedWhy = "YARA $($yh[0].Severity) hit" }
+            }
+            if (-not $seed) {
+                $il = @(Import-CaseCsv 'flash_ioc_hits' | Where-Object { "$($_.Indicator)" } | Select-Object -First 1)
+                if ($il) { $seed = "$($il[0].Indicator)"; $seedWhy = 'live IOC hit' }
+            }
+            if ($seed) {
+                Write-CaseLog "    auto-focus: $seedWhy on '$seed' -> building the dossier (focus\focus_report.html)" 'Cyan'
+                Invoke-FocusCore -Indicator $seed -Meta ([pscustomobject]@{ Computer = "$Computer"; CaseID = "$($script:CurrentCaseID)" }) | Out-Null
+            }
+        }
+    } catch { Write-CaseLog "    auto-focus failed: $($_.Exception.Message)" 'DarkYellow' }
     try { Get-CaseNarrative | Set-Content -LiteralPath (Join-Path $CaseDir 'case_draft.txt') -Encoding UTF8 } catch { Write-CaseLog "    case draft failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-SiemExport } catch { Write-CaseLog "    siem export failed: $($_.Exception.Message)" 'DarkYellow' }
     try { New-AttackLayer } catch { Write-CaseLog "    ATT&CK layer failed: $($_.Exception.Message)" 'DarkYellow' }
@@ -7171,6 +7335,7 @@ function Invoke-UpdateRulesMode {
         $n = @(Get-ChildItem $rulesDir -Recurse -Filter '*.yml' -ErrorAction SilentlyContinue).Count
         if ($n -eq 0) { throw 'no rule files found after extract' }
         if ($bak -and (Test-Path $bak)) { Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue }
+        Apply-ShippedRuleTuning -HayabusaExe $h
         Write-Host "Rules updated ($n rule files). (Chainsaw Sigma rules: git pull in tools\chainsaw\sigma)" -ForegroundColor Green
         return $true
     } catch {
@@ -7190,6 +7355,43 @@ function Find-SigmaRuleFile {
         Select-String -Pattern ([regex]::Escape($RuleId)) -List -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($hit) { return $hit.Path }
     return $null
+}
+
+function Apply-ShippedRuleTuning {
+    # v2.45: physically rewrite rule levels from the shipped tuning list (ophira-level-tuning.txt
+    # next to the hayabusa exe). hayabusa 4.x does NOT read level_tuning.txt at scan time - it is
+    # only an input for `hayabusa level-tuning`, which rewrites the rule yml files. We do the same
+    # rewrite here (deterministic, no subprocess quirks) after Setup and after every
+    # -Mode UpdateRules, because a rules refresh replaces the whole rules folder and resets levels.
+    # Format per line: <rule-guid>,<informational|low|medium|high|critical>[ # comment]
+    param($HayabusaExe)
+    if (-not $HayabusaExe) { return }
+    $tune = Join-Path $HayabusaExe.DirectoryName 'ophira-level-tuning.txt'
+    if (-not (Test-Path -LiteralPath $tune)) { return }
+    $entries = @()
+    foreach ($line in @(Get-Content -LiteralPath $tune -ErrorAction SilentlyContinue)) {
+        if ("$line" -match '^([0-9a-fA-F-]{36}),(informational|low|medium|high|critical)\b') {
+            $entries += [pscustomobject]@{ Id = $Matches[1]; Level = $Matches[2] }
+        }
+    }
+    if ($entries.Count -eq 0) { return }
+    $rulesDir = Join-Path $HayabusaExe.DirectoryName 'rules'
+    if (-not (Test-Path $rulesDir)) { return }
+    $applied = 0
+    foreach ($y in @(Get-ChildItem -Path $rulesDir -Recurse -Filter '*.yml' -File -ErrorAction SilentlyContinue)) {
+        $raw = $null
+        try { $raw = [IO.File]::ReadAllText($y.FullName) } catch { continue }
+        if (-not $raw) { continue }
+        $newRaw = $raw
+        foreach ($e in $entries) {
+            if (-not $newRaw.Contains($e.Id)) { continue }
+            $newRaw = $newRaw -replace "(?m)^level: \w+(\s*)$", "level: $($e.Level)`$1"
+        }
+        if ($newRaw -ne $raw) {
+            try { [IO.File]::WriteAllText($y.FullName, $newRaw); $applied++ } catch { }
+        }
+    }
+    if ($applied -gt 0) { Write-Host "  shipped rule tuning applied to $applied rule file(s)" -ForegroundColor DarkGray }
 }
 
 function Invoke-TuneMode {
@@ -7475,6 +7677,20 @@ function Invoke-FocusEngine {
     if (-not $meta) { return $false }
     if (-not $Indicator) { $Indicator = (Read-Host "  Process name, PID, path fragment or hash").Trim() }
     if (-not $Indicator) { Write-Host "  no indicator given" -ForegroundColor Red; return $false }
+    return (Invoke-FocusCore -Indicator $Indicator -Meta ([pscustomobject]@{ Computer = "$($meta.Computer)"; CaseID = "$($meta.CaseID)" }))
+}
+
+function Invoke-FocusCore {
+    # Focus engine core (v2.45 split) - runs inside an already-open case session
+    # ($script:CaseDir/$script:CsvDir set). Called by Invoke-FocusEngine (analyst-side) and by
+    # the auto-focus trigger in Invoke-RegenerateOutputs: when the scoring calls a process
+    # malicious (HIGH) - or a YARA-high/IOC fires - the dossier builds itself, so every case
+    # ships with the "everything it did" story pre-assembled. Also persists
+    # focus\focus_instances_detail.json (per-instance joins + activity graph SVG) for the
+    # main report's Focus section embed.
+    param([string]$Indicator, [pscustomobject]$Meta)
+    $meta = $Meta
+    if (-not $meta) { $meta = [pscustomobject]@{ Computer = "$($script:Computer)"; CaseID = "$($script:CurrentCaseID)" } }
     $focusDir = Join-Path $script:CaseDir 'focus'
     New-Item -ItemType Directory -Path $focusDir -Force | Out-Null
     Write-Host "  Case: $($meta.Computer)  indicator: $Indicator" -ForegroundColor Gray
@@ -7864,6 +8080,7 @@ function Invoke-FocusEngine {
         [void]$g.AppendLine('</svg>')
         return $g.ToString()
     }
+    $svg = ''
     if ($hits.Count -gt 0) {
         $detSrcs = '^(yara_hits|defender_threats|flash_ioc_hits|ioc_hits_|memory_malfind)'
         $sigSrcs = '^(beacon_candidates|dns_beacon_candidates|hunt_findings|hayabusa_timeline|flash_process_scored|loldrivers_hits)'
@@ -7881,7 +8098,8 @@ function Invoke-FocusEngine {
         if ($masq.Count -gt 0) { [void]$h.AppendLine("<div class='banner med'><span class='warn'>MASQUERADE WARNING:</span> the name appears at multiple paths - $($(& $esc ($masq -join ', '))). Compare the groups below; only one of them is probably the real OS binary.</div>") }
         if ($perInst.Count -gt 0) {
             [void]$h.AppendLine("<h2>Activity graph</h2>")
-            [void]$h.AppendLine((& $buildGraph))
+            $svg = & $buildGraph
+            [void]$h.AppendLine($svg)
             [void]$h.AppendLine("<div class='meta'>Left to right: parent processes -> the focused instances (red) -> child processes they spawned (amber) -> what each instance did (blue chips: network/DNS/DLL/file/registry). Per-instance detail tables below the instance list. Degraded cases (no ProcessGuid) show fewer joins.</div>")
         }
         if ($groups.Count -gt 0) {
@@ -7997,6 +8215,28 @@ function Invoke-FocusEngine {
         [void]$h.AppendLine("</body></html>")
         Set-Content -LiteralPath (Join-Path $focusDir 'focus_report.html') -Value $h.ToString() -Encoding UTF8
     }
+
+    # ---- per-instance detail + graph for the main report embed (v2.45) ----
+    # The general report's Focus section reads this instead of re-computing the joins.
+    $detailInstances = @($perInst | ForEach-Object {
+        [pscustomobject]@{
+            Pid = "$($_.Instance.Pid)"; Guid = "$($_.Instance.Guid)"; Started = "$($_.Instance.Started)"
+            Image = "$($_.Instance.Image)"; Parent = "$($_.Instance.Parent)"; User = "$($_.Instance.User)"
+            Children = @($_.Children | Select-Object -First 25)
+            Net = @($_.Net | Select-Object -First 25)
+            Dns = @($_.Dns | Select-Object -First 25)
+            Dll = @($_.Dll | Select-Object -First 25)
+            Reg = @($_.Reg | Select-Object -First 25)
+            File = @($_.File | Select-Object -First 25)
+            FileCreate = @($_.FileCreate | Select-Object -First 25)
+            FileDelete = @($_.FileDelete | Select-Object -First 25)
+        }
+    })
+    @{
+        Indicator = $Indicator
+        GraphSvg = $svg
+        Instances = $detailInstances
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $focusDir 'focus_instances_detail.json') -Encoding UTF8
 
     # ---- console summary --------------------------------------------------
     Write-Host ""

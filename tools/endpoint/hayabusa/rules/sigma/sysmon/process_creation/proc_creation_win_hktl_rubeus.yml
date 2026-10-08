@@ -49,5 +49,5 @@ detection:
     condition: process_creation and selection
 falsepositives:
     - Unlikely
-level: critical
+level: high
 ruletype: Sigma

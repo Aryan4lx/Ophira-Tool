@@ -96,5 +96,5 @@ detection:
     condition: antivirus and (1 of selection_*)
 falsepositives:
     - Unlikely
-level: high
+level: informational
 ruletype: Sigma

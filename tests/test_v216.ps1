@@ -103,7 +103,7 @@ Check "rule lookup: unknown GUID returns null" ($null -eq (Find-SigmaRuleFile -R
 # (with auto-resolve) on a case
 # ============================================================================
 $defs = ''
-foreach ($n in @('Open-CaseSession', 'Invoke-FocusEngine')) {
+foreach ($n in @('Open-CaseSession', 'Invoke-FocusEngine', 'Invoke-FocusCore')) {
     $m2 = [regex]::Match($src, "(?s)function $n\b.*?\r?\n\}")
     if (-not $m2.Success) { throw "extract failed: $n" }
     $defs += $m2.Value + "`r`n"

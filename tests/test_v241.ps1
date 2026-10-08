@@ -23,9 +23,9 @@ Check "verdict: crit floor gated to >=3 events from >=2 distinct rules" ($src -m
 Check "verdict: sigma counts object keeps int shape (SigmaCritical.Count)" ($src -match [regex]::Escape('SigmaCritical = $hayCrit.Count'))
 Check "A0b: sysmon registry parser captures ProcessGuid" ($src -match [regex]::Escape("TargetObject = 'TargetObject'; Image = 'Image'; ProcessId = 'ProcessId'; ProcessGuid = 'ProcessGuid'"))
 Check "A0b: sysmon file-time parser captures ProcessGuid" ($src -match [regex]::Escape("PreviousCreationUtcTime = 'PreviousCreationUtcTime'; ProcessId = 'ProcessId'; ProcessGuid = 'ProcessGuid'"))
-$tune = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'tools\endpoint\hayabusa\rules\config\level_tuning.txt') -Raw
+$tune = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'tools\endpoint\hayabusa\ophira-level-tuning.txt') -Raw
 foreach ($fp in @(@('dbbfd9f3-9508-478b-887e-03ddb9236909', 'Suspicious Service Path'), @('cc429813-21db-4019-b520-2f19648e1ef1', 'Suspicious Service Name'), @('a1be9170-2ada-e8bb-285c-3e1ff336189e', 'AV Relevant File Paths'))) {
-    Check "tuning: $($fp[1]) demoted in shipped hayabusa config" ($tune -match [regex]::Escape($fp[0]))
+    Check "tuning: $($fp[1]) listed in shipped ophira-level-tuning.txt (applied to rule files by Setup/UpdateRules)" ($tune -match [regex]::Escape($fp[0]))
 }
 
 # ============================================================================

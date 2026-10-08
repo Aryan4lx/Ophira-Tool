@@ -7,7 +7,7 @@ details: 'Svc: %ServiceName% ¦ Path: %ImagePath% ¦ Acct: %AccountName% ¦ Star
 description: Tries to look for random-looking service names that are often used by malware for persistence.
 
 id: cc429813-21db-4019-b520-2f19648e1ef1
-level: high
+level: informational
 status: stable
 logsource:
     product: windows

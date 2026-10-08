@@ -56,5 +56,5 @@ detection:
     condition: security and (selection and not 1 of filter_main_*)
 falsepositives:
     - Valid DC Sync that is not covered by the filters; please report
-level: medium
+level: critical
 ruletype: Sigma

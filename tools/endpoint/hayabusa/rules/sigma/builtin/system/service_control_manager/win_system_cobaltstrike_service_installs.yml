@@ -45,5 +45,5 @@ detection:
     condition: system and (selection_id and (selection1 or selection2 or selection3 or selection4))
 falsepositives:
     - Unknown
-level: critical
+level: high
 ruletype: Sigma

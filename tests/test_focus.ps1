@@ -25,12 +25,22 @@ Check "A0: Sysmon EID3 network rows carry ProcessGuid" ($src -match [regex]::Esc
 Check "A0: Sysmon EID7 image loads carry ProcessGuid" ($src -match [regex]::Escape("ProcessId = `$d['ProcessId']; ProcessGuid = `$d['ProcessGuid']"))
 Check "report: focus section + nav anchor present" (($src -match [regex]::Escape("name='focus'")) -and ($src -match [regex]::Escape('<a href=''#focus''>Focus</a>')))
 Check "auto-parse: analyze wizard routes single cases to the parse flow" ($src -match [regex]::Escape('Single case detected -> finishing it'))
+# v2.45: auto-focus + decision-first report wiring
+Check "auto-focus: trigger fires on HIGH process / YARA high / live IOC" (($src -match [regex]::Escape("`$hiProc = @(Import-CaseCsv 'flash_process_scored' | Where-Object { `"`$(`$_.Verdict)`" -eq 'HIGH'")) -and ($src -match [regex]::Escape("`$seedWhy = `"YARA `$(`$yh[0].Severity) hit`"")) -and ($src -match [regex]::Escape("'live IOC hit'")))
+Check "auto-focus: manual dossier wins (trigger skips when terms.json exists)" ($src -match [regex]::Escape('if (-not (Test-Path -LiteralPath $focusTermsP))'))
+Check "auto-focus: Invoke-RegenerateOutputs calls the core in-session" ($src -match [regex]::Escape('Invoke-FocusCore -Indicator $seed -Meta'))
+Check "engine: core split exists as its own function" (($src -match '(?m)^function Invoke-FocusCore \{') -and ($src -match '(?m)^function Invoke-FocusEngine \{'))
+Check "engine: core persists focus_instances_detail.json" ($src -match 'focus_instances_detail\.json')
+Check "report: leads nav + section present" (($src -match [regex]::Escape("<a href='#leads'>Leads</a>")) -and ($src -match 'Triage leads - decide these first'))
+Check "report: verdict banner do-now + clickable signals" (($src -match [regex]::Escape('<b>Do now:</b>')) -and ($src -match 'click a signal to jump'))
+Check "report: focus embed reads the detail json" ($src -match [regex]::Escape('focus_instances_detail.json') -and $src -match 'Activity graph \(parents')
+Check "hunt R5: USB trail skips the kit's own raw copies" ($src -match [regex]::Escape('OPHIRA_[^\\]*\\raw\\'))
 
 # ============================================================================
 # engine behavior on a synthetic multi-instance + masquerade case
 # ============================================================================
 $defs = ''
-foreach ($n in @('Open-CaseSession', 'Invoke-FocusEngine')) {
+foreach ($n in @('Open-CaseSession', 'Invoke-FocusEngine', 'Invoke-FocusCore')) {
     $m = [regex]::Match($src, "(?s)function $n \{.*?\r?\n\}")
     if (-not $m.Success) { throw "extract failed: $n" }
     $defs += $m.Value + "`r`n"
@@ -134,6 +144,15 @@ Check "per-instance: EID23 file deletes rendered as anti-forensics evidence" (($
 Check "graph: layered SVG with instance/child/network nodes" (($html -match '<svg') -and ($html -match 'Activity graph') -and ($html -match 'child PID 4900') -and ($html -match 'NET 185\.199\.10\.7:443'))
 Check "graph: file-drop and delete chips rendered" (($html -match 'DROP payload\.dll') -and ($html -match 'DEL logs\.txt'))
 
+# v2.45: per-instance detail json for the main report embed
+$fDetail = $null
+try { $fDetail = Get-Content -LiteralPath (Join-Path $fDir 'focus_instances_detail.json') -Raw | ConvertFrom-Json } catch { }
+Check "detail: json written with indicator + graph svg" ($fDetail -and "$($fDetail.Indicator)" -eq 'malware.exe' -and "$($fDetail.GraphSvg)" -match '<svg')
+Check "detail: instance 4812 carries guid-joined sections" (@($fDetail.Instances | Where-Object { "$($_.Pid)" -eq '4812' }).Count -eq 1 -and @($fDetail.Instances | Where-Object { "$($_.Guid)" -match '7a1f-aaaa' }).Count -ge 1)
+$i4812 = @($fDetail.Instances | Where-Object { "$($_.Pid)" -eq '4812' })[0]
+Check "detail: sections populated (children/net/dns/dll/reg/file/drop/del)" ($i4812 -and @($i4812.Children).Count -ge 1 -and @($i4812.Net).Count -ge 2 -and @($i4812.Dns).Count -ge 1 -and @($i4812.Dll).Count -ge 1 -and @($i4812.Reg).Count -ge 1 -and @($i4812.File).Count -ge 1 -and @($i4812.FileCreate).Count -ge 1 -and @($i4812.FileDelete).Count -ge 1)
+Check "detail: benign notepad drop NOT in instance sections" (@($i4812.FileCreate | Where-Object { "$($_.TargetFilename)" -match 'benign\.txt' }).Count -eq 0)
+
 # PID seed: resolves via the live snapshot to the same entity
 $ok2 = Invoke-FocusEngine -Path $case -Indicator '4812'
 $hits2 = @(); try { $hits2 = @(Import-Csv -LiteralPath (Join-Path $fDir 'focus_hits.csv') -ErrorAction Stop) } catch { }
@@ -153,6 +172,46 @@ Check "degraded: no-GUID case flags attribution as limited" ($ok3 -and $terms3 -
 # empty indicator fails cleanly
 $ok4 = Invoke-FocusEngine -Path $case -Indicator 'zzz-nothing-matches-xyz'
 Check "empty result: engine still succeeds with zero-hit outputs" ($ok4 -eq $true)
+
+# ============================================================================
+# v2.45: the general report embeds the correlation (leads section + focus embed)
+# (rebuild the dossier first - the no-match probe above overwrote terms/detail json)
+$null = Invoke-FocusEngine -Path $case -Indicator 'malware.exe'
+New-Csv (Join-Path $csv 'flash_process_scored.csv') '"PID","Name","Path","Score","Verdict","Evidence","Flags","Signer"' @(
+    '"4812","malware.exe","C:\Users\dev\AppData\Roaming\malware.exe","9","HIGH","runs-from-user-path; unsigned/no-company; public-conn:185.199.10.7:443; persistence:service(2)","USER-WRITABLE-PATH",""',
+    '"500","svchost.exe","C:\Windows\System32\svchost.exe","0","LOW","","","Microsoft Corporation"'
+)
+New-Csv (Join-Path $csv 'entities_binaries.csv') '"Categories","CatCount","Name","Path","Verdict","Signer","FirstSeen","LastSeen","Hashes","Bytes","Evidence"' @(
+    '"verdict;running;hash;conn;beacon;yara;svc-persist","7","malware.exe","C:\Users\dev\AppData\Roaming\malware.exe","HIGH","","2026-10-05 14:02:11","2026-10-05 14:21:00","AAAABBBB","","runs-from-user-path"'
+)
+$rd = ''
+foreach ($n in @('ConvertTo-HtmlEsc', 'New-VtLink', 'Import-CaseCsv', 'Get-CompromiseVerdict', 'New-HtmlReport', 'Get-LvlRank', 'Split-TagList', 'Get-TacticLabel')) {
+    $m = [regex]::Match($src, "(?s)function $n\b.*?\r?\n\}")
+    if (-not $m.Success) { throw "report extract failed: $n" }
+    $rd += $m.Value + "`r`n"
+}
+Invoke-Expression $rd
+$RawDir = Join-Path $case 'raw'; $MemDir = Join-Path $case 'mem'; $CaseDir = $case
+New-Item -ItemType Directory -Path $RawDir, $MemDir -Force | Out-Null
+$Computer = 'FT'; $LogHours = 168; $script:LogStartDT = $null
+$script:CurrentCaseID = 'C-40'; $script:CurrentAnalyst = 't'; $script:DeltaBaseline = $null
+$IsAdmin = $true; $Sysmon = $true
+$StartTime = Get-Date; $script:DeltaCount = 0; $script:ShareOk = $false
+$script:EndpointAdmin = $true
+function Test-IsAdmin { $true }
+function Write-CaseLog { param([string]$Message, [string]$Color = 'Gray') }
+$script:Verdict = Get-CompromiseVerdict
+$null = New-HtmlReport
+$rep = Get-Content -LiteralPath (Join-Path $case 'report.html') -Raw
+Check "report: leads section right after the verdict block" (($rep -match 'Triage leads - decide these first') -and ($rep.IndexOf('Triage leads') -lt $rep.IndexOf("name='coverage'")))
+Check "report: HIGH process lead card with evidence + identity" (($rep -match 'malware\.exe \(PID 4812\)') -and ($rep -match 'correlation score 9') -and ($rep -match 'runs-from-user-path'))
+Check "report: lead corroboration chips from entity categories" (($rep -match 'corroborated by 7 evidence categories') -and ($rep -match 'svc-persist') -and ($rep -match 'beacon'))
+Check "report: lead links into the focus correlation story" ($rep -match "full correlation story \(instances, activity graph, everything it did\) in the Focus section")
+Check "report: do-now block for the verdict rank" ($rep -match 'Do now:')
+Check "report: signals clickable to their sections" ($rep -match 'click a signal to jump')
+Check "report: focus embed renders the activity graph inline" ($rep -match 'Activity graph \(parents -> instances -> children -> what they did\)')
+Check "report: focus embed renders per-instance sections" (($rep -match 'Instance PID 4812[^<]*everything it did') -and ($rep -match 'Files dropped \(1\)') -and ($rep -match 'payload\.dll') -and ($rep -match 'anti-forensics'))
+Check "report: focus embed excludes the benign row" ($rep -notmatch 'benign\.txt')
 
 Write-Host ""
 Write-Host "RESULT: $pass passed, $fail failed" -ForegroundColor $(if ($fail -eq 0) { 'Green' } else { 'Red' })
