@@ -25,6 +25,7 @@ $tune = Get-Content -LiteralPath $tunePath -ErrorAction SilentlyContinue
 $bad = @($tune | Where-Object { "$_" -and "$_" -notmatch '^(#|id,new_level|[0-9a-fA-F-]{36},(informational|low|medium|high|critical)\b)' })
 Check "tuning: every non-comment line parses (id,level - no full-line comments, hayabusa rejects those)" ($bad.Count -eq 0)
 Check "tuning: entries include the v2.41 clean-host demotions" (($tune -match 'dbbfd9f3-9508-478b-887e-03ddb9236909') -and ($tune -match 'cc429813-21db-4019-b520-2f19648e1ef1') -and ($tune -match 'a1be9170-2ada-e8bb-285c-3e1ff336189e'))
+Check "tuning: 4648 explicit-logon storm rule demoted to medium (v2.46)" ([bool]($tune -match '7616e857-8e41-4976-bc21-811d122b9fc9,medium'))
 Check "tuning: rules\config\level_tuning.txt kept for hayabusa's config-presence check" (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'tools\endpoint\hayabusa\rules\config\level_tuning.txt'))
 Check "tuning: Apply-ShippedRuleTuning called from Setup + UpdateRules" (([regex]::Matches($src, 'Apply-ShippedRuleTuning -HayabusaExe')).Count -ge 2)
 Check "tuning: Setup preserves ophira-level-tuning.txt across the hayabusa re-extract" ($src -match [regex]::Escape('$keepTuning = Join-Path $dest ''ophira-level-tuning.txt'''))
