@@ -1,5 +1,5 @@
 ﻿<#
-Ophira v2.46  -  Windows Incident Response Triage Toolkit
+Ophira v2.47  -  Windows Incident Response Triage Toolkit
 READ-ONLY by design: never modifies the system, only reads and copies data
 into its own output folder. Intended to be handed to a system owner or run
 by a responder during early triage / threat hunting.
@@ -42,7 +42,7 @@ param(
     [System.Management.Automation.PSCredential]$Credential
 )
 
-$ScriptVersion = "2.46"
+$ScriptVersion = "2.47"
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -5260,8 +5260,12 @@ tr.techrow{cursor:pointer}
                 if ("$($pd2.Guid)") { $hdr2 += " - $($pd2.Guid)" }
                 if ("$($pd2.User)") { $hdr2 += " ($($pd2.User))" }
                 $null = $sb.AppendLine("<h3>$(ConvertTo-HtmlEsc $hdr2) - everything it did</h3>")
+                if ("$($pd2.Respawn)") { $null = $sb.AppendLine("<div class='lead lead-med' style='padding:6px 12px'><b>$(ConvertTo-HtmlEsc $pd2.Respawn)</b></div>") }
+                if (@($pd2.Lineage).Count -gt 1) { $null = $sb.AppendLine("<div class='meta'>Arrived via: $(ConvertTo-HtmlEsc (@($pd2.Lineage) -join ' <- '))</div>") }
                 foreach ($secDef in @(
                     @('Child processes', 'Children', @('Time', 'Child', 'PID', 'User'), { param($x) @("$($x.Time)", "$($x.Image)", "$($x.ProcessId)", "$($x.User)") }),
+                    @('Persistence', 'Persist', @('Time', 'Mechanism', 'Detail'), { param($x) @("$($x.Time)", "$($x.Kind)", "$($x.Detail)") }),
+                    @('C2 beaconing', 'Beacon', @('Kind', 'Destination', 'Pattern'), { param($x) @("$($x.Kind)", "$($x.Target)", "$($x.Detail)") }),
                     @('Network connections', 'Net', @('Time', 'Destination', 'Process'), { param($x) @("$($x.Time)", "$($x.DestIp):$($x.DestPort)", "$($x.Image)") }),
                     @('DNS queries', 'Dns', @('Time', 'Query', 'Process'), { param($x) @("$($x.Time)", "$($x.QueryName)", "$($x.Image)") }),
                     @('Loaded DLLs', 'Dll', @('Time', 'DLL', 'Process'), { param($x) @("$($x.Time)", "$($x.Dll)", "$($x.Image)") }),
@@ -7847,14 +7851,21 @@ function Invoke-FocusCore {
                     } else {
                         $iPid = "$($r.NewProcessId)"; $iStart = "$($r.Time)"; $iImg = "$($r.NewProcess)"; $iParent = "$($r.ParentProcess)"; $iUser = "$($r.Account)"
                     }
-                    $ik = "$iPid|$iImg".ToLower()
+                    # v2.47: normalize hex PIDs for the dedup key - 4688 records NewProcessId as
+                    # hex (0x15f4) while Sysmon/the live snapshot use decimal (5620); canonical
+                    # form is decimal so both sources collapse onto one instance
+                    $iPidN = $iPid
+                    if ("$iPidN" -match '^0x([0-9a-fA-F]+)$') { try { $iPidN = "$([convert]::ToInt64($Matches[1], 16))" } catch { } }
+                    $ik = "$iPidN|$iImg".ToLower()
                     if (($iPid -or $iGuid) -and $instKeys.Add($ik)) {
                         $instances.Add([pscustomobject]@{ Pid = $iPid; Guid = $iGuid; Started = $iStart; Image = $iImg; Parent = $iParent; User = $iUser; Source = $src })
                     } elseif ($instances.Count -gt 0) {
                         # same instance seen in another source -> enrich the existing row
                         # (sysmon rows carry guid/user/parent, the live snapshot carries PPID)
                         foreach ($ex in $instances) {
-                            if ("$($ex.Pid)|$($ex.Image)".ToLower() -eq $ik) {
+                            $exPidN = "$($ex.Pid)"
+                            if ("$exPidN" -match '^0x([0-9a-fA-F]+)$') { try { $exPidN = "$([convert]::ToInt64($Matches[1], 16))" } catch { } }
+                            if ("$exPidN|$($ex.Image)".ToLower() -eq $ik) {
                                 if ($iGuid -and -not "$($ex.Guid)") { $ex | Add-Member -NotePropertyName Guid -NotePropertyValue $iGuid -Force }
                                 if ($iUser -and -not "$($ex.User)") { $ex | Add-Member -NotePropertyName User -NotePropertyValue $iUser -Force }
                                 if ($iParent -and -not "$($ex.Parent)") { $ex | Add-Member -NotePropertyName Parent -NotePropertyValue $iParent -Force }
@@ -7906,6 +7917,49 @@ function Invoke-FocusCore {
             if ($gl) { $kids = @($cache['sysmon_proc_create'] | Where-Object { "$($_.ParentProcessGuid)".ToLower() -eq $gl }) }
             elseif ($pl) { $kids = @($cache['sysmon_proc_create'] | Where-Object { "$($_.ParentImage)".ToLower() -eq "$($i.Image)".ToLower() }) }
         }
+        # v2.47: persistence + C2 beacon joins per instance (name-or-path match - these artifacts
+        # carry no ProcessGuid, and on no-Sysmon hosts they are the ONLY instance-level evidence)
+        $imgL = "$($i.Image)".ToLower()
+        $leafL = ''
+        try { $leafL = (Split-Path $imgL -Leaf) } catch { }
+        $persistJoin = {
+            @('services', 'system_new_services', 'scheduled_tasks', 'security_task_install', 'autoruns_runkeys', 'autoruns_startup_folders') | ForEach-Object {
+                $srcName = $_
+                if (-not $cache.ContainsKey($srcName)) { return }
+                foreach ($r in $cache[$srcName]) {
+                    $blob = ''
+                    foreach ($p2 in $r.PSObject.Properties) { $blob += "$($p2.Value) ".ToLower() }
+                    if (-not $blob.Contains($imgL) -and (-not $leafL -or -not $blob.Contains($leafL))) { continue }
+                    $kind = switch ($srcName) {
+                        'services' { 'service (live)' }
+                        'system_new_services' { 'service install (7045)' }
+                        'scheduled_tasks' { 'scheduled task' }
+                        'security_task_install' { 'task install (4698)' }
+                        'autoruns_runkeys' { 'autorun (run key)' }
+                        'autoruns_startup_folders' { 'autorun (startup folder)' }
+                        default { $srcName }
+                    }
+                    $tm = ''
+                    foreach ($pn2 in @('Time', 'KeyTimeStamp')) { $p3 = $r.PSObject.Properties[$pn2]; if ($p3 -and "$($p3.Value)") { $tm = "$($p3.Value)"; break } }
+                    [pscustomobject]@{ Time = $tm; Kind = $kind; Source = $srcName; Detail = ($r.PSObject.Properties | Where-Object { "$($_.Value)" -and "$($_.Name)" -ne 'Time' } | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' | ' }
+                }
+            }
+        }
+        $beaconJoin = {
+            @('beacon_candidates', 'dns_beacon_candidates') | ForEach-Object {
+                $srcName = $_
+                if (-not $cache.ContainsKey($srcName)) { return }
+                foreach ($r in $cache[$srcName]) {
+                    $bp = "$($r.Process)".ToLower()
+                    if ($bp -ne $imgL -and (-not $leafL -or $bp -notmatch [regex]::Escape($leafL))) { continue }
+                    if ($srcName -eq 'beacon_candidates') {
+                        [pscustomobject]@{ Kind = 'C2 beacon'; Target = "$($r.RemoteIp):$($r.Port)"; Detail = "$($r.Events) connections over $($r.SpanMin) min, median interval ~$($r.MedianIntervalSec)s, regularity $($r.Regularity), severity $($r.Severity)" }
+                    } else {
+                        [pscustomobject]@{ Kind = 'DNS beacon'; Target = "$($r.Domain)"; Detail = "$($r.Events) queries over $($r.SpanMin) min, median interval ~$($r.MedianIntervalSec)s, regularity $($r.Regularity), severity $($r.Severity)" }
+                    }
+                }
+            }
+        }
         # @() wrappers: & scriptblock unrolls single-element results -> .Count must stay an int
         $det = [pscustomobject]@{
             Instance = $i
@@ -7917,9 +7971,128 @@ function Invoke-FocusCore {
             File = @(& $guidFilter 'sysmon_file_time' $gl $pl)
             FileCreate = @(& $guidFilter 'sysmon_file_create' $gl $pl)
             FileDelete = @(& $guidFilter 'sysmon_file_delete' $gl $pl)
+            Persist = @(& $persistJoin)
+            Beacon = @(& $beaconJoin)
         }
-        if ($det.Children.Count -gt 0 -or $det.Net.Count -gt 0 -or $det.Dns.Count -gt 0 -or $det.Dll.Count -gt 0 -or $det.Reg.Count -gt 0 -or $det.File.Count -gt 0 -or $det.FileCreate.Count -gt 0 -or $det.FileDelete.Count -gt 0) {
+        if ($det.Children.Count -gt 0 -or $det.Net.Count -gt 0 -or $det.Dns.Count -gt 0 -or $det.Dll.Count -gt 0 -or $det.Reg.Count -gt 0 -or $det.File.Count -gt 0 -or $det.FileCreate.Count -gt 0 -or $det.FileDelete.Count -gt 0 -or $det.Persist.Count -gt 0 -or $det.Beacon.Count -gt 0) {
             $perInst.Add($det)
+        }
+    }
+
+    # ---- v2.47: ancestry walk-up, respawn narration, target/relative split ----
+    $instKey = { param($i2) ("$($i2.Pid)|$($i2.Guid)|$($i2.Image)").ToLower() }
+    foreach ($i in $instances) {
+        # walk parent rows up the tree: sysmon EID 1 by ParentImage, 4688 by ParentProcess,
+        # live snapshot by PPID - stop at 6 generations, a repeated node, or a missing parent row.
+        # A parent row must PREDATE its child (same-name siblings/self-rows otherwise win).
+        $lin = New-Object System.Collections.Generic.List[string]
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+        $parentName = "$($i.Parent)".Trim()
+        $curTime = $null; try { $curTime = [datetime]"$($i.Started)" } catch { }
+        $lastGuid = "$($i.Guid)".ToLower()
+        $gen = 0
+        if ($parentName -match '^PPID ') {
+            # live-snapshot parents are just a PPID number - prefer the instance's own EID 1 row,
+            # which carries the parent IMAGE (the PPID holder may have exited before collection)
+            if ($cache.ContainsKey('sysmon_proc_create')) {
+                $own = @()
+                if ($lastGuid) { $own = @($cache['sysmon_proc_create'] | Where-Object { "$($_.ProcessGuid)".ToLower() -eq $lastGuid }) }
+                if ($own.Count -eq 0) {
+                    $il3 = "$($i.Image)".ToLower()
+                    $own = @($cache['sysmon_proc_create'] | Where-Object { "$($_.Image)".ToLower() -eq $il3 })
+                    if ($own.Count -gt 1 -and $curTime) {
+                        $near = @($own | Where-Object { $rt2 = $null; try { $rt2 = [datetime]"$($_.Time)" } catch { }; $rt2 -and [Math]::Abs(($rt2 - $curTime).TotalMinutes) -lt 5 })
+                        if ($near.Count -gt 0) { $own = $near }
+                    }
+                }
+                if ($own.Count -gt 0 -and "$($own[0].ParentImage)") { $parentName = "$($own[0].ParentImage)" }
+            }
+        }
+        while ($parentName -and $gen -lt 6) {
+            if ($parentName -match '^PPID (\d+)') {
+                $pp = $null
+                if ($cache.ContainsKey('processes')) { $pp = @($cache['processes'] | Where-Object { "$($_.PID)" -eq $Matches[1] }) }
+                if ($pp -and $pp.Count -gt 0 -and "$($pp[0].Path)") { $parentName = "$($pp[0].Path)" } else { break }
+            }
+            $pl2 = $parentName.ToLower()
+            if (-not $seen.Add($pl2)) { break }
+            $pleaf = $pl2
+            try { $lf = (Split-Path $pl2 -Leaf); if ($lf) { $pleaf = $lf } } catch { }
+            $prow = $null
+            if ($cache.ContainsKey('sysmon_proc_create')) {
+                $best = $null; $bestT = [datetime]::MinValue
+                foreach ($c2 in @($cache['sysmon_proc_create'] | Where-Object { "$($_.Image)".ToLower() -eq $pl2 -or "$($_.Image)".ToLower().EndsWith("\$pleaf") })) {
+                    if ("$($c2.ProcessGuid)".ToLower() -and "$($c2.ProcessGuid)".ToLower() -eq $lastGuid) { continue }
+                    $rt = $null; try { $rt = [datetime]"$($c2.Time)" } catch { }
+                    if ($curTime -and $rt -and $rt -gt $curTime.AddSeconds(1)) { continue }
+                    if ($null -eq $best -or $rt -ge $bestT) { $best = $c2; $bestT = $rt }
+                }
+                if ($best) { $prow = $best }
+            }
+            if (-not $prow -and $cache.ContainsKey('security_proc_events')) {
+                $best = $null; $bestT = [datetime]::MinValue
+                foreach ($c2 in @($cache['security_proc_events'] | Where-Object { "$($_.NewProcess)".ToLower() -eq $pl2 -or "$($_.NewProcess)".ToLower().EndsWith("\$pleaf") })) {
+                    $rt = $null; try { $rt = [datetime]"$($c2.Time)" } catch { }
+                    if ($curTime -and $rt -and $rt -gt $curTime.AddSeconds(1)) { continue }
+                    if ($null -eq $best -or $rt -ge $bestT) { $best = $c2; $bestT = $rt }
+                }
+                if ($best) { $prow = $best }
+            }
+            $lbl = $pleaf
+            if ($prow) {
+                foreach ($pn2 in @('Time', 'TimeCreated')) {
+                    $p3 = $prow.PSObject.Properties[$pn2]
+                    if ($p3 -and "$($p3.Value)") { $lbl = "$pleaf ($($p3.Value))"; break }
+                }
+            }
+            $lin.Add($lbl)
+            $next = $null
+            if ($prow) {
+                if ($prow.PSObject.Properties['ParentImage'] -and "$($prow.ParentImage)") { $next = "$($prow.ParentImage)" }
+                elseif ($prow.PSObject.Properties['ParentProcess'] -and "$($prow.ParentProcess)") { $next = "$($prow.ParentProcess)" }
+                if ($prow.PSObject.Properties['ProcessGuid']) { $lastGuid = "$($prow.ProcessGuid)".ToLower() }
+                foreach ($pn2 in @('Time', 'TimeCreated')) {
+                    $p3 = $prow.PSObject.Properties[$pn2]
+                    if ($p3 -and "$($p3.Value)") { try { $curTime = [datetime]"$($p3.Value)" } catch { }; break }
+                }
+            }
+            if (-not $next -or "$next".ToLower() -eq $pl2) { break }
+            $parentName = $next
+            $gen++
+        }
+        $i | Add-Member -NotePropertyName Lineage -NotePropertyValue $lin.ToArray() -Force
+    }
+    $pathSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($pt in $paths) { $null = $pathSet.Add("$pt".ToLower()) }
+    $indLeaf = ''
+    try { $lf2 = (Split-Path $ind -Leaf); if ($lf2) { $indLeaf = $lf2.ToLower() } } catch { }
+    $targetKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($i in $instances) {
+        $il = "$($i.Image)".ToLower()
+        if ($pathSet.Contains($il) -or ($indLeaf -and $il.EndsWith("\$indLeaf"))) { $null = $targetKeys.Add((& $instKey $i)) }
+    }
+    foreach ($grp in (@($instances | Where-Object { $targetKeys.Contains((& $instKey $_)) }) | Group-Object { "$($_.Image)".ToLower() })) {
+        $ordered = @($grp.Group | Where-Object { "$($_.Started)" } | Sort-Object { $k2 = [datetime]::MaxValue; try { $k2 = [datetime]"$($_.Started)" } catch { }; $k2 })
+        for ($x = 1; $x -lt $ordered.Count; $x++) {
+            $t1 = $null; $t2 = $null
+            try { $t1 = [datetime]"$($ordered[$x - 1].Started)"; $t2 = [datetime]"$($ordered[$x].Started)" } catch { }
+            if (-not $t1 -or -not $t2 -or (($t2 - $t1).TotalMinutes -lt 5)) { continue }
+            $gap = "$([int](($t2 - $t1).TotalHours))h$([int](($t2 - $t1).TotalMinutes % 60))m"
+            $note = "respawned after $gap"
+            $ev = @()
+            $il2 = "$($ordered[$x].Image)".ToLower()
+            foreach ($d2 in $perInst) {
+                foreach ($fc in @($d2.FileCreate)) {
+                    $ft = $null; try { $ft = [datetime]"$($fc.Time)" } catch { }
+                    if ("$($fc.TargetFilename)".ToLower() -eq $il2 -and $ft -and $t1 -and $ft -ge $t1 -and $ft -le $t2) {
+                        $ev += "re-dropped by $(try { Split-Path "$($d2.Instance.Image)" -Leaf } catch { "$($d2.Instance.Image)" })"
+                    }
+                }
+            }
+            $own = @($perInst | Where-Object { (& $instKey $_.Instance) -eq (& $instKey $ordered[$x]) })
+            if ($own.Count -gt 0 -and @($own[0].Persist).Count -gt 0) { $ev += "persistence: $($own[0].Persist[0].Kind)" }
+            if ($ev.Count -gt 0) { $note += " ($(@($ev | Select-Object -Unique) -join ', '))" }
+            $ordered[$x] | Add-Member -NotePropertyName Respawn -NotePropertyValue $note -Force
         }
     }
 
@@ -8001,7 +8174,15 @@ function Invoke-FocusCore {
         $edges = New-Object System.Collections.Generic.List[object]
         $yP = 50; $yI = 50; $yC = 50; $yA = 50
         $parents = New-Object System.Collections.Generic.List[string]
-        foreach ($p in $instances) { $pv = "$($p.Parent)".Trim(); if ($pv -and -not $parents.Contains($pv) -and $parents.Count -lt 8) { $parents.Add($pv) } }
+        foreach ($p in $instances) {
+            # v2.47: walk the lineage chain root-first so the parent column shows how it arrived
+            if ($p.PSObject.Properties['Lineage']) {
+                $chain2 = @($p.Lineage)
+                for ($x2 = $chain2.Count - 1; $x2 -ge 0; $x2--) { $pv = "$($chain2[$x2])"; if ($pv -and -not $parents.Contains($pv) -and $parents.Count -lt 8) { $parents.Add($pv) } }
+            }
+            $pv = "$($p.Parent)".Trim()
+            if ($pv -and -not $parents.Contains($pv) -and $parents.Count -lt 8) { $parents.Add($pv) }
+        }
         foreach ($pv in $parents) {
             $nodes.Add([pscustomobject]@{ Id = "p:$pv"; X = $XP; Y = $yP; W = 240; H = 38; Label = (& $clip $pv 34); Sub = 'parent process'; Fill = '#253044'; Stroke = '#3a4a63' })
             $yP += 52
@@ -8037,12 +8218,14 @@ function Invoke-FocusCore {
             }
             if (-not $srcInst) { continue }
             $chips = New-Object System.Collections.Generic.List[string]
-            foreach ($n in @($pd.Net | Select-Object -First 2)) { $chips.Add("NET $($n.DestIp):$($n.DestPort)") }
-            foreach ($d in @($pd.Dns | Select-Object -First 2)) { $chips.Add("DNS $(& $clip $d.QueryName 26)") }
-            foreach ($d in @($pd.Dll | Select-Object -First 2)) { $chips.Add("DLL $(& $clip (Split-Path "$($d.Dll)" -Leaf) 26)") }
-            foreach ($f in @($pd.File | Select-Object -First 2)) { $chips.Add("FILE $(& $clip (Split-Path "$($f.TargetFilename)" -Leaf) 26)") }
             foreach ($f2 in @($pd.FileCreate | Select-Object -First 2)) { $chips.Add("DROP $(& $clip (Split-Path "$($f2.TargetFilename)" -Leaf) 26)") }
             foreach ($f2 in @($pd.FileDelete | Select-Object -First 1)) { $chips.Add("DEL $(& $clip (Split-Path "$($f2.TargetFilename)" -Leaf) 26)") }
+            foreach ($b in @($pd.Beacon | Select-Object -First 1)) { $chips.Add("BEACON $($b.Target)") }
+            foreach ($pz in @($pd.Persist | Select-Object -First 1)) { $chips.Add("PERSIST $(& $clip $pz.Kind 30)") }
+            foreach ($n in @($pd.Net | Select-Object -First 2)) { $chips.Add("NET $($n.DestIp):$($n.DestPort)") }
+            foreach ($d in @($pd.Dns | Select-Object -First 1)) { $chips.Add("DNS $(& $clip $d.QueryName 26)") }
+            foreach ($f in @($pd.File | Select-Object -First 1)) { $chips.Add("FILE $(& $clip (Split-Path "$($f.TargetFilename)" -Leaf) 26)") }
+            foreach ($d in @($pd.Dll | Select-Object -First 1)) { $chips.Add("DLL $(& $clip (Split-Path "$($d.Dll)" -Leaf) 26)") }
             foreach ($r in @($pd.Reg | Select-Object -First 1)) { $chips.Add("REG $(& $clip (Split-Path "$($r.TargetObject)" -Leaf) 26)") }
             $n2 = 0
             foreach ($chip in $chips) {
@@ -8110,11 +8293,25 @@ function Invoke-FocusCore {
             [void]$h.AppendLine("</table>")
         }
         if ($instances.Count -gt 0) {
-            [void]$h.AppendLine("<h2>Instances (PID / ProcessGuid where captured)</h2><table><tr><th>PID</th><th>ProcessGuid</th><th>Started</th><th>Image</th><th>Parent</th><th>User</th><th>Source</th></tr>")
-            foreach ($i in $instances) {
-                [void]$h.AppendLine("<tr><td>$(& $esc $i.Pid)</td><td class='path'>$(& $esc $i.Guid)</td><td>$(& $esc $i.Started)</td><td class='path'>$(& $esc $i.Image)</td><td>$(& $esc $i.Parent)</td><td>$(& $esc $i.User)</td><td>$(& $esc $i.Source)</td></tr>")
+            $tgI = @($instances | Where-Object { $targetKeys.Contains((& $instKey $_)) })
+            $rlI = @($instances | Where-Object { -not $targetKeys.Contains((& $instKey $_)) })
+            [void]$h.AppendLine("<h2>Instances - $($tgI.Count) of the target / $($rlI.Count) relative(s) in the chain</h2>")
+            [void]$h.AppendLine("<h3>Target instances</h3><table><tr><th>PID</th><th>ProcessGuid</th><th>Started</th><th>Image</th><th>User</th><th>Arrived via</th><th>Notes</th></tr>")
+            foreach ($i in $tgI) {
+                $ln2 = ''
+                if ($i.PSObject.Properties['Lineage'] -and @($i.Lineage).Count -gt 0) { $ln2 = (@($i.Lineage) -join ' &lt;- ') }
+                $rp2 = ''
+                if ($i.PSObject.Properties['Respawn']) { $rp2 = "<span class='warn'>$(& $esc $i.Respawn)</span>" }
+                [void]$h.AppendLine("<tr><td>$(& $esc $i.Pid)</td><td class='path'>$(& $esc $i.Guid)</td><td>$(& $esc $i.Started)</td><td class='path'>$(& $esc $i.Image)</td><td>$(& $esc $i.User)</td><td>$ln2</td><td>$rp2</td></tr>")
             }
             [void]$h.AppendLine("</table>")
+            if ($rlI.Count -gt 0) {
+                [void]$h.AppendLine("<h3>Relatives in the chain (parents / children of the target)</h3><table><tr><th>PID</th><th>Started</th><th>Image</th><th>Parent</th><th>User</th></tr>")
+                foreach ($i in $rlI) {
+                    [void]$h.AppendLine("<tr><td>$(& $esc $i.Pid)</td><td>$(& $esc $i.Started)</td><td class='path'>$(& $esc $i.Image)</td><td>$(& $esc $i.Parent)</td><td>$(& $esc $i.User)</td></tr>")
+                }
+                [void]$h.AppendLine("</table>")
+            }
         }
         foreach ($pd in $perInst) {
             $i3 = $pd.Instance
@@ -8122,10 +8319,28 @@ function Invoke-FocusCore {
             if ("$($i3.Guid)") { $hdr += " - $($i3.Guid)" }
             if ("$($i3.User)") { $hdr += " ($($i3.User))" }
             [void]$h.AppendLine("<h3>$(& $esc $hdr) - everything it did</h3>")
+            if ($i3.PSObject.Properties['Respawn']) { [void]$h.AppendLine("<div class='banner med'><span class='warn'>$(& $esc $i3.Respawn)</span></div>") }
+            if ($i3.PSObject.Properties['Lineage'] -and @($i3.Lineage).Count -gt 1) {
+                [void]$h.AppendLine("<div class='meta'>Arrived via: $(& $esc ((@($i3.Lineage)) -join ' <- '))</div>")
+            }
             if ($pd.Children.Count -gt 0) {
                 [void]$h.AppendLine("<h4>Child processes ($($pd.Children.Count))</h4><table><tr><th>Time</th><th>Child</th><th>PID</th><th>User</th><th>CommandLine</th></tr>")
                 foreach ($x in @($pd.Children | Select-Object -First 25)) {
                     [void]$h.AppendLine("<tr><td>$(& $esc $x.Time)</td><td class='path'>$(& $esc $x.Image)</td><td>$(& $esc $x.ProcessId)</td><td>$(& $esc $x.User)</td><td>$(& $esc $x.CommandLine)</td></tr>")
+                }
+                [void]$h.AppendLine("</table>")
+            }
+            if ($pd.Persist.Count -gt 0) {
+                [void]$h.AppendLine("<h4>Persistence ($($pd.Persist.Count))</h4><table><tr><th>Time</th><th>Mechanism</th><th>Detail</th></tr>")
+                foreach ($x in @($pd.Persist | Select-Object -First 25)) {
+                    [void]$h.AppendLine("<tr><td>$(& $esc $x.Time)</td><td>$(& $esc $x.Kind)</td><td class='path'>$(& $esc $x.Detail)</td></tr>")
+                }
+                [void]$h.AppendLine("</table>")
+            }
+            if ($pd.Beacon.Count -gt 0) {
+                [void]$h.AppendLine("<h4>C2 beaconing ($($pd.Beacon.Count))</h4><table><tr><th>Kind</th><th>Destination</th><th>Pattern</th></tr>")
+                foreach ($x in @($pd.Beacon | Select-Object -First 25)) {
+                    [void]$h.AppendLine("<tr><td>$(& $esc $x.Kind)</td><td class='path'>$(& $esc $x.Target)</td><td>$(& $esc $x.Detail)</td></tr>")
                 }
                 [void]$h.AppendLine("</table>")
             }
@@ -8219,9 +8434,13 @@ function Invoke-FocusCore {
     # ---- per-instance detail + graph for the main report embed (v2.45) ----
     # The general report's Focus section reads this instead of re-computing the joins.
     $detailInstances = @($perInst | ForEach-Object {
+        $lnI = @(); $rpI = ''
+        if ($_.Instance.PSObject.Properties['Lineage']) { $lnI = @($_.Instance.Lineage) }
+        if ($_.Instance.PSObject.Properties['Respawn']) { $rpI = "$($_.Instance.Respawn)" }
         [pscustomobject]@{
             Pid = "$($_.Instance.Pid)"; Guid = "$($_.Instance.Guid)"; Started = "$($_.Instance.Started)"
             Image = "$($_.Instance.Image)"; Parent = "$($_.Instance.Parent)"; User = "$($_.Instance.User)"
+            Lineage = $lnI; Respawn = $rpI
             Children = @($_.Children | Select-Object -First 25)
             Net = @($_.Net | Select-Object -First 25)
             Dns = @($_.Dns | Select-Object -First 25)
@@ -8230,6 +8449,8 @@ function Invoke-FocusCore {
             File = @($_.File | Select-Object -First 25)
             FileCreate = @($_.FileCreate | Select-Object -First 25)
             FileDelete = @($_.FileDelete | Select-Object -First 25)
+            Persist = @($_.Persist | Select-Object -First 25)
+            Beacon = @($_.Beacon | Select-Object -First 25)
         }
     })
     @{
@@ -8250,13 +8471,25 @@ function Invoke-FocusCore {
         Write-Host ("  [{0}] {1}{2}  hits:{3}" -f $g.Name, $g.Path, $h, $g.HitCount) -ForegroundColor White
     }
     if ($masq.Count -gt 0) { Write-Host "  MASQUERADE WARNING: same name at multiple paths -> $($masq -join ', ')" -ForegroundColor Yellow }
+    $tg = @($instances | Where-Object { $targetKeys.Contains((& $instKey $_)) })
+    $rl = @($instances | Where-Object { -not $targetKeys.Contains((& $instKey $_)) })
+    Write-Host ("  instances: {0} of the target / {1} relative(s) in the chain" -f $tg.Count, $rl.Count) -ForegroundColor White
+    foreach ($t2 in $tg) {
+        $rp = ''; if ($t2.PSObject.Properties['Respawn']) { $rp = "  [$($t2.Respawn)]" }
+        $ln = ''
+        if ($t2.PSObject.Properties['Lineage'] -and @($t2.Lineage).Count -gt 0) {
+            $lc = @($t2.Lineage)
+            $ln = "  arrived via: " + (($lc[[Math]::Min($lc.Count - 1, 2)..0] | ForEach-Object { "$_".Trim() }) -join ' <- ')
+        }
+        Write-Host ("    PID {0}  {1}  started {2}{3}{4}" -f $t2.Pid, $t2.Image, $t2.Started, $rp, $ln) -ForegroundColor Gray
+    }
     foreach ($g in ($sourcesHit.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 12)) {
         Write-Host ("  {0,-32} x{1}" -f $g.Key, $g.Value) -ForegroundColor Gray
     }
     if (-not ($guids.Count -gt 0)) {
         Write-Host "  note: no ProcessGuid in this case (legacy/no-Sysmon collect) - per-instance attribution is limited" -ForegroundColor DarkYellow
     }
-    if ($perInst.Count -gt 0) { Write-Host ("  per-instance detail joined for {0} instance(s): children / network / DNS / DLLs / file / registry" -f $perInst.Count) -ForegroundColor Gray }
+    if ($perInst.Count -gt 0) { Write-Host ("  per-instance detail joined for {0} instance(s): children / network / DNS / DLLs / file / registry / persistence / beacons" -f $perInst.Count) -ForegroundColor Gray }
     Write-Host ""
     Write-Host "Dossier -> focus\focus_report.html  (chain: focus\focus_chain.csv, hits: focus\focus_hits.csv)" -ForegroundColor Green
     return $true
@@ -8522,6 +8755,28 @@ function Invoke-CanaryMode {
     $raRows = @(Import-CsvFlatMapped $csv 'remote_access')
     $sysSvcRows = @(Import-CsvFlatMapped $csv 'system_new_services')
     $score = 0; $possible = 0
+    # v2.47 R4: the focus pipeline gets a canary row like R1-R27 - run the real engine core on
+    # the planted canary_ngrok.exe against the fresh case and require a dossier with hits + instance
+    $focusFired = 0; $focusData = 0; $focusWhy = 'live snapshot / Sysmon EID 1 missing (Standard preset required)'
+    $focusData = @($pcRows | Where-Object { "$($_)" -match 'canary_ngrok' }).Count + @(Get-ChildItem -LiteralPath $csv -Recurse -Filter 'processes.csv' -ErrorAction SilentlyContinue | ForEach-Object { @(Import-Csv -LiteralPath $_.FullName -ErrorAction SilentlyContinue | Where-Object { "$($_)" -match 'canary_ngrok' }).Count } | Measure-Object -Sum | Select-Object -ExpandProperty Sum)
+    $focusTerms = Join-Path $case.FullName 'focus\focus_terms.json'
+    if (-not (Test-Path -LiteralPath (Join-Path $case.FullName 'focus'))) {
+        $savedCaseDir = $script:CaseDir; $savedCsvDir = $script:CsvDir; $savedRawDir = $script:RawDir; $savedLog = $script:CaseLog
+        try {
+            $script:CaseDir = $case.FullName
+            $script:CsvDir = $csv
+            $script:RawDir = Join-Path $case.FullName 'raw'
+            $script:CaseLog = Join-Path $case.FullName 'collection.log'
+            $null = Invoke-FocusCore -Indicator 'canary_ngrok.exe' -Meta ([pscustomobject]@{ Computer = 'canary'; CaseID = 'CANARY' })
+        } catch { Write-Host "    focus canary failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+        finally { $script:CaseDir = $savedCaseDir; $script:CsvDir = $savedCsvDir; $script:RawDir = $savedRawDir; $script:CaseLog = $savedLog }
+    }
+    if (Test-Path -LiteralPath $focusTerms) {
+        try {
+            $ftC = Get-Content -LiteralPath $focusTerms -Raw | ConvertFrom-Json
+            if ([int]$ftC.HitCount -gt 0) { $focusFired = 1 }
+        } catch { }
+    }
     $c4720 = @($authRows | Where-Object { "$($_.EventId)" -eq '4720' }).Count
     $c4732 = @($authRows | Where-Object { @('4728', '4732', '4756') -contains "$($_.EventId)" }).Count
     $r6Why = if ($c4720 -eq 0 -and $c4732 -eq 0) { 'User Account Management audit not active' } elseif ($c4732 -eq 0) { 'Security Group Management audit not active (4720 seen, no group change)' } else { 'auth telemetry missing' }
@@ -8533,6 +8788,7 @@ function Invoke-CanaryMode {
         @{ L = 'R23  remote-access tunnel (canary_ngrok)'; Hit = @($hf | Where-Object { $_.Rule -match 'Remote-access tunnel' }).Count; Data = @($raRows | Where-Object { $_ -match 'canary_ngrok' }).Count + @($sysSvcRows | Where-Object { $_ -match 'canary_ngrok|canary_tunneld' }).Count; DataWhy = 'module 8.16 + processes missing (Standard preset required)' }
         @{ L = 'RA   service-install telemetry (7045 canary_tunneld)'; Hit = @($sysSvcRows | Where-Object { $_ -match 'canary_tunneld' }).Count; Data = @($sysSvcRows).Count; DataWhy = 'System log module (4.5) did not run - no 7045 rows' }
         @{ L = 'R26  SSH authorized_keys plant';   Hit = @($hf | Where-Object { $_.Rule -match 'authorized_keys' }).Count;                Data = @($raRows | Where-Object { $_ -match 'administrators_authorized_keys' }).Count; DataWhy = 'module 8.16 missing (Standard preset required)' }
+        @{ L = 'FOCUS auto-dossier (canary_ngrok)'; Hit = $focusFired;                                                                    Data = $focusData; DataWhy = $focusWhy }
     )
     foreach ($c in $checks) {
         $possible++

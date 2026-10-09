@@ -35,6 +35,8 @@ Check "report: leads nav + section present" (($src -match [regex]::Escape("<a hr
 Check "report: verdict banner do-now + clickable signals" (($src -match [regex]::Escape('<b>Do now:</b>')) -and ($src -match 'click a signal to jump'))
 Check "report: focus embed reads the detail json" ($src -match [regex]::Escape('focus_instances_detail.json') -and $src -match 'Activity graph \(parents')
 Check "hunt R5: USB trail skips the kit's own raw copies" ($src -match [regex]::Escape('OPHIRA_[^\\]*\\raw\\'))
+Check "canary R4: scorecard runs the focus core on canary_ngrok (FIRED/MISS/BLIND)" (($src -match [regex]::Escape("'FOCUS auto-dossier (canary_ngrok)'")) -and ($src -match [regex]::Escape('Invoke-FocusCore -Indicator ''canary_ngrok.exe''')))
+Check "detail json: lineage + respawn persisted for the report embed" (($src -match [regex]::Escape('Lineage = $lnI; Respawn = $rpI')))
 
 # ============================================================================
 # engine behavior on a synthetic multi-instance + masquerade case
@@ -83,8 +85,9 @@ New-Csv (Join-Path $csv 'supertimeline.csv') '"Timestamp","Source","Type","Actor
     '"2026-10-05 14:19:03","sysmon_proc_create","process create (Sysmon 1)","dev","malware.exe","respawn after kill"',
     '"2026-10-05 12:00:00","prefetch_parsed","prefetch run","dev","notepad.exe","unrelated"'
 )
-New-Csv (Join-Path $csv 'beacon_candidates.csv') '"RemoteIp","RemotePort","IntervalSec","Hits","Jitter","Score","Detail"' @(
-    '"185.199.10.7","443","60","22","0.08","high","regular intervals - C2 pattern"'
+New-Csv (Join-Path $csv 'beacon_candidates.csv') '"Severity","Rank","Process","RemoteIp","Port","Events","SpanMin","MedianIntervalSec","Jitter","Regularity","Flags"' @(
+    '"high","3","C:\Users\dev\AppData\Roaming\malware.exe","185.199.10.7","443","38","190","60","0.06","0.94","user-path"',
+    '"medium","2","","185.199.10.7","8443","12","60","120","0.10","0.88",""'
 )
 New-Csv (Join-Path $csv 'yara_hits.csv') '"Time","Binary","Rule","Score","Detail"' @(
     '"2026-10-05 14:20:00","C:\Users\dev\AppData\Roaming\malware.exe","MALWARE_FAMILY_Test","high","YARA match on flagged binary"'
@@ -108,6 +111,20 @@ New-Csv (Join-Path $csv 'sysmon_file_create.csv') '"Time","EventId","Image","Tar
 New-Csv (Join-Path $csv 'sysmon_file_delete.csv') '"Time","EventId","Image","TargetFilename","ProcessId","ProcessGuid","Hashes","Archived"' @(
     '"2026-10-05 14:21:00.000","23","C:\Users\dev\AppData\Roaming\malware.exe","C:\Users\dev\AppData\Roaming\logs.txt","4812","{7a1f-aaaa}","SHA256=CAFEBABE","false"'
 )
+# v2.47: persistence + lineage fixtures (7045 install, run-key autorun, explorer grandparent)
+New-Csv (Join-Path $csv 'system_new_services.csv') '"Time","Service","Binary","Type"' @(
+    '"2026-10-05 14:05:00.000","MalwareSvc","C:\Users\dev\AppData\Roaming\malware.exe","NewService"'
+)
+New-Csv (Join-Path $csv 'autoruns_runkeys.csv') '"Location","Hive","User","Name","Value"' @(
+    '"HKCU\Software\Microsoft\Windows\CurrentVersion\Run","HKU","S-1-5-21-1000","MalwareAuto","C:\Users\dev\AppData\Roaming\malware.exe"'
+)
+New-Csv (Join-Path $csv 'sysmon_proc_create_explore.csv') '"Time","EventId","Image","OriginalFileName","CommandLine","User","ProcessId","ProcessGuid","ParentImage","ParentProcessGuid"' @(
+    '"2026-10-05 09:00:00.000","1","C:\Windows\explorer.exe","EXPLORER.EXE","explorer.exe","DEVLAB01\dev","100","{1111-0000}","C:\Windows\System32\winlogon.exe","{0000-0001}"'
+)
+# merge the explorer row into sysmon_proc_create (single source of truth for the engine cache)
+$spc = Join-Path $csv 'sysmon_proc_create.csv'
+(Get-Content $spc) + (Get-Content (Join-Path $csv 'sysmon_proc_create_explore.csv') | Select-Object -Skip 1) | Set-Content $spc -Encoding UTF8
+Remove-Item (Join-Path $csv 'sysmon_proc_create_explore.csv') -Force
 
 $ok = Invoke-FocusEngine -Path $case -Indicator 'malware.exe'
 $fDir = Join-Path $case 'focus'
@@ -115,7 +132,7 @@ Check "engine: name seed returns success" ($ok -eq $true)
 
 $hits = @(); try { $hits = @(Import-Csv -LiteralPath (Join-Path $fDir 'focus_hits.csv') -ErrorAction Stop) } catch { }
 Check "hits: matched across process/network/proc-create sources" (@($hits | Where-Object Source -eq 'sysmon_network').Count -ge 2 -and @($hits | Where-Object Source -eq 'sysmon_proc_create').Count -ge 2)
-Check "hits: ip pivot pulls the beacon row (IP never carries the name)" (@($hits | Where-Object Source -eq 'beacon_candidates').Count -ge 1 -and @($hits | Where-Object { "$($_.MatchedOn)" -match '^ip ' }).Count -ge 1)
+Check "hits: ip pivot pulls the beacon row (IP never carries the name)" (@($hits | Where-Object Source -eq 'beacon_candidates').Count -ge 2 -and @($hits | Where-Object { "$($_.Source)" -eq 'beacon_candidates' -and "$($_.Detail)" -match '8443' -and "$($_.MatchedOn)" -match '^ip ' }).Count -ge 1)
 Check "hits: yara detection surface matched" (@($hits | Where-Object Source -eq 'yara_hits').Count -eq 1)
 Check "hits: unrelated notepad timeline row excluded" (@($hits | Where-Object { $_.Detail -match 'notepad' }).Count -eq 0)
 
@@ -152,6 +169,12 @@ Check "detail: instance 4812 carries guid-joined sections" (@($fDetail.Instances
 $i4812 = @($fDetail.Instances | Where-Object { "$($_.Pid)" -eq '4812' })[0]
 Check "detail: sections populated (children/net/dns/dll/reg/file/drop/del)" ($i4812 -and @($i4812.Children).Count -ge 1 -and @($i4812.Net).Count -ge 2 -and @($i4812.Dns).Count -ge 1 -and @($i4812.Dll).Count -ge 1 -and @($i4812.Reg).Count -ge 1 -and @($i4812.File).Count -ge 1 -and @($i4812.FileCreate).Count -ge 1 -and @($i4812.FileDelete).Count -ge 1)
 Check "detail: benign notepad drop NOT in instance sections" (@($i4812.FileCreate | Where-Object { "$($_.TargetFilename)" -match 'benign\.txt' }).Count -eq 0)
+# v2.47: ancestry walk-up, persistence + beacon joins, target/relative split, respawn narration
+Check "lineage: instance 4812 walks up to explorer then winlogon (2 hops)" ((@($i4812.Lineage).Count -ge 2) -and (@($i4812.Lineage) -join '|') -match 'explorer\.exe' -and (@($i4812.Lineage) -join '|') -match 'winlogon\.exe')
+Check "persistence: 7045 install + run-key autorun joined onto the instance" ((@($i4812.Persist).Count -ge 2) -and (@($i4812.Persist | ForEach-Object { $_.Kind }) -contains 'service install (7045)') -and (@($i4812.Persist | ForEach-Object { $_.Kind }) -contains 'autorun (run key)'))
+Check "beacon: per-instance C2 cadence joined (beacon_candidates by image)" ((@($i4812.Beacon).Count -ge 1) -and "$($i4812.Beacon[0].Detail)" -match 'median interval')
+$im5620 = @($fDetail.Instances | Where-Object { "$($_.Pid)" -eq '5620' })[0]
+Check "respawn: same-path instance 17 min later narrated" ($im5620 -and "$($im5620.Respawn)" -match 'respawned after \d+h1[67]m')
 
 # PID seed: resolves via the live snapshot to the same entity
 $ok2 = Invoke-FocusEngine -Path $case -Indicator '4812'
@@ -211,6 +234,7 @@ Check "report: do-now block for the verdict rank" ($rep -match 'Do now:')
 Check "report: signals clickable to their sections" ($rep -match 'click a signal to jump')
 Check "report: focus embed renders the activity graph inline" ($rep -match 'Activity graph \(parents -> instances -> children -> what they did\)')
 Check "report: focus embed renders per-instance sections" (($rep -match 'Instance PID 4812[^<]*everything it did') -and ($rep -match 'Files dropped \(1\)') -and ($rep -match 'payload\.dll') -and ($rep -match 'anti-forensics'))
+Check "report: focus embed renders persistence + beacon + lineage + respawn" (($rep -match 'Persistence \(2\)') -and ($rep -match 'C2 beaconing \(1\)') -and ($rep -match 'Arrived via:') -and ($rep -match 'respawned after'))
 Check "report: focus embed excludes the benign row" ($rep -notmatch 'benign\.txt')
 
 Write-Host ""
