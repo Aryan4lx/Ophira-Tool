@@ -111,6 +111,16 @@ New-Csv (Join-Path $csv 'sysmon_file_create.csv') '"Time","EventId","Image","Tar
 New-Csv (Join-Path $csv 'sysmon_file_delete.csv') '"Time","EventId","Image","TargetFilename","ProcessId","ProcessGuid","Hashes","Archived"' @(
     '"2026-10-05 14:21:00.000","23","C:\Users\dev\AppData\Roaming\malware.exe","C:\Users\dev\AppData\Roaming\logs.txt","4812","{7a1f-aaaa}","SHA256=CAFEBABE","false"'
 )
+# v2.48: injection + pipe fixtures - malware (guid aaaa) injected into its own child cmd (cccc),
+# rundll32 injected INTO malware, and a C2-family pipe created by instance aaaa
+New-Csv (Join-Path $csv 'sysmon_remote_thread.csv') '"Time","EventId","SourceImage","TargetImage","SourceProcessGuid","TargetProcessGuid","NewThreadId","StartModule","StartFunction","User"' @(
+    '"2026-10-05 14:02:45.000","8","C:\Users\dev\AppData\Roaming\malware.exe","C:\Windows\System32\cmd.exe","{7a1f-aaaa}","{7a1f-cccc}","3110","","LoadLibraryA","FT\dev"',
+    '"2026-10-05 14:03:30.000","8","C:\Windows\System32\rundll32.exe","C:\Users\dev\AppData\Roaming\malware.exe","{4444-4444}","{7a1f-aaaa}","3220","C:\Windows\System32\kernel32.dll","GetProcAddress","FT\dev"'
+)
+New-Csv (Join-Path $csv 'sysmon_pipes.csv') '"Time","EventId","Image","PipeName","EventType","User","ProcessId","ProcessGuid"' @(
+    '"2026-10-05 14:02:50.000","17","C:\Users\dev\AppData\Roaming\malware.exe","\msagent_f00d","CreatePipe","FT\dev","4812","{7a1f-aaaa}"',
+    '"2026-10-05 14:02:51.000","17","C:\Windows\System32\svchost.exe","\wkssvc","CreatePipe","LOCAL SYSTEM","500","{7777-7777}"'
+)
 # v2.47: persistence + lineage fixtures (7045 install, run-key autorun, explorer grandparent)
 New-Csv (Join-Path $csv 'system_new_services.csv') '"Time","Service","Binary","Type"' @(
     '"2026-10-05 14:05:00.000","MalwareSvc","C:\Users\dev\AppData\Roaming\malware.exe","NewService"'
@@ -160,6 +170,13 @@ Check "per-instance: EID11 file creates joined by guid - dropped files listed" (
 Check "per-instance: EID23 file deletes rendered as anti-forensics evidence" (($html -match 'Files deleted \(') -and ($html -match 'logs\.txt') -and ($html -match 'anti-forensics'))
 Check "graph: layered SVG with instance/child/network nodes" (($html -match '<svg') -and ($html -match 'Activity graph') -and ($html -match 'child PID 4900') -and ($html -match 'NET 185\.199\.10\.7:443'))
 Check "graph: file-drop and delete chips rendered" (($html -match 'DROP payload\.dll') -and ($html -match 'DEL logs\.txt'))
+# v2.48: injection + pipe chips/sections/edges
+Check "injection: CrtIn section - rundll32 injected INTO instance 4812" (($html -match 'Cross-process injection INTO this instance \(1\)') -and ($html -match 'rundll32\.exe') -and ($html -match 'GetProcAddress'))
+Check "injection: CrtOut section - threads created in the child cmd" (($html -match 'Remote threads this instance created in OTHER processes \(1\)') -and ($html -match 'LoadLibraryA'))
+Check "pipes: C2-family pipe joined onto the instance, stock pipe excluded" (($html -match 'Named pipes created/connected \(1\)') -and ($html -match 'msagent_f00d') -and ($html -notmatch 'wkssvc'))
+Check "graph: INJECT/THREAD/PIPE chips rendered" (($html -match 'INJECT&lt;- rundll32\.exe') -and ($html -match 'THREAD-&gt; cmd\.exe') -and ($html -match 'PIPE \\msagent_f00d'))
+Check "graph: red cross-instance injection edge between tracked instances" ($html -match "stroke='#a33'")
+Check "dossier: injection hits routed to the Process events section" (($html -match 'Process events \(') -and ($html -match 'sysmon_remote_thread'))
 
 # v2.45: per-instance detail json for the main report embed
 $fDetail = $null
@@ -169,6 +186,9 @@ Check "detail: instance 4812 carries guid-joined sections" (@($fDetail.Instances
 $i4812 = @($fDetail.Instances | Where-Object { "$($_.Pid)" -eq '4812' })[0]
 Check "detail: sections populated (children/net/dns/dll/reg/file/drop/del)" ($i4812 -and @($i4812.Children).Count -ge 1 -and @($i4812.Net).Count -ge 2 -and @($i4812.Dns).Count -ge 1 -and @($i4812.Dll).Count -ge 1 -and @($i4812.Reg).Count -ge 1 -and @($i4812.File).Count -ge 1 -and @($i4812.FileCreate).Count -ge 1 -and @($i4812.FileDelete).Count -ge 1)
 Check "detail: benign notepad drop NOT in instance sections" (@($i4812.FileCreate | Where-Object { "$($_.TargetFilename)" -match 'benign\.txt' }).Count -eq 0)
+Check "detail: CrtIn/CrtOut/Pipes persisted for instance 4812" ((@($i4812.CrtIn).Count -eq 1) -and (@($i4812.CrtOut).Count -eq 1) -and (@($i4812.Pipes).Count -eq 1))
+$im4812out = @($i4812.CrtOut)[0]
+Check "detail: CrtOut row names the child cmd target" ($im4812out -and "$($im4812out.TargetImage)" -match 'cmd\.exe' -and "$($im4812out.TargetProcessGuid)" -match '7a1f-cccc')
 # v2.47: ancestry walk-up, persistence + beacon joins, target/relative split, respawn narration
 Check "lineage: instance 4812 walks up to explorer then winlogon (2 hops)" ((@($i4812.Lineage).Count -ge 2) -and (@($i4812.Lineage) -join '|') -match 'explorer\.exe' -and (@($i4812.Lineage) -join '|') -match 'winlogon\.exe')
 Check "persistence: 7045 install + run-key autorun joined onto the instance" ((@($i4812.Persist).Count -ge 2) -and (@($i4812.Persist | ForEach-Object { $_.Kind }) -contains 'service install (7045)') -and (@($i4812.Persist | ForEach-Object { $_.Kind }) -contains 'autorun (run key)'))
@@ -235,6 +255,7 @@ Check "report: signals clickable to their sections" ($rep -match 'click a signal
 Check "report: focus embed renders the activity graph inline" ($rep -match 'Activity graph \(parents -> instances -> children -> what they did\)')
 Check "report: focus embed renders per-instance sections" (($rep -match 'Instance PID 4812[^<]*everything it did') -and ($rep -match 'Files dropped \(1\)') -and ($rep -match 'payload\.dll') -and ($rep -match 'anti-forensics'))
 Check "report: focus embed renders persistence + beacon + lineage + respawn" (($rep -match 'Persistence \(2\)') -and ($rep -match 'C2 beaconing \(1\)') -and ($rep -match 'Arrived via:') -and ($rep -match 'respawned after'))
+Check "report: focus embed renders injection + pipe sections" (($rep -match 'Cross-process injection INTO this instance \(1\)') -and ($rep -match 'Remote threads created in other processes \(1\)') -and ($rep -match 'Named pipes \(1\)') -and ($rep -match 'msagent_f00d'))
 Check "report: focus embed excludes the benign row" ($rep -notmatch 'benign\.txt')
 
 Write-Host ""

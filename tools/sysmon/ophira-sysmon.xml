@@ -1,5 +1,5 @@
 <!--
-  Ophira recommended Sysmon configuration (v2.22)
+  Ophira recommended Sysmon configuration (v2.48)
   ===============================================
   Lean config that enables exactly the telemetry Ophira's parsers and hunt rules consume.
   Install (elevated, once per endpoint - Ophira itself never installs anything):
@@ -12,9 +12,11 @@
     2  FileCreateTime                 - R15/R22 timestomping evidence
     3  NetworkConnect                 - C2 beaconing (module 4.8), entity correlation
     7  ImageLoad                      - R2/R3 DLL side-load detections
+    8  CreateRemoteThread (AV/VM-source noise excluded) - R28 cross-process injection, Focus INJECT edges
     10 ProcessAccess  (FILTERED to lsass targets) - R8 LSASS access; the filter keeps volume sane
     13 RegistryEvent  (FILTERED to hot keys)      - R11 UAC bypass + persistence sweep
-    22 DnsQuery                      - DNS beaconing (module 4.8)
+    17/18 PipeCreated/PipeConnected (stock service pipes excluded) - R29 C2-style pipe detection
+    22 DnsQuery                      - DNS beaconing (DNS beaconing data source) (module 4.8)
   Deliberately NOT enabled: clipboard, raw disk access, driver load spam - keep triage noise low.
 -->
 <Sysmon schemaversion="4.90">
@@ -42,6 +44,29 @@
       <Signed condition="is">true</Signed>
       <ImageLoaded condition="begin with">C:\Windows\</ImageLoaded>
     </ImageLoad>
+
+    <!-- 8: remote-thread creation (R28 cross-process injection; Focus INJECT edges).
+         Exclude the AV/VM noise sources that legitimately poke other processes. -->
+    <CreateRemoteThread onmatch="exclude">
+      <SourceImage condition="end with">MsMpEng.exe</SourceImage>
+      <SourceImage condition="end with">NisSrv.exe</SourceImage>
+      <SourceImage condition="end with">Sense.exe</SourceImage>
+      <SourceImage condition="end with">vmtoolsd.exe</SourceImage>
+      <SourceImage condition="end with">VGAuthService.exe</SourceImage>
+    </CreateRemoteThread>
+
+    <!-- 17/18: named pipe created/connected (R29 C2-style pipe detection; SMB-beacon channels).
+         Sysmon logs PipeName WITHOUT the \\.\pipe\ prefix. Exclude stock Windows service pipes + Chromium IPC. -->
+    <PipeEvent onmatch="exclude">
+      <PipeName condition="is">\wkssvc</PipeName>
+      <PipeName condition="is">\srvsvc</PipeName>
+      <PipeName condition="is">\ntsvcs</PipeName>
+      <PipeName condition="is">\scerpc</PipeName>
+      <PipeName condition="is">\epmapper</PipeName>
+      <PipeName condition="is">\atsvc</PipeName>
+      <PipeName condition="begin with">\mojo.</PipeName>
+      <PipeName condition="begin with">\chrome.mojo</PipeName>
+    </PipeEvent>
 
     <!-- 10: process access, LSASS-focused - the credential-dump signal (R8).
          Include narrows to lsass targets; exclude then drops the legit system/AV openers. -->
